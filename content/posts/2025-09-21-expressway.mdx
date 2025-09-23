@@ -8,19 +8,22 @@ excerpt: "Exploit IKE and CVE-2025-32463 on sudo v1.9.17"
 ---
 
 
-# RECON
+## RECON
 
 
-## Port Scan
+### Port Scan
 
 
 ```
+
 $ rustscan -a 10.10.11.87 --ulimit 2000 -r 1-65535 -- -A sS -Pn
 
 PORT   STATE SERVICE REASON  VERSION
 22/tcp open  ssh     syn-ack OpenSSH 10.0p2 Debian 8 (protocol 2.0)
 Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
+
 ```
+
 
 Kita lihat di TCP gak ada port yang open selain port 22(SSH), jadi kita lakukan scanning di UDP.
 
@@ -28,7 +31,9 @@ UDP itu ibarat saudara nya TCP, sudah buat di enumerate kalo tools kita gak tepa
 
 Disini kita bisa gunakan [`udpx`](https://github.com/nullt3r/udpx):
 
+
 ```
+
 $ git clone https://github.com/nullt3r/udpx.git
 $ cd udpx
 $ go build ./cmd/udpx
@@ -46,12 +51,15 @@ $ udpx -t 10.10.11.87 -c 128 -w 1000
 2025/09/20 16:33:27 [+] Starting UDP scan on 1 target(s)
 2025/09/20 16:33:45 [*] 10.129.13.112:500 (ike)
 2025/09/20 16:34:00 [+] Scan completed
+
 ```
+
 
 Lihat di logging atas, `udpx` menemukan sesuatu: UDP/500 (IKE).
 
 
-# USER
+
+## USER
 
 
 Port UDP **500** merupakan khas dari **ISAKMP / IKE (IPsec VPN)**:
@@ -61,13 +69,13 @@ Port UDP **500** merupakan khas dari **ISAKMP / IKE (IPsec VPN)**:
 *   Misconfiguration (PSKs yang lemah, exposed Aggressive Mode, atau malformed di certificates nya) bisa merujuk ke information-leak surface .
 
 
-## IKE
+### IKE
 
 
 _**[IKE (Internet Key Exchange)](https://www.paloaltonetworks.com/cyberpedia/what-is-ike)** orchestrates the cryptographic associations used by **IPsec**. In plain terms: IKE is the handshake that lets two endpoints negotiate keys, algorithms, and identities so they can erect encrypted tunnels (ESP/AH)._
 
 
-### IKE Scan
+#### IKE Scan
 
 
 Untuk fingerprinting dan probing IKE, kita bisa gunakan **[ike-scan](https://github.com/royhills/ike-scan)**.
@@ -76,6 +84,7 @@ Installation:
 
 
 ```
+
 # Debian/Ubuntu
 sudo apt install -y ike-scan
 
@@ -90,6 +99,7 @@ autoreconf --install
 ./configure --with-openssl
 make -j"$(nproc)"
 sudo make install
+
 ```
 
 
@@ -160,7 +170,7 @@ bc859f8dc4a9e13eb9005f4c8837adcc1d9ae7a994f101f02a655305fa74f5b3749c13b308743811
 Kita dapet hash buat **--id=ike@expressway.htb**.
 
 
-### PSK Cracking
+#### PSK Cracking
 
 
 **PSK (Pre-Shared Key)** merupakan sebuah symmetric secret shared oleh kedua endpoinnt VPN sebelumnya (coba pikirkan: password yang di pake kedua belah pihak).
@@ -200,10 +210,10 @@ Kita mendapatkan user flag nya
 > Note: akun **ike** kita bisa mengetahuinya dengan detail selama enumerate post-exploitation. dan termasuk didalam grup `proxy`
 
 
-# ROOT
+## ROOT
 
 
-## CVE-2025-32463
+### CVE-2025-32463
 
 
 _**[Sudo 1.9.17p1](https://nvd.nist.gov/vuln/detail/CVE-2025-32463)** allows local users to obtain root access because /etc/nsswitch.conf from a user-controlled directory is used with the --chroot option._
