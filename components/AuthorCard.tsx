@@ -13,7 +13,7 @@ export default function AuthorCard() {
       <div>
         <div className="font-semibold">HADES</div>
         <div className="text-sm text-foreground/70">
-          Security enthusiast. CTF / pentesting / write-ups.
+          Cyber Security Enthusiast | CTF Player | Pentester
         </div>
       </div>
     </div>

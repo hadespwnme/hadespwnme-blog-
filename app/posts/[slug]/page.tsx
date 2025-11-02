@@ -37,6 +37,10 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-8">
+        <div className="lg:hidden" data-aos="fade-up" data-aos-delay="140">
+          <Toc containerId="post-content" variant="dropdown" />
+        </div>
+
         <div id="post-content" className="prose" data-aos="fade-up" data-aos-delay="150">
           {content}
         </div>

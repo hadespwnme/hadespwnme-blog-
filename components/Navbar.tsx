@@ -5,6 +5,9 @@ import { usePathname } from "next/navigation";
 import { Github, Sun, Moon, Menu, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useLang } from "@/lib/useLang";
+import { Press_Start_2P } from "next/font/google";
+
+const pressStart = Press_Start_2P({ subsets: ["latin"], weight: "400" });
 
 const labels = {
   id: {
@@ -79,8 +82,25 @@ export default function Navbar() {
           >
             {open ? <X size={18} /> : <Menu size={18} />}
           </button>
-          <Link href="/" className="font-semibold tracking-tight">
-            {t.brand}
+          <Link
+            href="/"
+            className={`brand ${pressStart.className} tracking-tight text-sm sm:text-base`}
+            style={{
+              textShadow: "0 0 2px #a78bfa, 0 0 10px #60a5fa",
+            }}
+          >
+            {(() => {
+              const brand = t.brand ?? "hadespwnme";
+              const idx = brand.toLowerCase().indexOf("pwn");
+              if (idx === -1) return brand;
+              return (
+                <>
+                  {brand.slice(0, idx)}
+                  <span className="pwn">{brand.slice(idx, idx + 3)}</span>
+                  {brand.slice(idx + 3)}
+                </>
+              );
+            })()}
           </Link>
         </div>
 

@@ -35,7 +35,7 @@ export default function CodeBlock({ children }: Props) {
   };
 
   return (
-    <div className="rounded-md border border-black/10 dark:border-white/10 overflow-hidden bg-[#0b1020] text-[#eaeaff]">
+    <div className="code-block rounded-md border border-black/10 dark:border-white/10 overflow-hidden bg-[#0b1020] text-[#eaeaff]">
       <div className="flex items-center justify-between px-3 py-2 bg-[#12182b] border-b border-white/10">
         <div className="flex items-center gap-1.5">
           <span className="w-3 h-3 rounded-full bg-red-400" />
@@ -54,7 +54,7 @@ export default function CodeBlock({ children }: Props) {
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      <pre className="overflow-auto max-h-[70vh] p-3 text-sm leading-relaxed font-mono whitespace-pre">
+      <pre className="overflow-auto max-h-[70vh] px-2.5 py-2 text-sm leading-relaxed font-mono whitespace-pre">
         {codeEl}
       </pre>
     </div>

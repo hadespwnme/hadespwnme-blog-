@@ -13,7 +13,7 @@ export default async function AboutPage() {
           aboutSiteBody:
             "Blog ini dibuat untuk dokumentasi writeup dalam bermain CTF. Dan saya membuatnya menggunakan Next Js dengan tema terinspirasi dari Tema Blowfish.",
           whoami: "Whoami",
-          whoamiBody: "Penggemar keamanan yang suka membaca novel dan nonton donghua 😶‍🌫️",
+          whoamiBody: "Halo, saya seorang penggemar keamanan siber dan pemain CTF dari Jakarta, Indonesia. Saya juga anggota TCP1P, di mana saya berpartisipasi dalam berbagai kompetisi CTF.",
           blogContent: "Konten Blog",
           blogContentBody: "Writeup untuk CTF / Pentest",
           latest: "Terbaru",
@@ -27,7 +27,7 @@ export default async function AboutPage() {
           aboutSiteBody:
             "This blog documents my CTF writeups. I built it with Next.js and a theme inspired by the Blowfish theme.",
           whoami: "Whoami",
-          whoamiBody: "Security enthusiast who enjoys reading novels and watching donghua 😶‍🌫️",
+          whoamiBody: "Hello, I am a cyber security enthusiast and CTF player from Jakarta, Indonesia. Also, I am a member of TCP1P, where I participate in various CTF competitions.",
           blogContent: "Blog Content",
           blogContentBody: "Writeups for CTF / Pentest",
           latest: "Latest",

@@ -5,6 +5,10 @@ import TagChip from "@/components/TagChip";
 import CategoryChip from "@/components/CategoryChip";
 import { getServerLang } from "@/lib/i18n-server";
 import { Globe, Github } from "lucide-react";
+import { Press_Start_2P } from "next/font/google";
+import TypingText from "@/components/TypingText";
+
+const pressStart = Press_Start_2P({ subsets: ["latin"], weight: "400" });
 
 export default async function Home() {
   const posts = getAllPostsMeta().slice(0, 6);
@@ -36,10 +40,31 @@ export default async function Home() {
           className="rounded-full"
           data-aos="zoom-in"
         />
-        <h1 className="text-3xl font-bold tracking-tight" data-aos="fade-up">
-          hadespwnme
+        <h1
+          className={`brand ${pressStart.className} text-3xl tracking-tight`}
+          style={{ textShadow: "0 0 2px #a78bfa, 0 0 10px #60a5fa" }}
+          data-aos="fade-up"
+        >
+          {(() => {
+            const brand = "hadespwnme";
+            const idx = brand.indexOf("pwn");
+            return (
+              <>
+                {brand.slice(0, idx)}
+                <span className="pwn" style={{ color: "#ef4444" }}>{brand.slice(idx, idx + 3)}</span>
+                {brand.slice(idx + 3)}
+              </>
+            );
+          })()}
         </h1>
-        <p className="text-foreground/70" data-aos="fade-up" data-aos-delay="100">{t.subtitle}</p>
+        <TypingText
+          className="text-foreground/70"
+          text={t.subtitle}
+          speed={55}
+          startDelay={350}
+          data-aos="fade-up"
+          data-aos-delay="100"
+        />
         <div className="flex items-center gap-2" data-aos="fade-up" data-aos-delay="150">
           <a
             href="https://hadespwn.me"
