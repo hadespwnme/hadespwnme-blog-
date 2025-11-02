@@ -3,12 +3,13 @@ import { getAllPostsMeta } from "@/lib/posts";
 import CategoryChip from "@/components/CategoryChip";
 import TagChip from "@/components/TagChip";
 
-export default function TagArchive({ params }: { params: { name: string } }) {
-  const name = decodeURIComponent(params.name);
-  const list = getAllPostsMeta().filter((p) => (p.tags ?? []).includes(name));
+export default async function TagArchive({ params }: { params: Promise<{ name: string }> }) {
+  const { name } = await params;
+  const decoded = decodeURIComponent(name);
+  const list = getAllPostsMeta().filter((p) => (p.tags ?? []).includes(decoded));
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-semibold" data-aos="fade-up">Tag: {name}</h1>
+      <h1 className="text-2xl font-semibold" data-aos="fade-up">Tag: {decoded}</h1>
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
         {list.map((p, i) => (
           <article
