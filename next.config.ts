@@ -5,7 +5,6 @@ const nextConfig = {
   experimental: {
     mdxRs: true,
   },
-  // Non-standard property used only during local dev; ignored by Next at build time.
   allowedDevOrigins: ["https://*.ngrok-free.app"],
 } satisfies NextConfig & { allowedDevOrigins?: string[] };
 

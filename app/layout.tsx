@@ -20,6 +20,12 @@ export const metadata: Metadata = {
   title: "hadespwnme's Blog",
   description: "Security, CTF, pentesting write-ups and notes.",
   metadataBase: new URL("https://hadespwn.me"),
+  icons: {
+    icon: [
+      { url: "/favicon.ico", type: "image/x-icon" },
+      { url: "/icon.png", type: "image/png", sizes: "512x512" },
+    ],
+  },
   openGraph: {
     title: "hadespwnme's Blog",
     description: "Security, CTF, pentesting write-ups and notes.",
@@ -35,7 +41,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
         <Providers>
           <Navbar />

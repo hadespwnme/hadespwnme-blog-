@@ -8,7 +8,6 @@ export function useLang() {
   const [lang, setLang] = useState<Lang>("id");
 
   useEffect(() => {
-    // prefer cookie, fallback to localStorage
     const cookieMatch = document.cookie.match(/(?:^|; )lang=(id|en)/);
     const cookieLang = (cookieMatch?.[1] as Lang | undefined) || undefined;
     const stored = (localStorage.getItem("lang") as Lang) || cookieLang || "id";
@@ -36,7 +35,6 @@ export function useLang() {
     document.cookie = `lang=${next}; path=/; max-age=31536000`;
     window.dispatchEvent(new CustomEvent("langchange", { detail: next }));
     setLang(next);
-    // Reload to allow server components to reflect language
     window.location.reload();
   };
 

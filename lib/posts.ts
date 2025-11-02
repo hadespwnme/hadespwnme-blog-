@@ -11,7 +11,7 @@ import React from "react";
 
 export type PostFrontmatter = {
   title: string;
-  date: string; // YYYY-MM-DD
+  date: string;
   categories?: string[];
   tags?: string[];
   cover?: string;
@@ -25,7 +25,6 @@ export type PostMeta = PostFrontmatter & {
 
 const POSTS_DIR = path.join(process.cwd(), "content", "posts");
 
-// Normalize a frontmatter date value (string | number | Date-like) to YYYY-MM-DD
 function normalizeDate(input: unknown): string {
   if (typeof input === "number") {
     return new Date(input).toISOString().slice(0, 10);
@@ -61,7 +60,6 @@ export function getPostMeta(slug: string): PostMeta | null {
   const words = content.trim().split(/\s+/).length;
   const stats = readingTime(content);
   const fm = data as PostFrontmatter & { date: string | Date | number };
-  // Ensure date is a string (React can't render Date objects directly)
   const dateStr = normalizeDate(fm.date);
   return {
     ...fm,
@@ -97,7 +95,6 @@ export async function getPost(slug: string) {
 
   const meta: PostMeta = {
     ...frontmatter,
-    // Normalize date to string in case YAML parsed it as Date
     date: normalizeDate(frontmatter.date as unknown),
     slug,
     words,

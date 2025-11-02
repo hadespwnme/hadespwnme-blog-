@@ -58,7 +58,6 @@ export default function Toc({ containerId, variant = "sidebar" }: TocProps) {
                 href={`#${it.id}`}
                 className={`block py-0.5 hover:underline underline-offset-4 ${active === it.id ? "text-foreground" : "text-foreground/70"}`}
                 onClick={() => {
-                  // Close dropdown after navigating to heading
                   if (detailsRef.current) detailsRef.current.open = false;
                 }}
               >

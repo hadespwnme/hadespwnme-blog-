@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { Github, Sun, Moon, Menu, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -46,8 +47,6 @@ export default function Navbar() {
     root.classList.toggle("dark", isDark);
     root.classList.toggle("light", !isDark);
     setDark(isDark);
-
-    // language initialization handled in useLang
   }, []);
 
   const t = useMemo(() => labels[lang], [lang]);
@@ -82,6 +81,13 @@ export default function Navbar() {
           >
             {open ? <X size={18} /> : <Menu size={18} />}
           </button>
+          <Image
+            src="/assets/hades-logo.png"
+            alt="Hadespwnme logo"
+            width={39}
+            height={39}
+            priority
+          />
           <Link
             href="/"
             className={`brand ${pressStart.className} tracking-tight text-sm sm:text-base`}
