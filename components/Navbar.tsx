@@ -84,8 +84,8 @@ export default function Navbar() {
           <Image
             src="/assets/hades-logo.png"
             alt="Hadespwnme logo"
-            width={44}
-            height={44}
+            width={52}
+            height={52}
             priority
             unoptimized
           />
