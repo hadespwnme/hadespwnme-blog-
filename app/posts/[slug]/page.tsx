@@ -10,17 +10,20 @@ export async function generateStaticParams() {
 
 export default async function PostPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const data = await getPost(slug);
+  const lang = await getServerLang();
+  const data = await getPost(slug, lang);
   if (!data) return notFound();
   const { content, meta } = data;
 
-  const all = getAllPostsMeta();
+  const all = getAllPostsMeta(lang);
   const idx = all.findIndex((m) => m.slug === slug);
-  const prev = idx >= 0 && idx + 1 < all.length ? all[idx + 1] : null; // older
-  const next = idx > 0 ? all[idx - 1] : null; // newer
+  const prev = idx >= 0 && idx + 1 < all.length ? all[idx + 1] : null;
+  const next = idx > 0 ? all[idx - 1] : null;
 
-  const lang = await getServerLang();
-  const t = lang === "id" ? { prev: "Sebelumnya", next: "Berikutnya" } : { prev: "Previous", next: "Next" };
+  const t =
+    lang === "id"
+      ? { prev: "Sebelumnya", next: "Berikutnya", words: "kata", minutes: "menit" }
+      : { prev: "Previous", next: "Next", words: "words", minutes: "min" };
 
   return (
     <article className="space-y-6">
@@ -29,7 +32,7 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
           {meta.title}
         </h1>
         <div className="text-sm text-foreground/60 mt-1" data-aos="fade-up" data-aos-delay="50">
-          {meta.date} · {meta.words} kata · {meta.minutes} menit
+          {meta.date} · {meta.words} {t.words} · {meta.minutes} {t.minutes}
         </div>
         <div className="mt-3" data-aos="fade-up" data-aos-delay="100">
           <AuthorCard />

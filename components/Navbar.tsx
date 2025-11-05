@@ -20,6 +20,10 @@ const labels = {
     about: "Tentang",
     language: "Bahasa",
     theme: "Tema",
+    openMenu: "Buka menu",
+    closeMenu: "Tutup menu",
+    chooseLanguage: "Pilih bahasa",
+    toggleTheme: "Ubah tema",
   },
   en: {
     brand: "hadespwnme",
@@ -30,6 +34,10 @@ const labels = {
     about: "About",
     language: "Language",
     theme: "Theme",
+    openMenu: "Open menu",
+    closeMenu: "Close menu",
+    chooseLanguage: "Select language",
+    toggleTheme: "Toggle theme",
   },
 };
 
@@ -75,7 +83,7 @@ export default function Navbar() {
       <nav className="relative mx-auto max-w-5xl px-4 h-14 flex items-center justify-center md:justify-between">
         <button
           className="md:hidden absolute left-4 p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
-          aria-label={open ? "Tutup menu" : "Buka menu"}
+          aria-label={open ? t.closeMenu : t.openMenu}
           onClick={() => setOpen((v) => !v)}
         >
           {open ? <X size={18} /> : <Menu size={18} />}
@@ -139,7 +147,7 @@ export default function Navbar() {
           <div className="relative">
             <button
               className="px-2 py-1 text-xs rounded-md border border-black/10 dark:border-white/15 hover:bg-black/5 dark:hover:bg-white/10"
-              aria-label="Pilih bahasa"
+              aria-label={t.chooseLanguage}
               onClick={() => toggleLang()}
             >
               {lang.toUpperCase()}
@@ -148,7 +156,7 @@ export default function Navbar() {
 
           <button
             className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
-            aria-label="Toggle tema"
+            aria-label={t.toggleTheme}
             onClick={toggleTheme}
           >
             {dark ? <Sun size={16} /> : <Moon size={16} />}
@@ -186,7 +194,7 @@ export default function Navbar() {
 
               <button
                 className="px-2 py-1 text-xs rounded-md border border-black/10 dark:border-white/15 hover:bg-black/5 dark:hover:bg-white/10"
-                aria-label="Pilih bahasa"
+                aria-label={t.chooseLanguage}
                 onClick={() => toggleLang()}
               >
                 {lang.toUpperCase()}
@@ -194,7 +202,7 @@ export default function Navbar() {
 
               <button
                 className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
-                aria-label="Toggle tema"
+                aria-label={t.toggleTheme}
                 onClick={toggleTheme}
               >
                 {dark ? <Sun size={16} /> : <Moon size={16} />}

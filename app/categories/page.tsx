@@ -3,8 +3,8 @@ import { aggregateCategories } from "@/lib/posts";
 import { getServerLang } from "@/lib/i18n-server";
 
 export default async function CategoriesPage() {
-  const data = aggregateCategories();
   const lang = await getServerLang();
+  const data = aggregateCategories(lang);
   const t = lang === "id" ? { title: "Kategori" } : { title: "Categories" };
   return (
     <div className="space-y-6">

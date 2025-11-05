@@ -4,8 +4,8 @@ import React from "react";
 
 type Props = React.HTMLAttributes<HTMLSpanElement> & {
   text: string;
-  speed?: number; // ms per character
-  startDelay?: number; // ms before typing starts
+  speed?: number;
+  startDelay?: number;
   showCaret?: boolean;
 };
 
@@ -41,4 +41,3 @@ export default function TypingText({
     </span>
   );
 }
-

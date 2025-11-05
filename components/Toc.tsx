@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useLang } from "@/lib/useLang";
 
 type TocItem = { id: string; text: string; level: number };
 
@@ -13,6 +14,8 @@ export default function Toc({ containerId, variant = "sidebar" }: TocProps) {
   const [items, setItems] = useState<TocItem[]>([]);
   const [active, setActive] = useState<string>("");
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
+  const { lang } = useLang();
+  const title = lang === "id" ? "Daftar Isi" : "Table of Contents";
 
   useEffect(() => {
     const container = document.getElementById(containerId);
@@ -46,7 +49,7 @@ export default function Toc({ containerId, variant = "sidebar" }: TocProps) {
     return (
       <details ref={detailsRef} className="group text-sm border border-black/5 dark:border-white/10 rounded-lg" data-aos="fade-up">
         <summary className="cursor-pointer list-none px-4 py-3 flex items-center justify-between">
-          <span className="font-medium">Daftar Isi</span>
+          <span className="font-medium">{title}</span>
           <svg aria-hidden viewBox="0 0 20 20" className="w-4 h-4 opacity-70 group-open:-rotate-180 transition-transform">
             <path fill="currentColor" d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.71a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z" />
           </svg>
@@ -72,7 +75,7 @@ export default function Toc({ containerId, variant = "sidebar" }: TocProps) {
 
   return (
     <nav className="text-sm sticky top-24 p-4 border border-black/5 dark:border-white/10 rounded-lg" data-aos="fade-left">
-      <div className="font-medium mb-2">Daftar Isi</div>
+      <div className="font-medium mb-2">{title}</div>
       <ul className="space-y-1">
         {items.map((it) => (
           <li key={it.id} className={it.level === 3 ? "pl-3" : ""}>

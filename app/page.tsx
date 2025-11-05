@@ -11,8 +11,8 @@ import TypingText from "@/components/TypingText";
 const pressStart = Press_Start_2P({ subsets: ["latin"], weight: "400" });
 
 export default async function Home() {
-  const posts = getAllPostsMeta().slice(0, 6);
   const lang = await getServerLang();
+  const posts = getAllPostsMeta(lang).slice(0, 6);
   const t = lang === "id"
     ? {
         subtitle: "live by code and raised by ethic",

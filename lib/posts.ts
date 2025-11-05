@@ -8,6 +8,7 @@ import remarkGfm from "remark-gfm";
 import rehypeSlug from "rehype-slug";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
 import React from "react";
+import type { Lang } from "@/lib/i18n-server";
 
 export type PostFrontmatter = {
   title: string;
@@ -25,6 +26,49 @@ export type PostMeta = PostFrontmatter & {
 
 const POSTS_DIR = path.join(process.cwd(), "content", "posts");
 
+type PostLang = Lang | undefined;
+
+function parseFilename(file: string): { base: string; lang: PostLang } | null {
+  if (!file.endsWith(".mdx")) return null;
+  const m = file.match(/^(.*)\.(id|en)\.mdx$/);
+  if (m) {
+    return { base: m[1], lang: m[2] as Lang };
+  }
+  return { base: file.replace(/\.mdx$/, ""), lang: undefined };
+}
+
+function listPostFiles() {
+  if (!fs.existsSync(POSTS_DIR)) return [] as string[];
+  return fs.readdirSync(POSTS_DIR).filter((f) => f.endsWith(".mdx"));
+}
+
+function getAllBaseSlugs(): string[] {
+  const files = listPostFiles();
+  const set = new Set<string>();
+  for (const f of files) {
+    const info = parseFilename(f);
+    if (info) set.add(info.base);
+  }
+  return Array.from(set);
+}
+
+function resolveFileFor(slug: string, preferred?: Lang): string | null {
+  if (preferred) {
+    const p = path.join(POSTS_DIR, `${slug}.${preferred}.mdx`);
+    if (fs.existsSync(p)) return p;
+  }
+  const legacy = path.join(POSTS_DIR, `${slug}.mdx`);
+  if (fs.existsSync(legacy)) return legacy;
+  const alt: Lang = preferred === "id" ? "en" : "id";
+  const p2 = path.join(POSTS_DIR, `${slug}.${alt}.mdx`);
+  if (fs.existsSync(p2)) return p2;
+  for (const lang of ["id", "en"] as Lang[]) {
+    const p3 = path.join(POSTS_DIR, `${slug}.${lang}.mdx`);
+    if (fs.existsSync(p3)) return p3;
+  }
+  return null;
+}
+
 function normalizeDate(input: unknown): string {
   if (typeof input === "number") {
     return new Date(input).toISOString().slice(0, 10);
@@ -39,22 +83,20 @@ function normalizeDate(input: unknown): string {
 }
 
 export function getAllSlugs(): string[] {
-  if (!fs.existsSync(POSTS_DIR)) return [];
-  return fs
-    .readdirSync(POSTS_DIR)
-    .filter((f) => f.endsWith(".mdx"))
-    .map((f) => f.replace(/\.mdx$/, ""));
+  return getAllBaseSlugs();
 }
 
-export function getAllPostsMeta(): PostMeta[] {
-  const slugs = getAllSlugs();
-  const metas = slugs.map((slug) => getPostMeta(slug)).filter(Boolean) as PostMeta[];
+export function getAllPostsMeta(lang?: Lang): PostMeta[] {
+  const slugs = getAllBaseSlugs();
+  const metas = slugs
+    .map((slug) => getPostMeta(slug, lang))
+    .filter(Boolean) as PostMeta[];
   return metas.sort((a, b) => (a.date < b.date ? 1 : -1));
 }
 
-export function getPostMeta(slug: string): PostMeta | null {
-  const file = path.join(POSTS_DIR, `${slug}.mdx`);
-  if (!fs.existsSync(file)) return null;
+export function getPostMeta(slug: string, lang?: Lang): PostMeta | null {
+  const file = resolveFileFor(slug, lang);
+  if (!file) return null;
   const raw = fs.readFileSync(file, "utf8");
   const { data, content } = matter(raw);
   const words = content.trim().split(/\s+/).length;
@@ -70,9 +112,9 @@ export function getPostMeta(slug: string): PostMeta | null {
   };
 }
 
-export async function getPost(slug: string) {
-  const file = path.join(POSTS_DIR, `${slug}.mdx`);
-  if (!fs.existsSync(file)) return null;
+export async function getPost(slug: string, lang?: Lang) {
+  const file = resolveFileFor(slug, lang);
+  if (!file) return null;
   const source = fs.readFileSync(file, "utf8");
   const Pre: React.FC<React.HTMLAttributes<HTMLPreElement>> = (props) =>
     React.createElement(CodeBlock, null, props.children);
@@ -104,9 +146,9 @@ export async function getPost(slug: string) {
   return { content, meta };
 }
 
-export function aggregateCategories() {
+export function aggregateCategories(lang?: Lang) {
   const map = new Map<string, number>();
-  for (const meta of getAllPostsMeta()) {
+  for (const meta of getAllPostsMeta(lang)) {
     for (const c of meta.categories ?? []) {
       map.set(c, (map.get(c) ?? 0) + 1);
     }
@@ -116,9 +158,9 @@ export function aggregateCategories() {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function aggregateTags() {
+export function aggregateTags(lang?: Lang) {
   const map = new Map<string, number>();
-  for (const meta of getAllPostsMeta()) {
+  for (const meta of getAllPostsMeta(lang)) {
     for (const t of meta.tags ?? []) {
       map.set(t, (map.get(t) ?? 0) + 1);
     }

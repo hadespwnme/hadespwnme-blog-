@@ -11,12 +11,12 @@ export default async function PostsPage({
 }: {
   searchParams: Promise<{ page?: string }>;
 }) {
-  const all = getAllPostsMeta();
+  const lang = await getServerLang();
+  const all = getAllPostsMeta(lang);
   const params = await searchParams;
   const page = Math.max(1, Number(params.page ?? "1") || 1);
   const totalPages = Math.max(1, Math.ceil(all.length / PAGE_SIZE));
   const items = all.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
-  const lang = await getServerLang();
   const t = lang === "id"
     ? { title: "Artikel", prev: "Sebelumnya", next: "Berikutnya", words: "kata", minutes: "menit" }
     : { title: "Articles", prev: "Previous", next: "Next", words: "words", minutes: "min" };

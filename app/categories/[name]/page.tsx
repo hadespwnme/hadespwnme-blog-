@@ -2,14 +2,17 @@ import Link from "next/link";
 import { getAllPostsMeta } from "@/lib/posts";
 import CategoryChip from "@/components/CategoryChip";
 import TagChip from "@/components/TagChip";
+import { getServerLang } from "@/lib/i18n-server";
 
 export default async function CategoryArchive({ params }: { params: Promise<{ name: string }> }) {
   const { name } = await params;
   const decoded = decodeURIComponent(name);
-  const list = getAllPostsMeta().filter((p) => (p.categories ?? []).includes(decoded));
+  const lang = await getServerLang();
+  const list = getAllPostsMeta(lang).filter((p) => (p.categories ?? []).includes(decoded));
+  const title = lang === "id" ? `Kategori: ${decoded}` : `Category: ${decoded}`;
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-semibold" data-aos="fade-up">Category: {decoded}</h1>
+      <h1 className="text-2xl font-semibold" data-aos="fade-up">{title}</h1>
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
         {list.map((p, i) => (
           <article

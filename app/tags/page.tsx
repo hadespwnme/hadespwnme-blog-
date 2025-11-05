@@ -3,8 +3,8 @@ import { aggregateTags } from "@/lib/posts";
 import { getServerLang } from "@/lib/i18n-server";
 
 export default async function TagsPage() {
-  const data = aggregateTags();
   const lang = await getServerLang();
+  const data = aggregateTags(lang);
   const t = lang === "id" ? { title: "Tag" } : { title: "Tags" };
   return (
     <div className="space-y-6">

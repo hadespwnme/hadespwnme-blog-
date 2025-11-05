@@ -1,0 +1,235 @@
+---
+layout: post
+title: "HTB Writeup – Dog"
+date: 2025-06-24
+image: /assets/machine/dog/dog.jpg
+categories: ["HTB-Machine"]
+tags: [htb, linux]
+excerpt: "Exploit Backdrop CMS and use bee tool for privesc"
+---
+
+
+<center>
+  <img src="/assets/machine/dog/dog.jpg" className="img-post" />
+</center>
+
+
+# RECON
+
+## Port Scan
+
+```
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 8.2p1 Ubuntu 4ubuntu0.12 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey: 
+|   3072 97:2a:d2:2c:89:8a:d3:ed:4d:ac:00:d2:1e:87:49:a7 (RSA)
+|   256 27:7c:3c:eb:0f:26:e9:62:59:0f:0f:b1:38:c9:ae:2b (ECDSA)
+|_  256 93:88:47:4c:69:af:72:16:09:4c:ba:77:1e:3b:3b:eb (ED25519)
+80/tcp open  http    Apache httpd 2.4.41 ((Ubuntu))
+| http-git: 
+|   10.10.11.58:80/.git/
+|     Git repository found!
+|     Repository description: Unnamed repository; edit this file 'description' to name the...
+|_    Last commit message: todo: customize url aliases.  reference:https://docs.backdro...
+|_http-server-header: Apache/2.4.41 (Ubuntu)
+|_http-generator: Backdrop CMS 1 (https://backdropcms.org)
+| http-robots.txt: 22 disallowed entries (15 shown)
+| /core/ /profiles/ /README.md /web.config /admin 
+| /comment/reply /filter/tips /node/add /search /user/register 
+|_/user/password /user/login /user/logout /?q=admin /?q=comment/reply
+|_http-title: Home | Dog
+```
+
+We can see there is a `.git` directory; we can use it to inspect code history and changes in the repository.
+
+
+## Git Dump
+
+We can use several tools, like GitTools, GitHack, etc.
+
+
+Here I use [GitHack](https://github.com/lijiejie/GitHack)
+
+<center>
+  <img src="/assets/machine/dog/githack.png" className="img-post" />
+</center>
+
+After that we can use `grep` to search for the keywords we want, like this:
+
+```bash
+grep -rE "password|@dog.htb|administrator|database" 10.10.11.58
+```
+
+and here is what we get:
+
+```
+10.10.11.58/files/config_83dddd18e1ec67fd8ff5bba2453c7fb3/active/update.settings.json:        "tiffany@dog.htb"
+
+10.10.11.58/settings.php:$database = 'mysql://root:BackDropJ2024DS2024@127.0.0.1/backdrop';
+```
+
+We get `tiffany` and `BackDropJ2024DS2024` as credentials to log in to the web.
+
+<center>
+  <img src="/assets/machine/dog/webtifanny.jpg" className="img-post" />
+</center>
+
+# USER
+
+## www-data
+
+We find a page to upload files. 
+
+Previously I explored the site and it runs **[Backdrop CMS 1.27.1](https://www.exploit-db.com/exploits/52021)**, and there is a CVE that can lead to RCE.
+
+```bash
+$ python3 52021.py http://10.10.11.58               
+Backdrop CMS 1.27.1 - Remote Command Execution Exploit
+Evil module generating...
+Evil module generated! shell.zip
+Go to http://10.10.11.58/admin/modules/install and upload the shell.zip for Manual Installation.
+Your shell address: http://10.10.11.58/modules/shell/shell.php
+```
+
+This will create a zip file, but only `tar tgz gz bz2` are allowed to upload, so we convert it to a `tar` file.
+
+```
+tar -cvf shell.tar shell/
+```
+
+Go to **Manual Installation** and upload.
+
+Then after success go to `/model/shell/shell.php` as shown by the python script above.
+
+We just create a revshell and get into user `www-data`
+
+<center>
+  <img src="/assets/machine/dog/nc.png" className="img-post" />
+</center>
+
+Remember in the git folder we got MySQL credentials? When I log in I also found a username `jobert` and its hash, but when cracked I did not get anything.
+
+<center>
+  <img src="/assets/machine/dog/home.jpg" className="img-post" />
+</center>
+
+## johncusack
+
+I tried using the password we found earlier and to log in to MySQL it turns out it can also be used for the user `johncusack`.
+
+and we get the user flag here.
+
+
+# ROOT
+
+We check using **sudo -l**
+
+```bash
+[sudo] password for johncusack: 
+Matching Defaults entries for johncusack on dog:
+    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/local/bin\:/usr/sbin\:/usr/bin\:/sbin\:/bin\:/snap/bin
+
+User johncusack may run the following commands on dog:
+    (ALL : ALL) /usr/local/bin/bee
+```
+
+We check `/usr/local/bin/bee`
+
+```
+#!/usr/bin/env php
+<?php
+/**
+ * @file
+ * A command line utility for Backdrop CMS.
+ */
+
+// Exit gracefully with a meaningful message if installed within a web
+// accessible location and accessed in the browser.
+if (!bee_is_cli()) {
+  echo bee_browser_load_html();
+  die();
+}
+
+// Set custom error handler.
+set_error_handler('bee_error_handler');
+
+// Include files.
+require_once __DIR__ . '/includes/miscellaneous.inc';
+require_once __DIR__ . '/includes/command.inc';
+require_once __DIR__ . '/includes/render.inc';
+require_once __DIR__ . '/includes/filesystem.inc';
+require_once __DIR__ . '/includes/input.inc';
+require_once __DIR__ . '/includes/globals.inc';
+
+// Main execution code.
+bee_initialize_server();
+bee_parse_input();
+bee_initialize_console();
+bee_process_command();
+bee_print_messages();
+bee_display_output();
+exit();
+
+/**
+ * Custom error handler for `bee`.
+ *
+ * @param int $error_level
+ *   The level of the error.
+ * @param string $message
+ *   Error message to output to the user.
+ * @param string $filename
+ *   The file that the error came from.
+ * @param int $line
+ *   The line number the error came from.
+ * @param array $context
+ *   An array of all variables from where the error was triggered.
+ *
+ * @see https://www.php.net/manual/en/function.set-error-handler.php
+ * @see _backdrop_error_handler()
+ */
+function bee_error_handler($error_level, $message, $filename, $line, array $context = NULL) {
+  require_once __DIR__ . '/includes/errors.inc';
+  _bee_error_handler_real($error_level, $message, $filename, $line, $context);
+}
+
+/**
+ * Detects whether the current script is running in a command-line environment.
+ */
+function bee_is_cli() {
+  return (empty($_SERVER['SERVER_SOFTWARE']) && (php_sapi_name() == 'cli' || (is_numeric($_SERVER['argc']) && $_SERVER['argc'] > 0)));
+}
+
+/**
+ * Return the HTML to display if this page is loaded in the browser.
+ *
+ * @return string
+ *   The concatentated html to display.
+ */
+function bee_browser_load_html() {
+  // Set the title to use in h1 and title elements.
+  $title = "Bee Gone!";
+  // Place a white block over "#!/usr/bin/env php" as this is output before
+  // anything else.
+  $browser_output = "<div style='background-color:white;position:absolute;width:15rem;height:3rem;top:0;left:0;z-index:9;'>&nbsp;</div>";
+  // Add the bee logo and style appropriately.
+  $browser_output .= "<img src='./images/bee.png' align='right' width='150' height='157' style='max-width:100%;margin-top:3rem;'>";
+  // Add meaningful text.
+  $browser_output .= "<h1 style='font-family:Tahoma;'>$title</h1>";
+  $browser_output .= "<p style='font-family:Verdana;'>Bee is a command line tool only and will not work in the browser.</p>";
+  // Add the document title using javascript when the window loads.
+  $browser_output .= "<script>window.onload = function(){document.title='$title';}</script>";
+  // Output the combined string.
+  return $browser_output;
+}
+```
+
+
+This is a tool to manage Backdrop CMS via the CLI, and at a glance we can see that it can run PHP scripts, this is where we can get root access.
+
+However here we have to do it from the path **/var/www/html** to be able to run it.
+
+<center>
+  <img src="/assets/machine/dog/root.jpg" className="img-post" />
+</center>
+
+Rooted.
