@@ -72,15 +72,16 @@ export default function Navbar() {
 
   return (
     <header className="sticky top-0 z-50 border-b border-black/10 dark:border-white/10 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/70">
-      <nav className="mx-auto max-w-5xl px-4 h-14 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <button
-            className="md:hidden p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
-            aria-label={open ? "Tutup menu" : "Buka menu"}
-            onClick={() => setOpen((v) => !v)}
-          >
-            {open ? <X size={18} /> : <Menu size={18} />}
-          </button>
+      <nav className="relative mx-auto max-w-5xl px-4 h-14 flex items-center justify-center md:justify-between">
+        <button
+          className="md:hidden absolute left-4 p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
+          aria-label={open ? "Tutup menu" : "Buka menu"}
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? <X size={18} /> : <Menu size={18} />}
+        </button>
+
+        <div className="flex items-center gap-3 mx-auto md:mx-0">
           <Image
             src="/assets/hades-logo.png"
             alt="Hadespwnme logo"
@@ -124,7 +125,7 @@ export default function Navbar() {
           ))}
         </ul>
 
-        <div className="flex items-center gap-2">
+        <div className="hidden md:flex items-center gap-2">
           <a
             href="https://github.com/hadespwnme"
             target="_blank"
@@ -156,7 +157,7 @@ export default function Navbar() {
       </nav>
 
       {open && (
-        <div className="md:hidden border-t border-black/10 dark:border-white/10 bg-background/95">
+        <div className="md:hidden bg-background/95">
           <ul className="mx-auto max-w-5xl px-4 py-3 space-y-2">
             {navItems.map((item) => (
               <li key={item.href}>
@@ -170,6 +171,36 @@ export default function Navbar() {
               </li>
             ))}
           </ul>
+
+          <div className="mx-auto max-w-5xl px-4 py-3">
+            <div className="flex items-center justify-center gap-3">
+              <a
+                href="https://github.com/hadespwnme"
+                target="_blank"
+                rel="noreferrer"
+                aria-label="GitHub"
+                className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
+              >
+                <Github size={18} />
+              </a>
+
+              <button
+                className="px-2 py-1 text-xs rounded-md border border-black/10 dark:border-white/15 hover:bg-black/5 dark:hover:bg-white/10"
+                aria-label="Pilih bahasa"
+                onClick={() => toggleLang()}
+              >
+                {lang.toUpperCase()}
+              </button>
+
+              <button
+                className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
+                aria-label="Toggle tema"
+                onClick={toggleTheme}
+              >
+                {dark ? <Sun size={16} /> : <Moon size={16} />}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </header>

