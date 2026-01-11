@@ -73,6 +73,38 @@ html {
   margin-top: 1.25rem;
 }
 
+.prose ul,
+.prose ol {
+  padding-left: 1.5rem;
+  margin: 1rem 0;
+}
+
+.prose ul {
+  list-style: disc;
+}
+
+.prose ol {
+  list-style: decimal;
+}
+
+.prose ul ul {
+  list-style: circle;
+}
+
+.prose li + li {
+  margin-top: 0.25rem;
+}
+
+.prose li > ul,
+.prose li > ol {
+  margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.prose li::marker {
+  color: color-mix(in oklab, var(--foreground) 70%, transparent);
+}
+
 .prose img {
   display: block;
   margin: 1.25rem auto;
@@ -95,6 +127,31 @@ html {
   margin-top: 1rem;
   margin-bottom: 0.5rem;
   font-weight: 600;
+}
+
+.light .prose h2,
+.light .prose h2 > a {
+  color: #2563eb;
+}
+
+.dark .prose h2,
+.dark .prose h2 > a {
+  color: #60a5fa;
+}
+
+.light .prose h3,
+.light .prose h3 > a {
+  color: #0f766e;
+}
+
+.dark .prose h3,
+.dark .prose h3 > a {
+  color: #5eead4;
+}
+
+.prose h2 > a,
+.prose h3 > a {
+  text-decoration: none;
 }
 
 .prose pre {

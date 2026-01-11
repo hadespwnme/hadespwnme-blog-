@@ -12,7 +12,7 @@
     "build:fresh": "npm run clean && next build --turbopack",
     "start": "next start",
     "lint": "eslint",
-    "check:parity": "node scripts/check-parity.js"
+    "check:parity": "node scripts/check-parity.mjs"
   },
   "dependencies": {
     "@next/mdx": "^15.5.2",

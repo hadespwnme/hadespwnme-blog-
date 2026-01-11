@@ -16,6 +16,8 @@ export type PostFrontmatter = {
   categories?: string[];
   tags?: string[];
   cover?: string;
+  achievement?: string;
+  achievment?: string;
 };
 
 export type PostMeta = PostFrontmatter & {
@@ -28,25 +30,42 @@ const POSTS_DIR = path.join(process.cwd(), "content", "posts");
 
 type PostLang = Lang | undefined;
 
-function parseFilename(file: string): { base: string; lang: PostLang } | null {
-  if (!file.endsWith(".mdx")) return null;
-  const m = file.match(/^(.*)\.(id|en)\.mdx$/);
-  if (m) {
-    return { base: m[1], lang: m[2] as Lang };
+function parsePostPath(filePath: string): { base: string; lang: PostLang } | null {
+  if (!filePath.endsWith(".mdx")) return null;
+
+  const rel = path.relative(POSTS_DIR, filePath);
+  const parts = rel.split(path.sep).filter(Boolean);
+  if (parts.length === 2 && (parts[0] === "id" || parts[0] === "en")) {
+    return { base: parts[1].replace(/\.mdx$/, ""), lang: parts[0] as Lang };
   }
+
+  const file = parts.at(-1) ?? path.basename(filePath);
+  const m = file.match(/^(.*)\.(id|en)\.mdx$/);
+  if (m) return { base: m[1], lang: m[2] as Lang };
   return { base: file.replace(/\.mdx$/, ""), lang: undefined };
 }
 
-function listPostFiles() {
-  if (!fs.existsSync(POSTS_DIR)) return [] as string[];
-  return fs.readdirSync(POSTS_DIR).filter((f) => f.endsWith(".mdx"));
+function listMdxFilesIn(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith(".mdx"))
+    .map((f) => path.join(dir, f));
+}
+
+function listPostFiles(): string[] {
+  return [
+    ...listMdxFilesIn(POSTS_DIR),
+    ...listMdxFilesIn(path.join(POSTS_DIR, "id")),
+    ...listMdxFilesIn(path.join(POSTS_DIR, "en")),
+  ];
 }
 
 function getAllBaseSlugs(): string[] {
   const files = listPostFiles();
   const set = new Set<string>();
   for (const f of files) {
-    const info = parseFilename(f);
+    const info = parsePostPath(f);
     if (info) set.add(info.base);
   }
   return Array.from(set);
@@ -54,17 +73,23 @@ function getAllBaseSlugs(): string[] {
 
 function resolveFileFor(slug: string, preferred?: Lang): string | null {
   if (preferred) {
-    const p = path.join(POSTS_DIR, `${slug}.${preferred}.mdx`);
+    const p = path.join(POSTS_DIR, preferred, `${slug}.mdx`);
     if (fs.existsSync(p)) return p;
+    const pLegacy = path.join(POSTS_DIR, `${slug}.${preferred}.mdx`);
+    if (fs.existsSync(pLegacy)) return pLegacy;
   }
   const legacy = path.join(POSTS_DIR, `${slug}.mdx`);
   if (fs.existsSync(legacy)) return legacy;
   const alt: Lang = preferred === "id" ? "en" : "id";
-  const p2 = path.join(POSTS_DIR, `${slug}.${alt}.mdx`);
+  const p2 = path.join(POSTS_DIR, alt, `${slug}.mdx`);
   if (fs.existsSync(p2)) return p2;
+  const p2Legacy = path.join(POSTS_DIR, `${slug}.${alt}.mdx`);
+  if (fs.existsSync(p2Legacy)) return p2Legacy;
   for (const lang of ["id", "en"] as Lang[]) {
-    const p3 = path.join(POSTS_DIR, `${slug}.${lang}.mdx`);
+    const p3 = path.join(POSTS_DIR, lang, `${slug}.mdx`);
     if (fs.existsSync(p3)) return p3;
+    const p3Legacy = path.join(POSTS_DIR, `${slug}.${lang}.mdx`);
+    if (fs.existsSync(p3Legacy)) return p3Legacy;
   }
   return null;
 }

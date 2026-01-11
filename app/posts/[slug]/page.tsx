@@ -1,12 +1,11 @@
 import AuthorCard from "@/components/AuthorCard";
 import Toc from "@/components/Toc";
-import { getAllPostsMeta, getAllSlugs, getPost } from "@/lib/posts";
+import { getAllPostsMeta, getPost } from "@/lib/posts";
 import { notFound } from "next/navigation";
 import { getServerLang } from "@/lib/i18n-server";
+import AchievementBadge from "@/components/AchievementBadge";
 
-export async function generateStaticParams() {
-  return getAllSlugs().map((slug) => ({ slug }));
-}
+export const dynamic = "force-dynamic";
 
 export default async function PostPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -28,9 +27,10 @@ export default async function PostPage({ params }: { params: Promise<{ slug: str
   return (
     <article className="space-y-6">
       <header>
-        <h1 className="text-3xl font-bold tracking-tight" data-aos="fade-up">
-          {meta.title}
-        </h1>
+        <div className="flex items-start justify-between gap-3" data-aos="fade-up">
+          <h1 className="text-3xl font-bold tracking-tight">{meta.title}</h1>
+          <AchievementBadge achievement={meta.achievement ?? meta.achievment ?? null} className="mt-1 shrink-0" />
+        </div>
         <div className="text-sm text-foreground/60 mt-1" data-aos="fade-up" data-aos-delay="50">
           {meta.date} · {meta.words} {t.words} · {meta.minutes} {t.minutes}
         </div>

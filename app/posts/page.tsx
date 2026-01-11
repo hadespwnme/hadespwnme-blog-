@@ -3,6 +3,7 @@ import { getAllPostsMeta } from "@/lib/posts";
 import { getServerLang } from "@/lib/i18n-server";
 import CategoryChip from "@/components/CategoryChip";
 import TagChip from "@/components/TagChip";
+import AchievementBadge from "@/components/AchievementBadge";
 
 const PAGE_SIZE = 10;
 
@@ -28,10 +29,14 @@ export default async function PostsPage({
         {items.map((p, i) => (
           <article
             key={p.slug}
-            className="rounded-lg p-4 border border-black/20 dark:border-white/20 shadow-sm hover:-translate-y-0.5 hover:shadow-md transition dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]"
+            className="relative rounded-lg p-4 border border-black/20 dark:border-white/20 shadow-sm hover:-translate-y-0.5 hover:shadow-md transition dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]"
             data-aos="fade-up"
             data-aos-delay={i * 50}
           >
+            <AchievementBadge
+              achievement={p.achievement ?? p.achievment ?? null}
+              variant="corner"
+            />
             <h3 className="font-semibold leading-tight mb-1">
               <Link href={`/posts/${p.slug}`}>{p.title}</Link>
             </h3>

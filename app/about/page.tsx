@@ -13,7 +13,8 @@ export default async function AboutPage() {
           aboutSiteBody:
             "Blog ini dibuat untuk dokumentasi writeup dalam bermain CTF. Dan saya membuatnya menggunakan Next Js dengan tema terinspirasi dari Tema Blowfish.",
           whoami: "Whoami",
-          whoamiBody: "Halo, saya seorang penggemar keamanan siber dan pemain CTF dari Jakarta, Indonesia. Saya juga anggota TCP1P, di mana saya berpartisipasi dalam berbagai kompetisi CTF.",
+          whoamiBody:
+            "Halo, nama saya Amar a.k.a Hades, saya dari Jakarta, Indonesia. Saya seorang Cyber Security Enthusiast dan pemain CTF. Saya bermain CTF sebagai hobi, dan juga ikut kompetisi CTF.\n\nMinat saya meliputi reverse engineering, pwn/binary exploitation, dan web security. Selain itu, saya juga suka membuat challenge dan menjadi probset di beberapa kompetisi CTF.",
           blogContent: "Konten Blog",
           blogContentBody: "Writeup untuk CTF / Pentest",
           latest: "Terbaru",
@@ -27,7 +28,8 @@ export default async function AboutPage() {
           aboutSiteBody:
             "This blog documents my CTF writeups. I built it with Next.js and a theme inspired by the Blowfish theme.",
           whoami: "Whoami",
-          whoamiBody: "Hello, I am a cyber security enthusiast and CTF player from Jakarta, Indonesia. Also, I am a member of TCP1P, where I participate in various CTF competitions.",
+          whoamiBody:
+            "Hello, my name is Amar a.k.a Hades, i am from jakarta, Indonesia. I am a Cyber Security Enthusiast and CTF player. I play ctf as my hobby, and also i play in ctf platform.\n\nMy interest span reverse engineering, pwn/binary exploitation, and web security. Besides that, i loved to create challenge and be a probset in few ctf platform.",
           blogContent: "Blog Content",
           blogContentBody: "Writeups for CTF / Pentest",
           latest: "Latest",
@@ -49,7 +51,7 @@ export default async function AboutPage() {
         <p>{t.aboutSiteBody}</p>
 
         <h2 className="flex items-center gap-2"><User size={16} className="opacity-70" /> {t.whoami}</h2>
-        <p>
+        <p className="whitespace-pre-line">
           {t.whoamiBody.split(/(pentesting|CTF|infrastruktur|infrastructure)/).map((s, i) =>
             s === "pentesting" || s === "CTF" || s === "infrastructure" || s === "infrastruktur" ? (
               <code key={i}>{s}</code>

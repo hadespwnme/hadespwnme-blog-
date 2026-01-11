@@ -1,0 +1,1385 @@
+---
+layout: post
+title: "SNI CTF 2025 - Reverse Engineering"
+date: 2025-12-13
+image: /assets/.
+categories: ["SNI"]
+tags: [rev, ctf2025]
+excerpt: " "
+---
+
+## againN2
+
+### Intro
+
+Challenge **againN2** tampil sederhana: arsip `dist.zip` berisi satu ELF `main` dan file `r` yang tampak seperti ciphertext. Ketika dijalankan, binary cuma minta input dan mengembalikan `Encoded message: 1` untuk input apa pun. Kedengarannya seperti encoder 1 arah — tapi kita diminta “solve it”, berarti yang disimpan di `r` adalah flag yang dikodekan oleh binary ini. Mari buka dan bedah.
+
+---
+
+### Recon: “ini encoder apa sih?”
+
+Isi folder setelah ekstrak:
+
+```bash
+$ unzip dist.zip
+$ ls
+main  r
+$ cat r
+tRDyU3W3Uu3/3SodS33UdSo/mhu8sFW8/WF/Md8uwBGk
+```
+
+`main` adalah PIE 64-bit yang sudah di-strip:
+
+```bash
+$ file main
+ELF 64-bit LSB pie executable, x86-64, dynamically linked, stripped
+```
+
+Running tanpa argumen:
+
+```bash
+$ ./main
+Enter message: test
+Encoded message: BMm
+```
+
+Outputnya pendek, jadi kemungkinan setiap karakter input dipetakan per-karakter ke tabel tertentu. Waktunya melihat ASM.
+
+---
+
+### Bedah singkat `.text`: bit swap + tabel 62-char
+
+`objdump -d main` menunjukkan tiga blok penting:
+
+1) **Fungsi mungil di 0x11c9** — ini memanipulasi bit input sebelum dipakai:
+
+```asm
+11c9: mov edi, edi
+11d6: shr  al, 1          ; b1 = (x>>1) & 1
+11e6: shr  al, 5          ; b5 = (x>>5) & 1
+11ef: cmp  [rbp-0x1], al  ; bandingkan b1 dan b5
+11f8: xorb $0x2, [rbp-0x14]   ; toggle bit1 jika beda
+11fc: xorb $0x20, [rbp-0x14]  ; toggle bit5 jika beda
+1200: movzx eax, BYTE PTR [rbp-0x14]
+```
+
+Pseudocode-nya:
+
+```c
+uint8_t twiddle(uint8_t x) {
+    uint8_t b1 = (x >> 1) & 1;
+    uint8_t b5 = (x >> 5) & 1;
+    if (b1 != b5) {
+        x ^= 0x02; // flip bit1
+        x ^= 0x20; // flip bit5
+    }
+    return x;
+}
+```
+
+2) **Encoder utama di 0x1206** — melintasi string input dan mengisi buffer output:
+
+```asm
+1221: call 1090 <strlen@plt>           ; len = strlen(msg)
+1239: ... movzx eax, BYTE PTR [rax]    ; ambil char
+124e: call 11c9 <twiddle>
+1256: and eax, 0x3f                    ; pakai 6 bit
+127a: lea rcx, [rip+0xd9f]  ; 0x2020
+1281: movzx eax, BYTE PTR [rax+rcx]    ; lookup tabel
+1285: mov    BYTE PTR [rdx], al        ; tulis output
+1293: ...                              ; loop sampai len
+12a0: mov BYTE PTR [rax], 0            ; null-terminate
+```
+
+3) **Main di 0x12aa** — alur program:
+
+```c
+char in[0x100], out[0x100];
+printf("Enter message: ");
+fgets(in, 0x100, stdin);
+in[strcspn(in, "\n")] = 0;              // buang newline
+encode(in, out);                        // fungsi di 0x1206
+printf("Encoded message: %s\n", out);
+```
+
+Tabel lookup berada di `.rodata` pada offset `0x2020`:
+
+```
+Z1aB2bC3cD4dE5eF6fG7gH8hI9iJ0jKkLlMmNnOoPpQqRrSsTtUuVvWwXxYy+/
+```
+
+Total 62 karakter (angka 62 dan 63 tidak dipakai karena hasil `twiddle(x) & 0x3f` tidak pernah 62–63).
+
+---
+
+### Memutar balik encoder: cari plaintext dari `r`
+
+Encoder bersifat deterministik per-karakter:
+
+```
+out[i] = table[ twiddle(in[i]) & 0x3f ]
+```
+
+Untuk me reverse, cukup:
+
+1. Ambil karakter output `c`.
+2. Cari indeks `idx = table.index(c)`.
+3. Enumerasi `x` yang mungkin di ASCII printable, pilih yang memenuhi `(twiddle(x) & 0x3f) == idx`.
+
+Karena `twiddle` hanya menukar bit1/bit5 ketika beda, setiap `idx` punya 1–2 kandidat. Sudah cukup untuk brute-force dengan preferensi karakter alfanumerik/kronologis.
+
+```py
+alphabet = "Z1aB2bC3cD4dE5eF6fG7gH8hI9iJ0jKkLlMmNnOoPpQqRrSsTtUuVvWwXxYy+/"
+
+def twiddle(x: int) -> int:
+    b1 = (x >> 1) & 1
+    b5 = (x >> 5) & 1
+    if b1 != b5:
+        x ^= 0x02
+        x ^= 0x20
+    return x
+
+def decode_char(c):
+    idx = alphabet.index(c)
+    return [chr(x) for x in range(32, 127) if (twiddle(x) & 0x3f) == idx]
+
+def decode(s):
+    res = []
+    for ch in s:
+        cand = decode_char(ch)
+        # pilih yang kelihatan “masuk akal”: huruf/angka/braces
+        res.append(cand[0])
+    return "".join(res)
+
+enc = "tRDyU3W3Uu3/3SodS33UdSo/mhu8sFW8/WF/Md8uwBGk"
+print(decode(enc))
+```
+
+Output langsung membentuk flag yang readable:
+
+```
+SNI{reverse_engineering_custom64_vm_bitswap}
+```
+
+### Flag
+
+`SNI{reverse_engineering_custom64_vm_bitswap}`
+
+---
+
+
+
+## Jajajaja
+
+### Intro
+
+Challenge **Jajajaja** ini kelihatannya simpel banget: satu `Jajajaja.exe`, kalau dijalankan muncul jendela “activation” ala software bajakan, dan kita diminta masukin *license key* berbentuk empat blok hex yang dipisah tanda minus.
+
+Di permukaan, ini terasa seperti “product key validator” biasa. Tapi begitu dibongkar, ternyata ada:
+
+- Sebuah fungsi *bit‑twiddling* yang agresif di Java bytecode,
+- Sebuah panel “SUCCESS!” yang nyembunyiin dekripsi ChaCha20,
+- Dan satu environment variable yang sengaja diselipin di dalam stub Windows launcher.
+
+Di write-up ini aku ajak kamu jalan pelan tapi tajam: mulai dari recon, reversing `KeyValidator` pakai Z3, ngupas `Flag` + `ChaCha20`, sampai akhirnya keluar flag yang sebenarnya.
+
+---
+
+### Recon: “.exe” tapi isinya Java?
+
+Mulai dari yang paling basic:
+
+```bash
+$ ls
+Jajajaja.exe
+
+$ file Jajajaja.exe
+Jajajaja.exe: Zip archive, with extra data prepended
+```
+
+`.exe` tapi tips dari `file` bilang ini ZIP dengan “extra data” di depan — klasik *Launch4j*-style wrapper buat Java .jar.
+
+List isi arsipnya:
+
+```bash
+$ unzip -l Jajajaja.exe
+Archive:  Jajajaja.exe
+warning [Jajajaja.exe]:  63488 extra bytes at beginning or within zipfile
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+     1891  ...               com/flab/jajajaja/ChaCha20.class
+      793  ...               com/flab/jajajaja/CodeUI$1.class
+     3471  ...               com/flab/jajajaja/CodeUI.class
+     2430  ...               com/flab/jajajaja/Flag.class
+      586  ...               com/flab/jajajaja/Jajajaja.class
+     1511  ...               com/flab/jajajaja/KeyValidator.class
+...
+```
+
+Extract dulu:
+
+```bash
+$ unzip -o Jajajaja.exe -d extracted
+```
+
+Struktur package-nya rapi: `Jajajaja` sebagai entry point, `CodeUI` buat UI activation, `KeyValidator` buat cek key, `Flag` buat tampilan sukses, dan `ChaCha20` yang kelihatan “lebih penting” dari namanya.
+
+---
+
+### Melihat UI & alur besar
+
+Kita nggak butuh full decompiler dulu; cukup `javap` untuk ngintip bytecode dan struktur class.
+
+Entry point:
+
+```bash
+$ javap -classpath extracted -c com.flab.jajajaja.Jajajaja
+Compiled from "Jajajaja.java"
+public class com.flab.jajajaja.Jajajaja {
+  public static void main(java.lang.String[]);
+    Code:
+       0: new           #7                  // class com/flab/jajajaja/Jajajaja$1
+       3: dup
+       4: invokespecial #9                  // Method com/flab/jajajaja/Jajajaja$1."<init>":()V
+       7: invokestatic  #10                 // Method java/awt/EventQueue.invokeLater:(Ljava/lang/Runnable;)V
+      10: return
+}
+```
+
+Inner class `Jajajaja$1` ternyata cuma bikin `JFrame` dan mengisi konten dengan `CodeUI`:
+
+```bash
+$ javap -classpath extracted -c com.flab.jajajaja.Jajajaja\$1
+...
+  public void run();
+    Code:
+       0: new           #7                  // class javax/swing/JFrame
+       3: dup
+       4: ldc           #9                  // String Jajajaja Activator
+...
+      50: aload_1
+      51: new           #43                 // class com/flab/jajajaja/CodeUI
+      54: dup
+      55: invokespecial #45                 // Method com/flab/jajajaja/CodeUI."<init>":()V
+      58: invokevirtual #46                 // Method javax/swing/JFrame.add:(Ljava/awt/Component;)Ljava/awt/Component;
+      61: pop
+...
+```
+
+Lanjut ke `CodeUI`, bagian yang menarik ada di handler tombol ACTIVATE:
+
+```bash
+$ javap -classpath extracted -c -p com.flab.jajajaja.CodeUI | sed -n '260,520p'
+...
+  private void activateButtonActionPerformed(java.awt.event.ActionEvent);
+    Code:
+       0: aload_0
+       1: getfield      #34                 // keyField
+       4: invokevirtual #135                // JTextField.getText:()Ljava/lang/String;
+       7: invokevirtual #139                // String.trim:()Ljava/lang/String;
+      10: astore_2
+      11: aload_2
+      12: invokestatic  #144                // KeyValidator.validate:(Ljava/lang/String;)Z
+      15: ifeq          56
+      18: aload_0
+      19: invokestatic  #150                // SwingUtilities.getWindowAncestor
+...
+      33: aload_3
+      34: new           #167                // new Flag()
+      37: dup
+      38: invokespecial #169                // Flag.<init>
+      41: invokevirtual #170                // JFrame.add(Component)
+...
+      56: ... setText("Invalid License Key. Please try again.")
+```
+
+Jadi alurnya:
+
+1. User input license key di `keyField`.
+2. `KeyValidator.validate(key)` dipanggil.
+3. Kalau valid → frame di-*wipe* dan diisi panel `Flag`, kalau tidak → pesan error merah.
+
+Artinya, seluruh logika RE‑nya ada di dua kelas:
+
+- `KeyValidator` (cek key)
+- `Flag` + `ChaCha20` (apa yang ditampilkan setelah valid).
+
+---
+
+### Reversing `KeyValidator`: constraint fest
+
+Mari fokus ke fungsi statis `validate(String)`:
+
+```bash
+$ javap -classpath extracted -c com.flab.jajajaja.KeyValidator
+```
+
+Potongan pentingnya:
+
+```text
+  public static boolean validate(java.lang.String);
+    Code:
+       0: aload_0
+       1: ifnull        13
+       4: aload_0
+       5: invokevirtual #7     // String.length()
+       8: bipush        35
+      10: if_icmpeq     15
+      13: iconst_0
+      14: ireturn
+      15: aload_0
+      16: ldc           #13    // "-"
+      18: invokevirtual #15    // String.split("-")
+      21: astore_1
+      22: aload_1
+      23: arraylength
+      24: iconst_4
+      25: if_icmpeq     30
+      28: iconst_0
+      29: ireturn
+```
+
+Sampai sini, formatnya jelas:
+
+- Panjang string harus 35,
+- Format: `xxxxxxxx-xxxxxxxx-xxxxxxxx-xxxxxxxx` (4 blok, 8 hex per blok → 4×8 + 3 `-` = 35).
+
+Lanjut sedikit lagi — di sini mulai menarik:
+
+```text
+      30: aload_1
+      31: iconst_0
+      32: aaload
+      33: bipush        16
+      35: invokestatic  #19   // Long.parseLong(part0, 16)
+      38: lstore_2            // a
+      39: aload_1
+      40: iconst_1
+      41: aaload
+      42: bipush        16
+      44: invokestatic  #19   // Long.parseLong(part1, 16)
+      47: lstore        4      // b
+      49: aload_1
+      50: iconst_2
+      51: aaload
+      52: bipush        16
+      54: invokestatic  #19   // part2
+      57: lstore        6      // c
+      59: aload_1
+      60: iconst_3
+      61: aaload
+      62: bipush        16
+      64: invokestatic  #19   // part3
+      67: lstore        8      // d
+```
+
+Empat blok hex di-cast ke `long` 64‑bit (tapi nanti dipotong ke 32‑bit lewat mask). Setelah itu, ada rangkaian check bitwise / aritmetika:
+
+```text
+      69: lload_2
+      70: lload         4
+      72: lxor
+      73: ldc2_w        #25   // 991153055
+      76: lcmp
+      77: ifeq          82
+      80: iconst_0
+      81: ireturn
+
+      82: lload         4
+      84: lload         6
+      86: ladd
+      87: ldc2_w        #27   // 4294967295
+      90: land
+      91: ldc2_w        #29   // 3548082989
+      94: lcmp
+      95: ifeq          100
+      98: iconst_0
+      99: ireturn
+
+     100: lload_2
+     101: ldc2_w        #31   // 4919
+     104: lmul
+     105: ldc2_w        #27   // 2^32-1
+     108: land
+     109: ldc2_w        #33   // 2871439159
+     112: lcmp
+     113: ifeq          118
+     116: iconst_0
+     117: ireturn
+```
+
+Dilanjut:
+
+```text
+     118: lload         6
+     120: lload         8
+     122: land
+     123: ldc2_w        #35   // 3195405
+...
+     132: lload         6
+     134: lload         8
+     136: lxor
+     137: ldc2_w        #37   // 2882216434
+...
+     146: lload         4
+     148: bipush        13
+     150: lshl
+     151: lload         4
+     153: bipush        19
+     155: lushr
+     156: lor
+     157: ldc2_w        #27   // & 0xffffffff
+     160: land
+     161: lstore        10    // e = rol32(b,13)
+     163: lload         10
+     165: ldc2_w        #39   // 3735928559
+     168: lxor
+     169: ldc2_w        #41   // 794719367
+...
+     178: lload_2
+     179: lload         4
+     181: ladd
+     182: lload         6
+     184: ladd
+     185: lload         8
+     187: ladd
+     188: ldc2_w        #43   // 65535
+     191: land
+     192: ldc2_w        #45   // 31147
+...
+     201: lload_2
+     202: lload         8
+     204: lxor
+     205: invokestatic  #47   // Long.bitCount
+     208: bipush        15
+...
+     215: lload_2
+     216: bipush        16
+     218: lushr
+     219: lload         4
+     221: bipush        16
+     223: lushr
+     224: ladd
+     225: lload         6
+     227: bipush        16
+     229: lushr
+     230: ladd
+     231: lload         8
+     233: bipush        16
+     235: lushr
+     236: ladd
+     237: lstore        12
+     239: lload         12
+     241: ldc2_w        #43   // & 0xffff
+     244: land
+     245: ldc2_w        #51   // 26566
+...
+     254: iconst_1
+     255: ireturn
+```
+
+Kalau kita tulis ulang sebagai *pseudocode* (alamat di sini aku pake offset bytecode sebagai “address”:
+
+```text
+// validate(String key) @ bytecode 0
+if (key == null) return false;                   // 0–13
+if (key.length() != 35) return false;           // 4–10
+
+parts = key.split("-");                         // 15–21
+if (parts.length != 4) return false;            // 22–29
+
+// parse 4 blok hex
+a = parseLong(parts[0], 16);                    // 30–38
+b = parseLong(parts[1], 16);                    // 39–47
+c = parseLong(parts[2], 16);                    // 49–57
+d = parseLong(parts[3], 16);                    // 59–67
+
+// constraint 1: XOR
+if ( (a ^ b) != 991153055 ) return false;       // 69–81
+
+// constraint 2: (b+c) mod 2^32
+if ( ((b + c) & 0xffffffff) != 3548082989L )    // 82–99
+  return false;
+
+// constraint 3: (a * 4919) mod 2^32
+if ( (a * 4919L & 0xffffffffL) != 2871439159L ) // 100–117
+  return false;
+
+// constraint 4–5: AND dan XOR antara c dan d
+if ( (c & d) != 3195405L ) return false;        // 118–131
+if ( (c ^ d) != 2882216434L ) return false;     // 132–145
+
+// constraint 6: rotasi b, lalu xor dengan 0xDEADBEEF
+e = Integer.rotateLeft((int)b, 13) & 0xffffffffL; // 146–161
+if ( (e ^ 3735928559L) != 794719367L )          // 163–177
+  return false;
+
+// constraint 7: jumlah 4 blok (mod 2^16)
+if ( ((a + b + c + d) & 0xffffL) != 31147L )    // 178–200
+  return false;
+
+// constraint 8: bitcount(a ^ d) == 15
+if ( Long.bitCount(a ^ d) != 15 )               // 201–214
+  return false;
+
+// constraint 9: jumlah upper 16 bit dari tiap blok (mod 2^16)
+sum_hi = (a >>> 16) + (b >>> 16) + (c >>> 16) + (d >>> 16);  // 215–237
+if ( (sum_hi & 0xffffL) != 26566L ) return false;            // 239–249
+
+return true;                                     // 254–255
+```
+
+Secara manual ini bisa di-*massage* jadi sistem persamaan mod 2^32, tapi jauh lebih enak dicolok ke solver SMT. Di sini aku pakai Z3 lewat Python.
+
+---
+
+### Memecahkan license key dengan Z3
+
+Kita treat `a, b, c, d` sebagai 32‑bit unsigned dan langsung encode semua constraint di atas:
+
+```python
+from z3 import *
+
+MASK32 = (1 << 32) - 1
+
+a, b, c, d = [BitVec(v, 32) for v in 'abcd']
+s = Solver()
+
+s.add((a ^ b) == 991153055)
+s.add((b + c) & MASK32 == 3548082989)
+s.add((a * 4919) & MASK32 == 2871439159)
+s.add((c & d) == 3195405)
+s.add((c ^ d) == 2882216434)
+
+rot = ((b << 13) | LShR(b, 19)) & MASK32
+s.add((rot ^ 3735928559) == 794719367)
+
+s.add((a + b + c + d) & 0xffff == 31147)
+
+x = a ^ d
+pop = Sum([ZeroExt(32-1, Extract(i, i, x)) for i in range(32)])
+s.add(pop == 15)
+
+s.add(((LShR(a,16) + LShR(b,16) + LShR(c,16) + LShR(d,16)) & 0xffff) == 26566)
+
+print(s.check())
+if s.check() == sat:
+    m = s.model()
+    vals = [m[v].as_long() & MASK32 for v in (a, b, c, d)]
+    print('hex:')
+    for v in vals:
+        print(f"{v:08x}")
+```
+
+Jalankan:
+
+```bash
+$ python solve_key.py
+sat
+hex:
+68544401
+53478f9e
+8033e38f
+2bf8c27d
+```
+
+Jadi license key yang valid adalah:
+
+```text
+68544401-53478F9E-8033E38F-2BF8C27D
+```
+
+Sampai sini, kita sudah bisa “mengaktifkan” software. Tapi itu belum flag — panel `Flag` nunjukin sesuatu yang lain.
+
+---
+
+### Panel Flag & ChaCha20: di mana flag sebenarnya?
+
+Sekarang saatnya ngintip kelas `Flag`:
+
+```bash
+$ javap -classpath extracted -c -p com.flab.jajajaja.Flag
+Compiled from "Flag.java"
+public class com.flab.jajajaja.Flag extends javax.swing.JPanel {
+  private javax.swing.JTextField flagField;
+  private javax.swing.JLabel successLabel;
+...
+  private void initComponents();
+    Code:
+       0: aload_0
+       1: new           #21                 // JLabel successLabel
+...
+     186: aload_0
+     187: getfield      #31                 // flagField
+     190: ldc           #83                 // "4cyqC2Y5nLRYn/XbyB4xg25Ie0oi3Y+4LR1YWDA="
+     192: ldc           #85                 // "oqKbQ+ltdeq80Mxk"
+     194: sipush        1337
+     197: invokestatic  #87                 // ChaCha20.decrypt(String,String,int)
+     200: invokevirtual #93                 // JTextField.setText(String)
+     203: goto          223
+     206: astore_1
+...
+```
+
+Yang menarik:
+
+- `flagField` dibuat non‑editable dan diformat monospaced.
+- `setText()` diisi dengan hasil `ChaCha20.decrypt(...)`.
+- Argumen decrypt:
+  - Ciphertext (Base64): `4cyqC2Y5nLRYn/XbyB4xg25Ie0oi3Y+4LR1YWDA=`
+  - Nonce (Base64): `oqKbQ+ltdeq80Mxk`
+  - Counter: `1337`
+
+Kalau decrypt gagal, exception message-nya dimasukkan ke text field (ini berguna untuk debugging kalau environment nggak pas).
+
+Sekarang lihat kelas `ChaCha20`:
+
+```bash
+$ javap -classpath extracted -c com.flab.jajajaja.ChaCha20
+Compiled from "ChaCha20.java"
+public class com.flab.jajajaja.ChaCha20 {
+  public static java.lang.String decrypt(java.lang.String, java.lang.String, int) throws java.lang.Exception;
+    Code:
+       0: ldc           #9                  // String MAKEY
+       2: invokestatic  #11                 // System.getenv("MAKEY")
+       5: astore_3
+       6: aload_3
+       7: ifnull        17
+      10: aload_3
+      11: invokevirtual #17                 // String.isEmpty()
+      14: ifeq          27
+      17: new           #23                 // RuntimeException("Environment variable MAKEY is not set.")
+...
+      27: invokestatic  #30                 // Base64.getDecoder()
+      30: aload_3
+      31: invokevirtual #36                 // decode(env)
+      34: astore        4                   // key bytes
+      36: invokestatic  #30                 // Base64.getDecoder()
+      39: aload_1
+      40: invokevirtual #36                 // decode(nonceB64)
+      43: astore        5                   // nonce bytes
+      45: invokestatic  #30                 // Base64.getDecoder()
+      48: aload_0
+      49: invokevirtual #36                 // decode(ctB64)
+      52: astore        6                   // ciphertext bytes
+      54: ldc           #42                 // "ChaCha20"
+      56: invokestatic  #44                 // Cipher.getInstance
+      59: astore        7                   // cipher
+      61: new           #50                 // ChaCha20ParameterSpec
+      64: dup
+      65: aload         5                    // nonce
+      67: iload_2                             // counter
+      68: invokespecial #52                 // (byte[] nonce, int counter)
+      71: astore        8
+      73: new           #55                 // SecretKeySpec
+      76: dup
+      77: aload         4                    // key bytes
+      79: ldc           #42                 // "ChaCha20"
+      81: invokespecial #57                 // SecretKeySpec(key,"ChaCha20")
+      84: astore        9
+      86: aload         7
+      88: iconst_2                           // Cipher.DECRYPT_MODE
+      89: aload         9
+      91: aload         8
+      93: invokevirtual #60                 // cipher.init(mode,key,paramSpec)
+      96: aload         7
+      98: aload         6
+     100: invokevirtual #64                 // cipher.doFinal(ct)
+     103: astore        10                  // plaintext bytes
+     105: new           #18                 // new String(...)
+     108: dup
+     109: aload         10
+     111: invokespecial #68
+     114: areturn
+}
+```
+
+Pseudocode‑nya:
+
+```java
+static String decrypt(String ctB64, String nonceB64, int counter) throws Exception {
+    String env = System.getenv("MAKEY");
+    if (env == null || env.isEmpty()) {
+        throw new RuntimeException("Environment variable MAKEY is not set.");
+    }
+
+    byte[] key   = Base64.getDecoder().decode(env);
+    byte[] nonce = Base64.getDecoder().decode(nonceB64);
+    byte[] ct    = Base64.getDecoder().decode(ctB64);
+
+    Cipher cipher = Cipher.getInstance("ChaCha20");
+    ChaCha20ParameterSpec params = new ChaCha20ParameterSpec(nonce, counter);
+    SecretKeySpec sk = new SecretKeySpec(key, "ChaCha20");
+
+    cipher.init(Cipher.DECRYPT_MODE, sk, params);
+    byte[] pt = cipher.doFinal(ct);
+    return new String(pt);
+}
+```
+
+Artinya:
+
+- Flag dienkripsi dengan ChaCha20,
+- Key disimpan di environment variable `MAKEY` dalam bentuk Base64,
+- Nonce dan counter di-hardcode,
+- Ciphertext di-hardcode di `Flag`.
+
+Berarti kuncinya: cari nilai `MAKEY`. Dan karena ini Launch4j, kemungkinan besar ada di bagian stub `.exe` luar.
+
+---
+
+### Menemukan MAKEY di launcher
+
+Balik ke `Jajajaja.exe` (bukan isi ZIP-nya), kita coba `strings`:
+
+```bash
+$ strings -n 4 Jajajaja.exe | rg "MAKEY"
+MAKEY=IKMitMLmeZ3uVceCf5s4gyqsFrNls54ml9e9IRWpd9k=
+```
+
+Boom. Launcher‑nya nyalain Java dengan environment:
+
+```text
+MAKEY=IKMitMLmeZ3uVceCf5s4gyqsFrNls54ml9e9IRWpd9k=
+```
+
+Jadi:
+
+- `MAKEY` (Base64) → ChaCha20 key,
+- Nonce dan ciphertext sudah kita tahu dari bytecode `Flag`.
+
+Next step: tiru persis implementasi ChaCha20 Java (nonce 12‑byte + counter int) di Python, lalu decrypt.
+
+---
+
+### Decrypt ChaCha20 secara manual
+
+Pertama cek parameter:
+
+```bash
+$ python - << 'PY'
+from base64 import b64decode
+
+key_b64   = 'IKMitMLmeZ3uVceCf5s4gyqsFrNls54ml9e9IRWpd9k='
+nonce_b64 = 'oqKbQ+ltdeq80Mxk'
+ct_b64    = '4cyqC2Y5nLRYn/XbyB4xg25Ie0oi3Y+4LR1YWDA='
+
+key   = b64decode(key_b64)
+nonce = b64decode(nonce_b64)
+ct    = b64decode(ct_b64)
+
+print('key_len', len(key), 'nonce_len', len(nonce), 'ct_len', len(ct))
+print('key_hex', key.hex())
+PY
+```
+
+Output:
+
+```text
+key_len 32 nonce_len 12 ct_len 29
+key_hex 20a322b4c2e6799dee55c7827f9b38832aac16b365b39e2697d7bd2115a977d9
+```
+
+Java JCE ChaCha20 (dengan `ChaCha20ParameterSpec(byte[] nonce, int counter)`) menggunakan:
+
+- 32‑byte key,
+- 12‑byte nonce,
+- 32‑bit block counter sebagai word ke‑13 dalam state.
+
+Supaya identik, aku implementasi ChaCha20 block function manual sesuai spec:
+
+```python
+from base64 import b64decode
+import struct
+
+key   = b64decode('IKMitMLmeZ3uVceCf5s4gyqsFrNls54ml9e9IRWpd9k=')
+nonce = b64decode('oqKbQ+ltdeq80Mxk')
+ct    = b64decode('4cyqC2Y5nLRYn/XbyB4xg25Ie0oi3Y+4LR1YWDA=')
+
+const = b"expand 32-byte k"
+
+def quarterround(a, b, c, d):
+    a = (a + b) & 0xffffffff; d ^= a; d = ((d << 16) | (d >> 16)) & 0xffffffff
+    c = (c + d) & 0xffffffff; b ^= c; b = ((b << 12) | (b >> 20)) & 0xffffffff
+    a = (a + b) & 0xffffffff; d ^= a; d = ((d << 8) | (d >> 24)) & 0xffffffff
+    c = (c + d) & 0xffffffff; b ^= c; b = ((b << 7) | (b >> 25)) & 0xffffffff
+    return a, b, c, d
+
+def chacha20_block(key, counter, nonce):
+    st = list(
+        struct.unpack('<4I', const) +
+        struct.unpack('<8I', key) +
+        (counter & 0xffffffff,) +
+        struct.unpack('<3I', nonce)
+    )
+    working = st.copy()
+    for _ in range(10):
+        # column rounds
+        working[0], working[4], working[8], working[12] = quarterround(working[0], working[4], working[8], working[12])
+        working[1], working[5], working[9], working[13] = quarterround(working[1], working[5], working[9], working[13])
+        working[2], working[6], working[10], working[14] = quarterround(working[2], working[6], working[10], working[14])
+        working[3], working[7], working[11], working[15] = quarterround(working[3], working[7], working[11], working[15])
+        # diagonal rounds
+        working[0], working[5], working[10], working[15] = quarterround(working[0], working[5], working[10], working[15])
+        working[1], working[6], working[11], working[12] = quarterround(working[1], working[6], working[11], working[12])
+        working[2], working[7], working[8], working[13] = quarterround(working[2], working[7], working[8], working[13])
+        working[3], working[4], working[9], working[14] = quarterround(working[3], working[4], working[9], working[14])
+    out = [(working[i] + st[i]) & 0xffffffff for i in range(16)]
+    return struct.pack('<16I', *out)
+
+def chacha20_encrypt(key, nonce, counter, data):
+    out = bytearray()
+    block_counter = counter
+    offset = 0
+    while offset < len(data):
+        ks = chacha20_block(key, block_counter, nonce)
+        block = data[offset:offset+64]
+        out.extend(bytes([b ^ k for b, k in zip(block, ks)]))
+        offset += 64
+        block_counter += 1
+    return bytes(out)
+
+pt = chacha20_encrypt(key, nonce, 1337, ct)
+print(pt)
+```
+
+Jalankan:
+
+```bash
+$ python decrypt_flag.py
+b'SNI{r3v_J4v4_L4unch4r_9f2b1e}'
+```
+
+Yang menarik di sini: kita sama sekali nggak perlu menjalankan aplikasinya dengan environment `MAKEY` asli — cukup treat binary sebagai sumber data, ekstrak parameternya, dan reimplementasi cipher.
+
+
+### Flag
+
+`SNI{r3v_J4v4_L4unch4r_9f2b1e}`
+
+---
+
+## oh_pints
+
+### Intro
+
+Challenge **oh_pints** ini kelihatannya simpel dan “ramah”: sebuah binary `pinst` yang nge-render maze di terminal, dan kita “cuma” diminta jalan dari start ke `E` pakai `w/a/s/d`. Di permukaan, ini kelihatan kayak game CLI santai buat ngetes kesabaran dan skill pathfinding.
+
+Tapi begitu dibongkar, ternyata isi perutnya lebih menarik: di balik PyInstaller stub ada Python 3.12 yang dikemas, sebuah manager game yang ngurus maze, dan satu fungsi `get_flag()` yang pakai PRNG linear buat nge-XOR ciphertext panjang. Kita tidak perlu benar‑benar menyelesaikan maze-nya; cukup ngobrol langsung sama bytecode‑nya.
+
+Di write-up ini aku ceritain alurnya: mulai dari recon terhadap binary PyInstaller, bedah bytecode `manager.pyc`, mengubah ASM (Python bytecode) jadi pseudocode yang enak dibaca, sampai akhirnya brute force seed PRNG dan reconstruct flag‑nya.
+
+---
+
+### Recon: “kok maze-nya dibungkus PyInstaller?”
+
+buka folder challenge:
+
+```bash
+$ ls
+dis312.py
+dump_dis.py
+main.py
+manager.dis.txt
+manager.py_failed
+opcode312.py
+pinst
+pinst_extracted
+__pycache__
+pyinstxtractor.py
+venv
+```
+
+`pinst` jelas kandidat utama. Cek tipenya:
+
+```bash
+$ file pinst
+pinst: ELF 64-bit LSB executable, x86-64, dynamically linked, ...
+```
+
+Kalau dijalankan, kita langsung disambut maze ASCII:
+
+```bash
+$ ./pinst
+---------------------------------------------------------------------------
+| ? ? ? ? ? ? ? ? ...                                                     |
+---------------------------------------------------------------------------
+Moves: 0
+
+Welcome to the Maze Challenge! Navigate to 'E'.
+Use 'w' (up), 'a' (left), 's' (down), 'd' (right) to move. Type 'q' to quit.
+Enter your move (w/a/s/d) or 'q' to quit:
+```
+
+Satu step salah / keluar dari batas, langsung mati dengan exit code negatif (nanti kelihatan di bytecode ada panggilan ke `os._exit(-1)`). Jadi secara “intended gameplay”, kita disuruh cari path valid dari start ke end, dan ketika sampai `E` baru `get_flag()` dipanggil.
+
+Kalau lihat isi `pinst_extracted/`, kelihatan banget kalau ini binary PyInstaller:
+
+```bash
+$ file pinst_extracted/*
+...
+pinst_extracted/main.pyc:     Byte-compiled Python module for CPython 3.12
+pinst_extracted/PYZ.pyz:      data
+pinst_extracted/PYZ.pyz_extracted: directory
+...
+```
+
+Di dalam `PYZ.pyz_extracted` kita menemukan semua modul Python yang dipak:
+
+```bash
+$ ls pinst_extracted/PYZ.pyz_extracted
+...
+manager.pyc
+render.pyc
+tile.pyc
+...
+```
+
+Jadi target sesungguhnya ada di `manager.pyc` – modul yang nge-manage state permainan dan flag‑nya.
+
+---
+
+### Bytecode 3.12: decompiler nyerah, disassembler masuk
+
+Kalau coba decompile pakai tool Python yang belum siap 3.12, hasilnya cuma:
+
+```py
+# main.py
+Unsupported Python version, 3.12.0, for decompilation
+```
+
+Untungnya, author sudah sekalian ngasih kita disassembly siap pakai di `manager.dis.txt` (hasil pydisasm). Ini bentuknya semacam “ASM versi Python bytecode”: ada konstanta, nama variabel, dan instruksi per offset.
+
+Bagian awal `manager.dis.txt` nunjukin struktur modul:
+
+```text
+# Method Name:       <module>
+# Filename:          manager.py
+...
+#    4: <Code311 code object Manager at 0x7f474761e360, file manager.py>, line 5
+...
+  5:          42 PUSH_NULL
+              44 LOAD_BUILD_CLASS
+              46 LOAD_CONST           (<Code311 code object Manager ...>, line 5)
+              48 MAKE_FUNCTION        (No arguments)
+              50 LOAD_CONST           ("Manager")
+              52 CALL                 2
+              60 STORE_NAME           (Manager)
+```
+
+Jadi entry point-nya adalah class `Manager`, dengan beberapa method:
+
+- `__init__` – bikin maze, set posisi pemain, dan `_move_count`.
+- `move` – handle input `w/a/s/d` dan increment `_move_count`.
+- `check_win` – cek apakah posisi pemain sudah di `end` dan kalau iya, panggil `get_flag`.
+- `get_flag` – fungsi yang kita incar.
+
+Sedikit kita lihat `__init__` untuk konteks:
+
+```text
+# Method Name:       __init__
+...
+  7:           2 LOAD_GLOBAL          (NULL + Tile)
+              12 LOAD_FAST            (x)
+              14 LOAD_FAST            (y)
+              16 CALL                 2
+              24 LOAD_FAST            (self)
+              26 STORE_ATTR           (_tile)
+...
+ 15:         272 LOAD_CONST           (0)
+             274 LOAD_FAST            (self)
+             276 STORE_ATTR           (_move_count)
+...
+ 17:         286 LOAD_FAST            (self)
+             288 LOAD_ATTR            (NULL|self + render_game)
+             308 CALL                 0
+             316 POP_TOP
+             318 RETURN_CONST         (None)
+```
+
+Garis besarnya:
+
+```py
+class Manager:
+    def __init__(self, x, y, moves):
+        self._tile = Tile(x, y)
+        self._tile.init_zeros()
+        if not self._tile.generate(target_path_length=moves):
+            raise ValueError("Could not generate a maze")
+
+        self._render = Render(self._tile)
+        self._player_pos = self._tile.start
+        self._move_count = 0
+        self.render_game()
+```
+
+Artinya: **seed PRNG di `get_flag()` nanti adalah `_move_count`**, yaitu banyaknya langkah valid yang kita lakukan sampai goal. Kita tidak tahu nilainya di awal, dan gameplay normal memaksa kita jalan sendiri di maze. Tapi dari sisi RE, kita bisa treat `_move_count` sebagai integer seed yang bisa kita brute force.
+
+---
+
+### Address & ASM: bedah `Manager.get_flag`
+
+Sekarang fokus ke fungsi utama:
+
+```text
+# Method Name:       get_flag
+# Filename:          manager.py
+# First Line:        19
+# Constants:
+#    1: '4bb6b048334940fa92f7fef985b9aa93eb1c70b44ed1bfec2045bb545b46a9b76eb6902d41b6b9334548773ef2a654c371ff9694e8e9fa'
+...
+ 19:           2 RESUME               0
+
+ 20:           4 LOAD_GLOBAL          (NULL + bytearray)
+              14 LOAD_GLOBAL          (bytes)
+              24 LOAD_ATTR            (NULL|self + fromhex)
+              44 LOAD_CONST           ("4bb6b0...e9fa")
+              46 CALL                 1
+              54 CALL                 1
+              62 STORE_FAST           (c)
+
+ 22:          64 LOAD_GLOBAL          (NULL + print)
+              74 LOAD_CONST           ("Waiting...")
+              76 CALL                 1
+              84 POP_TOP
+
+ 23:          86 LOAD_GLOBAL          (NULL + range)
+              96 LOAD_GLOBAL          (NULL + len)
+             106 LOAD_FAST            (c)
+             108 CALL                 1
+             116 CALL                 1
+             124 GET_ITER
+             126 FOR_ITER             (to 184)
+             130 STORE_FAST           (i)
+
+ 24:         132 LOAD_FAST            (c)
+             134 LOAD_FAST            (i)
+             136 COPY                 2
+             138 COPY                 2
+             140 BINARY_SUBSCR        ; ambil c[i]
+             144 PUSH_NULL
+             146 LOAD_CLOSURE         (self)
+             148 BUILD_TUPLE          1
+             150 LOAD_CONST           (<Code311 code object <lambda> ..., line 24)
+             152 MAKE_FUNCTION        (closure)
+             154 LOAD_FAST            (i)
+             156 LOAD_CONST           (10000000)
+             158 BINARY_OP            (+)
+             162 CALL                 1             ; lambda(i+10_000_000)
+             170 BINARY_OP            (^=)          ; c[i] ^= ...
+             174 SWAP
+             176 SWAP
+             178 STORE_SUBSCR         ; tulis balik ke c[i]
+         >>  182 JUMP_BACKWARD        (to 126)
+...
+ 26:         186 LOAD_GLOBAL          (NULL + print)
+             196 LOAD_CONST           ("Flag: ")
+             198 LOAD_FAST            (c)
+             200 LOAD_ATTR            (NULL|self + decode)
+             220 LOAD_CONST           ("latin-1")
+             222 CALL                 1
+             230 FORMAT_VALUE         0
+             232 BUILD_STRING         2
+             234 CALL                 1
+         >>  242 POP_TOP
+             244 RETURN_CONST         (None)
+```
+
+Kalau kita tulis dalam pseudocode Python:
+
+```py
+def get_flag(self):
+    # ciphertext disimpan sebagai hex string
+    c = bytearray(bytes.fromhex(
+        "4bb6b048334940fa92f7fef985b9aa93eb1c70b44ed1bfec2045bb545b46a9b"
+        "76eb6902d41b6b9334548773ef2a654c371ff9694e8e9fa"
+    ))
+
+    print("Waiting...")
+
+    for i in range(len(c)):
+        # perhatikan: lambda di-capture dengan self (buat pakai _move_count)
+        c[i] ^= self._lambda(i + 10_000_000) & 0xFF
+
+    print("Flag:", c.decode("latin-1"))
+```
+
+Yang menarik justru lambda yang dipakai buat menghasilkan keystream–nya. Di bagian paling bawah file disassembly:
+
+```text
+# Method Name:       <lambda>
+# First Line:        24
+# Constants:
+#    1: -1
+#    2: 7438
+#    3: 9332
+#    4: 14837
+...
+ 24:           2 RESUME               0
+               4 LOAD_DEREF           (self)
+               6 LOAD_ATTR            (_move_count)
+              26 BUILD_LIST           1
+              28 COPY                 1
+              30 STORE_FAST           (s)
+
+              32 LOAD_GLOBAL          (NULL + range)
+              42 LOAD_FAST            (n)
+              44 CALL                 1
+              52 GET_ITER
+...
+         >>   62 FOR_ITER             (to 128)
+              66 STORE_FAST           (_)
+              68 LOAD_FAST            (s)
+              70 LOAD_ATTR            (NULL|self + append)
+              90 LOAD_FAST            (s)
+              92 LOAD_CONST           (-1)
+              94 BINARY_SUBSCR        ; s[-1]
+              98 LOAD_CONST           (7438)
+             100 BINARY_OP            (*)
+             104 LOAD_CONST           (9332)
+             106 BINARY_OP            (+)
+             110 LOAD_CONST           (14837)
+             112 BINARY_OP            (%)
+             116 CALL                 1            ; s.append(...)
+             124 LIST_APPEND          2
+         >>  126 JUMP_BACKWARD        (to 62)
+             128 END_FOR
+...
+             134 BUILD_LIST           2
+             136 LOAD_CONST           (0)
+             138 BINARY_SUBSCR
+             142 LOAD_CONST           (-1)
+             144 BINARY_SUBSCR
+             148 RETURN_VALUE
+```
+
+Pseudocode‑nya:
+
+```py
+def stream_value(self, n: int) -> int:
+    s = [self._move_count]  # seed = banyak langkah valid
+    for _ in range(n):
+        s.append((s[-1] * 7438 + 9332) % 14837)
+    return s[-1]
+```
+
+Jadi `get_flag()` itu kira-kira:
+
+```py
+def get_flag(self):
+    c = bytearray.fromhex(HEX)
+    for i in range(len(c)):
+        keystream = stream_value(self, i + 10_000_000)
+        c[i] ^= keystream & 0xFF
+    print("Flag:", c.decode("latin-1"))
+```
+
+Kombinasi konstanta `7438`, `9332`, `14837` ini klasik PRNG linear (linear congruential generator) dalam bentuk:
+
+> `s_{k+1} = (a * s_k + b) mod m`
+>
+> dengan a = 7438, b = 9332, m = 14837.
+
+Seed awalnya `s_0 = _move_count`, dan tiap byte flag pakai `s_n` dengan `n = i + 10_000_000`. Tantangannya: kita **tidak tahu seed-nya**, tapi modulonya kecil (14837), sehingga ruang seed cuma 0–14836. Ini sangat brute‑forceable.
+
+---
+
+### Strategi: brute force seed, bukan maze
+
+Pilihan kita:
+
+1. Main maze beneran, jalan sampai goal, dan amati berapa `_move_count` saat `check_win()` terpenuhi. Secara gameplay, ini mungkin panjang dan riskan karena salah satu langkah ke dinding langsung `os._exit(-1)`.
+2. Perlakukan `_move_count` sebagai seed PRNG dan brute force semua kemungkinan 0..14836 sampai ciphertext berubah menjadi string yang masuk akal (ASCII printable, dan mudah‑mudahan ada pattern `SNI{`).
+
+Karena LCG‑nya relatif kecil, opsi (2) jauh lebih menarik.
+
+Masalahnya: `stream_value(self, n)` butuh iterasi sebanyak `n` dan `n` di sini sekitar 10 juta per byte. Kalau kita jalankan literally seperti pseudocode di atas untuk tiap byte dan tiap seed, bakal lama sekali.
+
+Triknya adalah membaca lambda sebagai **komposisi fungsi affine**:
+
+- Definisikan `f(x) = (a*x + b) mod m`.
+- `stream_value(n)` sebenarnya adalah `f` yang dikomposisikan n kali terhadap seed awal. Artinya, ada pasangan `(A_n, B_n)` sehingga:
+
+> f^n(x) = (A_n * x + B_n) mod m
+
+Kalau `(A_n, B_n)` bisa dihitung cepat (pakai binary exponentiation untuk fungsi affine), kita bisa langsung mendapat nilai keystream untuk seed apa pun tanpa perlu loop 10 juta kali.
+
+---
+
+### Dari ASM ke rumus: exponentiation by squaring buat LCG
+
+Secara matematis:
+
+- Kalau `f(x) = a*x + b` (mod m),
+- Maka:
+  - `f(f(x)) = a*(a*x + b) + b = a^2 * x + a*b + b`
+  - Komposisi dua affine `A1*x + B1` dan `A2*x + B2` menghasilkan:
+    - `A = A2 * A1`
+    - `B = A2 * B1 + B2`
+
+Ini bisa dipakai di exponentiation by squaring: kita treat `f` sebagai “basis” dengan pasangan `(baseA, baseB)`, lalu pakai bit‑decomposition `n` untuk menghitung `(A_n, B_n)` dalam `O(log n)`.
+
+Implementasi Python yang dipakai:
+
+```py
+def affine_pow(a, b, n, m):
+    # f(x) = a*x + b (mod m)
+    # return (A, B) s.t. f^n(x) = A*x + B (mod m)
+    A, B = 1, 0               # identitas: x -> x
+    baseA, baseB = a % m, b % m
+    while n > 0:
+        if n & 1:
+            # kompon basis ke (A,B)
+            A, B = (baseA * A) % m, (baseA * B + baseB) % m
+        # square basis: f^{2k}
+        baseA, baseB = (baseA * baseA) % m, (baseA * baseB + baseB) % m
+        n >>= 1
+    return A, B
+```
+
+Keystream untuk posisi ke‑`i` dan seed `s0` kemudian:
+
+```py
+n = i + 10_000_000
+A, B = affine_pow(a, b, n, m)
+val = (A * s0 + B) % m
+byte = val & 0xFF
+```
+
+Dengan ini, kita bisa:
+
+- Precompute `(A_i, B_i)` untuk semua posisi byte ciphertext (panjangnya pendek), satu kali saja.
+- Untuk setiap candidate seed `s0` di 0..14836, kita cek beberapa byte pertama plaintext: harus ASCII printable, dan idealnya cocok pattern `SNI{` di awal.
+
+---
+
+### Script brute force: cari seed yang bikin `SNI{…}`
+
+Ciphertext-nya diambil langsung dari konstanta hex di `get_flag`:
+
+```py
+from binascii import unhexlify
+
+hexstr = '4bb6b048334940fa92f7fef985b9aa93eb1c70b44ed1bfec2045bb545b46a9b' \
+         '76eb6902d41b6b9334548773ef2a654c371ff9694e8e9fa'
+ct = bytearray(unhexlify(hexstr))
+
+m = 14837
+a = 7438
+b = 9332
+```
+
+Lalu brute force seed:
+
+```py
+from string import printable
+
+def affine_pow(a, b, n, m):
+    A, B = 1, 0
+    baseA, baseB = a % m, b % m
+    while n > 0:
+        if n & 1:
+            A, B = (baseA * A) % m, (baseA * B + baseB) % m
+        baseA, baseB = (baseA * baseA) % m, (baseA * baseB + baseB) % m
+        n >>= 1
+    return A, B
+
+# precompute (A_i, B_i) untuk tiap posisi byte
+AB = []
+for i in range(len(ct)):
+    n = i + 10_000_000
+    AB.append(affine_pow(a, b, n, m))
+
+candidates = []
+
+for seed in range(m):  # 0..14836
+    ok = True
+    out0 = []
+    for i in range(6):  # cek 6 byte pertama
+        A, B = AB[i]
+        val = (A * seed + B) % m
+        p = ct[i] ^ (val & 0xFF)
+        if p not in range(32, 127):   # ASCII printable
+            ok = False
+            break
+        out0.append(chr(p))
+    if ok:
+        candidate = ''.join(out0)
+        # filter yang kelihatan plausible
+        if candidate.startswith('S') or candidate.startswith('SNI{'):
+            candidates.append((seed, candidate))
+
+print('candidate count:', len(candidates))
+for s, cand in candidates[:50]:
+    print(s, cand)
+```
+
+output pentingnya:
+
+```text
+candidate count: 19
+...
+12201 SNI{N1
+...
+```
+
+Dari semua kandidat, seed `12201` langsung standout: plaintext mulai dengan `SNI{N1`, sangat mirip format flag. Itu cukup kuat sebagai hipotesis bahwa:
+
+> `_move_count` pada saat mencapai goal (dan memanggil `get_flag`) adalah 12201.
+
+Kita tidak perlu benar‑benar membuktikan ini dengan menyelesaikan maze; cukup pakai seed tersebut untuk mendekripsi seluruh ciphertext.
+
+---
+
+### Dekripsi final: reconstruct flag
+
+Dengan seed `12201` di tangan, tinggal satu langkah: generate keystream penuh dan XOR dengan ciphertext:
+
+```py
+from binascii import unhexlify
+
+hexstr = '4bb6b048334940fa92f7fef985b9aa93eb1c70b44ed1bfec2045bb545b46a9b' \
+         '76eb6902d41b6b9334548773ef2a654c371ff9694e8e9fa'
+ct = bytearray(unhexlify(hexstr))
+
+m = 14837
+a = 7438
+b = 9332
+seed = 12201
+
+def affine_pow(a, b, n, m):
+    A, B = 1, 0
+    baseA, baseB = a % m, b % m
+    while n > 0:
+        if n & 1:
+            A, B = (baseA * A) % m, (baseA * B + baseB) % m
+        baseA, baseB = (baseA * baseA) % m, (baseA * baseB + baseB) % m
+        n >>= 1
+    return A, B
+
+AB = []
+for i in range(len(ct)):
+    n = i + 10_000_000
+    AB.append(affine_pow(a, b, n, m))
+
+pt_bytes = []
+for i, c in enumerate(ct):
+    A, B = AB[i]
+    val = (A * seed + B) % m
+    pt_bytes.append(c ^ (val & 0xFF))
+
+pt = bytes(pt_bytes)
+print(pt)
+```
+
+Output‑nya:
+
+```text
+b'SNI{N1c3_0ne_Y0u_S0lV3d_Th3_M4zeD_Th3_Fl4g_1s_Th3_Fl4g}'
+```
+
+Tanpa perlu satu pun langkah valid di maze, kita langsung “teleport” ke akhir dengan memanfaatkan struktur PRNG dan ukuran modulus yang kecil.
+
+### Flag
+
+`SNI{N1c3_0ne_Y0u_S0lV3d_Th3_M4zeD_Th3_Fl4g_1s_Th3_Fl4g}`
