@@ -30,7 +30,7 @@ export default async function AboutPage() {
             "This blog documents my CTF writeups. I built it with Next.js and a theme inspired by the Blowfish theme.",
           whoami: "Whoami",
           whoamiBody:
-            "Hello, my name is Amar a.k.a Hades, i am from jakarta, Indonesia. I am a Cyber Security Enthusiast and CTF player. I play ctf as my hobby, and also i play in ctf platform.\n\nMy interest span reverse engineering, pwn/binary exploitation, and web security. Besides that, i loved to create challenge and be a probset in few ctf platform.",
+            "Hello, my name is Amar a.k.a Hades, i am from jakarta, Indonesia. I am a Cyber Security Enthusiast and CTF player. I play ctf as my hobby, and also i play in ctf competition.\n\nMy interest span reverse engineering, pwn/binary exploitation, and web security. Besides that, i loved to create challenge and be a probset in few ctf platform.",
           blogContent: "Blog Content",
           blogContentBody: "Writeups for CTF / Pentest",
           latest: "Latest",
