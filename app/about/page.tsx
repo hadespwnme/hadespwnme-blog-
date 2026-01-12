@@ -1,4 +1,5 @@
 import AuthorCard from "@/components/AuthorCard";
+import TCP1PLeaderboardCard from "@/components/TCP1PLeaderboardCard";
 import { getServerLang } from "@/lib/i18n-server";
 import { Info, User, FileText } from "lucide-react";
 
@@ -46,24 +47,36 @@ export default async function AboutPage() {
 
       <AuthorCard />
 
-      <article className="prose" data-aos="fade-up">
-        <h2 className="flex items-center gap-2"><Info size={16} className="opacity-70" /> {t.aboutSite}</h2>
-        <p>{t.aboutSiteBody}</p>
+      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-8 items-start">
+        <article className="prose" data-aos="fade-up">
+          <h2 className="flex items-center gap-2">
+            <Info size={16} className="opacity-70" /> {t.aboutSite}
+          </h2>
+          <p>{t.aboutSiteBody}</p>
 
-        <h2 className="flex items-center gap-2"><User size={16} className="opacity-70" /> {t.whoami}</h2>
-        <p className="whitespace-pre-line">
-          {t.whoamiBody.split(/(pentesting|CTF|infrastruktur|infrastructure)/).map((s, i) =>
-            s === "pentesting" || s === "CTF" || s === "infrastructure" || s === "infrastruktur" ? (
-              <code key={i}>{s}</code>
-            ) : (
-              <span key={i}>{s}</span>
-            )
-          )}
-        </p>
+          <h2 className="flex items-center gap-2">
+            <User size={16} className="opacity-70" /> {t.whoami}
+          </h2>
+          <p className="whitespace-pre-line">
+            {t.whoamiBody.split(/(pentesting|CTF|infrastruktur|infrastructure)/).map((s, i) =>
+              s === "pentesting" || s === "CTF" || s === "infrastructure" || s === "infrastruktur" ? (
+                <code key={i}>{s}</code>
+              ) : (
+                <span key={i}>{s}</span>
+              )
+            )}
+          </p>
 
-        <h2 className="flex items-center gap-2"><FileText size={16} className="opacity-70" /> {t.blogContent}</h2>
-        <p>{t.blogContentBody}</p>
-      </article>
+          <h2 className="flex items-center gap-2">
+            <FileText size={16} className="opacity-70" /> {t.blogContent}
+          </h2>
+          <p>{t.blogContentBody}</p>
+        </article>
+
+        <aside className="space-y-4" data-aos="fade-up" data-aos-delay="80">
+          <TCP1PLeaderboardCard />
+        </aside>
+      </div>
 
       <div data-aos="fade-up">
         <a className="underline underline-offset-4 text-sm" href="mailto:hadespwn0@gmail.com">
