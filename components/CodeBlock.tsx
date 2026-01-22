@@ -25,6 +25,8 @@ export default function CodeBlock({ children }: Props) {
     return m?.[1];
   }, [codeEl]);
 
+  const lines = useMemo(() => text.split("\n"), [text]);
+
   const [copied, setCopied] = useState(false);
   const handleCopy = async () => {
     try {
@@ -54,9 +56,20 @@ export default function CodeBlock({ children }: Props) {
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      <pre className="overflow-auto max-h-[70vh] px-2.5 py-2 text-sm leading-relaxed font-mono whitespace-pre">
-        {codeEl}
-      </pre>
+      <div className="overflow-auto max-h-[70vh] text-sm leading-6 font-mono">
+        <div className="flex min-w-max">
+          <div className="sticky left-0 bg-[#0b1020] text-right text-white/40 select-none tabular-nums px-2.5 py-2 pr-3 border-r border-white/10 min-w-[4ch]">
+            {lines.map((_, idx) => (
+              <div key={idx} className="leading-6">
+                {idx + 1}
+              </div>
+            ))}
+          </div>
+          <pre className="m-0 px-3 py-2 whitespace-pre">
+            <code>{text}</code>
+          </pre>
+        </div>
+      </div>
     </div>
   );
 }
