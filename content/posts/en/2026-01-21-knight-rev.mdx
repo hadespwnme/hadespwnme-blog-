@@ -1,0 +1,1392 @@
+---
+layout: post
+title: "KnightCTF 2026 - Reverse Engineering"
+date: 2026-01-21
+image: /assets/.
+categories: ["Knight"]
+tags: [rev, ctf2026]
+---
+
+
+## E4sy P3asy
+
+### Intro
+
+This challenge is "easy RE", but doing it makes you smile crookedly: the size of the file given is **500MB**, the name is `E4sy_P3asy.ks`, and the prompt just tells us to enter a flag.
+
+Upon closer inspection, it turns out that this is the type of challenge that deliberately looks "heavy" on the outside, but inside it is concise and neat: verify flags using **MD5 per character**, plus there is a **decoy universe** to trap those who just submit.
+
+---
+
+### Recon: a file as big as gaban, what's in it?
+
+First, unzip and check the file type:
+
+```bash
+$ ls -la
+E4sy_P3asy.zip
+
+$ unzip -l E4sy_P3asy.zip
+... E4sy_P3asy.ks
+
+$ file extracted/E4sy_P3asy.ks
+ELF 64-bit LSB pie executable, x86-64, dynamically linked, stripped
+```
+
+What's funny: the file is 500MB, but the ELF header says the header section is at a small offset (meaning the loader program only cares about the beginning of the file; the rest can just be padding to make things messy).
+
+```bash
+$ readelf -S extracted/E4sy_P3asy.ks | head
+...
+.text   size kecil
+.rodata size kecil
+...
+```
+
+Run it first to find out the "story" of the binary:
+
+```bash
+$ ./extracted/E4sy_P3asy.ks
+========================================
+   E4sy P3asy - KnightCTF 2026
+========================================
+[*] Enter the flag to prove your worth!
+
+flag>
+```
+
+Since it's stripped, I start from `strings` to look for flag and clue formats:
+
+```bash
+$ strings -tx extracted/E4sy_P3asy.ks | rg '|KCTF\\{|FLAG\\{|Try again|Good job'
+   2023 Try again!
+   202e FLAG{
+   2034 KCTF{
+   203a Good job! You got it!
+```
+
+OK, there are a few “recognized” (or at least checked) formats: `FLAG{`, `KCTF{`, `GoogleCTF{`.
+
+Then I looked at `.rodata` — and there I saw a very distinctive 32 character hex string: **MD5**.
+
+```bash
+$ objdump -s -j .rodata extracted/E4sy_P3asy.ks | sed -n '1,120p'
+...
+2170 781011edfb2127ee5ff82b06bb1d2959
+2198 4cf891e0ddadbcaae8e8c2dc8bb15ea0
+...
+```
+
+This starts to read: the input flags are probably broken down by character, then each character is verified via MD5 against a list of digest targets embedded in the binary.
+
+---
+
+### ASM surgery: where is the verification?
+
+Because this is PIE, the address in `objdump` is a relative virtual address (the base will be random at runtime), but for static RE just use the address from disassembly.
+
+Disassemble:
+
+```bash
+$ objdump -d -Mintel --no-show-raw-insn extracted/E4sy_P3asy.ks | less
+```
+
+The “main logic” block starts at:
+
+- `0x1140` — main function (initial `.text`) that prints banners, reads input, and performs verification.
+
+Important helper functions:
+
+- `0x1660` — compute `md5` then convert it to hex string (32 chars).
+- `0x1760` — check prefix: `starts_with(input, prefix)` (use `strncmp` along with `strlen(prefix)`).
+- `0x17a0` — check suffix: `input[-1] == '}'`.
+
+#### Address highlight (so it's easy to anchor)
+
+- `0x1251` — check `GoogleCTF{` → enter decoy line.
+- `0x1468` — check `KCTF{...}` → true flag path.
+- `0x143f` — print “decoy universe” (you got the format right, but not in this universe).
+- `0x1549` — print "Good job! You got it!" (success).
+
+---
+
+### Pseudocode
+
+```c
+// 0x1760: starts_with(s, prefix)
+bool starts_with(char *s, char *prefix) {
+  return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+// 0x17a0: ends_with_brace(s)
+bool ends_with_brace(char *s) {
+  size_t n = strlen(s);
+  return (n > 0) && (s[n-1] == '}');
+}
+
+// 0x1660: md5hex(buf, len, out_hex_33)
+// - EVP_MD_CTX_new / EVP_md5 / EVP_DigestInit_ex / Update / Final_ex
+// - sprintf(out + 2*i, "%02x", digest[i])
+void md5hex(const void *buf, size_t len, char out[33]);
+
+// 0x1140: main-ish
+int main() {
+  print_banner();
+  s = fgets(stdin);
+  strip_trailing_newlines(s); // '\n' / '\r'
+
+  // Decoy path: GoogleCTF{...}
+  if (starts_with(s, "GoogleCTF{") && ends_with_brace(s)) {
+    inner = s + len("GoogleCTF{");
+    inner_len = strlen(s) - len("GoogleCTF{") - 1;
+    if (inner_len != 13) fail();
+
+    salt = "G00gleCTF_s@lt_2026";      // dibangun di stack (lihat 0x1389..0x13b6)
+    expected = google_hashes[13];      // pointer table di .data.rel.ro (base 0x3d60)
+
+    for (i = 0; i < 13; i++) {
+      tmp = snprintf("%s%zu%c", salt, i, inner[i]);
+      if (md5hex(tmp) != expected[i]) fail();
+    }
+
+    puts("[!] Interesting... but that's a decoy flag...");
+    puts("[!] You're in KnightCTF, not GoogleCTF :)");
+    return 0;
+  }
+
+  // “Format looks suspicious...” (anti-salah-format)
+  if (starts_with(s, "FLAG{") || starts_with(s, "CTF{")) {
+    puts("[?] Format looks suspicious... but not quite.");
+    return 0;
+  }
+
+  // Real path: KCTF{...}
+  if (!starts_with(s, "KCTF{") || !ends_with_brace(s)) fail();
+  inner = s + len("KCTF{");
+  inner_len = strlen(s) - len("KCTF{") - 1;
+  if (inner_len != 23) fail();
+
+  salt = "KnightCTF_2026_s@lt";        // dibangun di stack (lihat 0x1493..0x14be)
+  expected = knight_hashes[23];        // pointer table di .data.rel.ro (base 0x3ca0)
+
+  for (i = 0; i < 23; i++) {
+    tmp = snprintf("%s%zu%c", salt, i, inner[i]);
+    if (md5hex(tmp) != expected[i]) fail();
+  }
+
+  puts("Good job! You got it!");
+  return 0;
+}
+```
+
+Bottom line: **each character** in `{...}` is tested independently via MD5 of the string:
+
+```text
+"KnightCTF_2026_s@lt" + str(i) + flag_inner[i]
+```
+
+If the digest matches the target list, continue; If someone misses, immediately "Try again!".
+
+Because each position is independent, we can "exploit" this logic by brute-force per-index characters.
+
+---
+
+### Exploit (solve): brute-force per character
+
+All we need to take from binary is:
+
+1. Salt: `KnightCTF_2026_s@lt`
+2. List of 23 MD5 hex targets.
+
+The digest target list for path `KCTF{...}` (23 pieces) is in `.rodata` (arranged via the table pointer `.data.rel.ro`):
+
+```text
+781011edfb2127ee5ff82b06bb1d2959
+4cf891e0ddadbcaae8e8c2dc8bb15ea0
+d06d0cbe140d0a1de7410b0b888f22b4
+d44c9a9b9f9d1c28d0904d6a2ee3e109
+e20ab37bee9d2a1f9ca3d914b0e98f09
+d0beea4ce1c12190db64d10a82b96ef8
+ac87da74d381d253820bcf4e5f19fcea
+ce3f3a34a04ba5e5142f5db272b6cb1f
+13843aca227ef709694bbfe4e5a32203
+ca19a4c4eb435cb44d74c1e589e51a10
+19edec8e46bdf97e3018569c0a60baa3
+972e078458ce3cb6e32f795ff4972718
+071824f6039981e9c57725453e005beb
+66cd6098426b0e69e30e7fa360310728
+f78d152df5d277d0ab7d25fb7d1841f3
+dba3a36431c4aaf593566f7421abaa22
+8820bbdad85ebee06632c379231cfb6b
+722bc7cde7d548b81c5996519e1b0f0f
+c2862c390c830eb3c740ade576d64773
+94da978fe383b341f9588f9bab246774
+bea3bb724dbd1704cf45aea8e73c01e1
+ade2289739760fa27fd4f7d4ffbc722d
+3cd0538114fe416b32cdd814e2ee57b3
+```
+
+Solver (Python) that brute printable ASCII per position:
+
+```py
+#!/usr/bin/env python3
+import hashlib
+import string
+
+salt = "KnightCTF_2026_s@lt"
+targets = [
+    "781011edfb2127ee5ff82b06bb1d2959",
+    "4cf891e0ddadbcaae8e8c2dc8bb15ea0",
+    "d06d0cbe140d0a1de7410b0b888f22b4",
+    "d44c9a9b9f9d1c28d0904d6a2ee3e109",
+    "e20ab37bee9d2a1f9ca3d914b0e98f09",
+    "d0beea4ce1c12190db64d10a82b96ef8",
+    "ac87da74d381d253820bcf4e5f19fcea",
+    "ce3f3a34a04ba5e5142f5db272b6cb1f",
+    "13843aca227ef709694bbfe4e5a32203",
+    "ca19a4c4eb435cb44d74c1e589e51a10",
+    "19edec8e46bdf97e3018569c0a60baa3",
+    "972e078458ce3cb6e32f795ff4972718",
+    "071824f6039981e9c57725453e005beb",
+    "66cd6098426b0e69e30e7fa360310728",
+    "f78d152df5d277d0ab7d25fb7d1841f3",
+    "dba3a36431c4aaf593566f7421abaa22",
+    "8820bbdad85ebee06632c379231cfb6b",
+    "722bc7cde7d548b81c5996519e1b0f0f",
+    "c2862c390c830eb3c740ade576d64773",
+    "94da978fe383b341f9588f9bab246774",
+    "bea3bb724dbd1704cf45aea8e73c01e1",
+    "ade2289739760fa27fd4f7d4ffbc722d",
+    "3cd0538114fe416b32cdd814e2ee57b3",
+]
+
+alphabet = string.printable.strip()  # cukup untuk chall ini
+
+inner = []
+for i, want in enumerate(targets):
+    for ch in alphabet:
+        s = f"{salt}{i}{ch}".encode()
+        if hashlib.md5(s).hexdigest() == want:
+            inner.append(ch)
+            break
+    else:
+        raise RuntimeError(f"no match at index {i}")
+
+flag = "KCTF{" + "".join(inner) + "}"
+print(flag)
+```
+
+The output:
+
+```text
+KCTF{_L0TS_oF_bRuTE_foRCE_:P}
+```
+
+---
+
+### Validation (as Abah Anis said, so it's not just "he said")
+
+Direct test to binary:
+
+```bash
+$ ./extracted/E4sy_P3asy.ks <<'EOF'
+KCTF{_L0TS_oF_bRuTE_foRCE_:P}
+EOF
+
+Good job! You got it!
+```
+
+### Flags
+
+`KCTF{_L0TS_oF_bRuTE_foRCE_:P}`
+
+---
+
+## KrackM3
+
+### Intro
+
+This zip file looks simple: just one binary. But once extracted… `KrackM3.ks` is **500MB** in size. First impression: "okay this is definitely a trap, either *padding* or *anti-analysis*."
+
+And it's true: the core logic turns out to be small, tight, and annoying in a "two paths to success" style—one makes you smile, the other makes you **no points**.
+
+---
+
+### Recon: 500MB which is (almost) empty
+
+Start by unpacking the zip and checking the file type:
+
+```bash
+$ ls -la
+$ unzip -l KrackM3.zip
+$ unzip -o KrackM3.zip
+
+$ file KrackM3.ks
+KrackM3.ks: ELF 64-bit LSB executable, x86-64, dynamically linked, stripped
+```
+
+To be more sure this is "500MB conjured up", I checked the size section:
+
+```bash
+$ readelf -S KrackM3.ks | nl -ba | sed -n '28,38p'
+...
+[13] .text   ...  Size: 0x82b
+[15] .rodata ...  Size: 0x2d0
+```
+
+Run it first to know the output path:
+
+```bash
+$ ./KrackM3.ks
+Enter flag:
+```
+
+Look for the string "say":
+
+```bash
+$ strings -n 6 KrackM3.ks
+...
+Enter flag:
+Failed!
+Success! Real flag accepted.
+Success! ...but you won't get points for this flag :P
+...
+```
+
+Okay. There are at least 3 results:
+
+- `Failed!`
+- `Success! Real flag accepted.` ← this is the target
+- `Success! ...but you won't get points...` ← trap
+
+---
+
+### Enter `.text`: main door and format rules
+
+Because it was stripped, I used the address and reference `.rodata` from `objdump`.
+
+The main entry is around `0x401080`:
+
+```bash
+$ objdump -d KrackM3.ks --start-address=0x401080 --stop-address=0x4011a0
+```
+
+What to read from the plot:
+
+- Read input via `fgets` (max 0x100)
+- Strip newline via `strcspn`
+- Required length **32 bytes**
+- Mandatory format `KCTF{...}` (prefix + brace) and last character `}` (31st position)
+
+The format check function is in `0x401890`.
+
+### Pseudocode (converted results from ASM)
+
+**Main (`0x401080`)**
+
+```c
+int main() {
+  banner();
+  fgets(buf, 0x100, stdin);
+  buf[strcspn(buf, "\r\n")] = 0;
+
+  if (strlen(buf) != 0x20) return fail();          // 32
+  if (!looks_like_flag(buf)) return fail();        // 0x401890
+
+  build_sbox_and_inv(sbox, inv);                   // 0x401320
+  gen_rand(rand);                                  // 0x401480
+
+  int r = verify(buf, sbox, inv, rand);            // 0x401590
+  if (r == 1) return real_success();
+  if (r == 2) return decoy_success();
+  return fail();
+}
+```
+
+**Gate format (`0x401890`)**
+
+```c
+bool looks_like_flag(char *s) {
+  return *(uint32_t*)s == 0x4654434b /*"KCTF"*/
+      && s[4]  == '{'
+      && s[31] == '}';
+}
+```
+
+---
+
+### The essence of the trap: wrong “success” and right “success”.
+
+The fun (and somewhat evil) part is in the `0x401590` verifier.
+
+In `.rodata` there are **four** 32-byte tables used as per-position comparisons. If we dump around there:
+
+```bash
+$ objdump -s -j .rodata KrackM3.ks | sed -n '1,140p' | tail -n +80
+...
+4021f0 03f132fe d63a22c4 16e10000 00000000
+402200 38a614f3 6051fb1f d1e30000 00000000
+402210 45c001fb 1e3dfd2e e57cccb6 00000000
+402220 03f704d1 cf2a20b8 505e0000 00000000
+402230 38a614f3 6051fb1f d1e30000 00000000
+402240 45c001fb 1e3dfd2e e57cccb6 00000000
+402250 03f13237 0924b2e9 18990000 00000000
+402260 38a614f3 6051fb1f d1e30000 00000000
+402270 45c001fb 1e3dfd2e e57cccb6 00000000
+402280 03f132fe d63a22f3 ad650000 00000000
+402290 38a614f3 6051fb1f d1e30000 00000000
+4022a0 45c001fb 1e3dfd2e e57cccb6 00000000
+4022c0 4219a75c d30e912f 3377b108 e94d126a
+```
+
+The trick: the verifier calculates one byte of internal output per index `i` (0..31). The bytes are then compared across **four different tables**. But the return logic is not "if one matches, success".
+
+Quite the opposite:
+
+- If you match a certain table (decoy), the program gives you "Success! ...but you won't get points".
+- A real flag is one that **matches table A**, but **doesn't** match other tables.
+
+#### Important addresses (so easy to find)
+
+- `0x401590`: primary verifier
+- `0x401550`: helper takes “expected” bytes from 3 segments (12 + 10 + 10) to form a 32-byte table
+- The expected tables are around `.rodata`:
+  - `0x4022a0/0x402290/0x402280` (table A)
+  - `0x402270/0x402260/0x402250` (table B)
+  - `0x402240/0x402230/0x402220` (table C)
+  - `0x402210/0x402200/0x4021f0` (table D)
+
+#### Pseudocode: what is "two successes"?
+
+This is a concise version of the logic from reading ASM `0x40177a` to `0x401889`:
+
+```c
+for (i = 0; i < 32; i++) {
+  out = internal_byte(i, input[i]);      // state machine + sbox + rand
+
+  mA |= out ^ A[i];
+  mB |= out ^ B[i];
+  mC |= out ^ C[i];
+  mD |= out ^ D[i];
+}
+
+// “jebakan”: kalau B/C/D match sempurna, malah dapat decoy-success
+if (mB == 0 || mC == 0 || mD == 0) return 2;
+
+// real-success cuma kalau A match sempurna
+return (mA == 0) ? 1 : 0;
+```
+
+So our goal is clear: find an input that makes `out[i] == A[i]` for all `i`, but make sure there is at least one different position for B/C/D (let it be `mB/mC/mD != 0`).
+
+---
+
+### “Exploit”: emulation + backtracking
+
+`internal_byte()` is not a plain XOR. In `0x401320` and `0x401480` binary create:
+
+- 256-byte S-box + its inverse (PRNG based shuffling)
+- 256-byte random table (xorshift* style)
+
+Then `0x401590` uses the 16-byte state + register state (`r8/r9/...`) to output the `out` bytes per position.
+
+Turning this full state machine on its head is a waste of life, so I took the saner route:
+
+1. Forward state machine emulation (accurate enough to output `out[i]`)
+2. DFS/backtracking per character:
+   - posts 0..4 and 31 are fixed: `KCTF{` and `}`
+   - each step select ASCII printable, simulate 1 step, check `out[i] == A[i]`
+   - Continue until you find a 32 byte string
+
+### Solver (Python)
+
+```python3
+#!/usr/bin/env python3
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
+MASK64 = (1 << 64) - 1
+MASK32 = (1 << 32) - 1
+
+
+def rol64(value: int, count: int) -> int:
+    count &= 63
+    value &= MASK64
+    if count == 0:
+        return value
+    return ((value << count) & MASK64) | (value >> (64 - count))
+
+
+def rol8(value: int, count: int) -> int:
+    count &= 7
+    value &= 0xFF
+    if count == 0:
+        return value
+    return ((value << count) & 0xFF) | (value >> (8 - count))
+
+
+def read_vaddr(path: Path, vaddr: int, size: int) -> bytes:
+    # This binary is non-PIE and uses the classic 0x400000 base where:
+    # file_offset == vaddr - 0x400000
+    base = 0x400000
+    offset = vaddr - base
+    if offset < 0:
+        raise ValueError(f"Unexpected vaddr {vaddr:#x} (base {base:#x})")
+    with path.open("rb") as f:
+        f.seek(offset)
+        return f.read(size)
+
+
+def build_sboxes() -> tuple[list[int], list[int]]:
+    sbox = list(range(256))
+    seed = 0xF5A4ADA5
+    for i in range(255, 0, -1):
+        x = seed & MASK32
+        x ^= (x << 13) & MASK32
+        x ^= (x >> 17) & MASK32
+        x ^= (x << 5) & MASK32
+        seed = x & MASK32
+        j = seed % (i + 1)
+        sbox[i], sbox[j] = sbox[j], sbox[i]
+
+    inv = [0] * 256
+    for i, v in enumerate(sbox):
+        inv[v] = i
+    return sbox, inv
+
+
+def build_rand() -> list[int]:
+    x = 0x99ED0EBACD107339
+    mul = 0x2545F4914F6CDD1D
+    out: list[int] = []
+    for _ in range(256):
+        y = x
+        y ^= y >> 12
+        y &= MASK64
+        y ^= (y << 25) & MASK64
+        y ^= y >> 27
+        y &= MASK64
+        y = (y * mul) & MASK64
+        out.append((y >> 56) & 0xFF)
+        x = y
+    return out
+
+
+CONST_R15 = 0x6A124DE908B17733
+CONST_SHR = 0x2F910ED35CA71942
+CONST_RSI_XOR = 0x9E3779B97F4A7C15
+FNV_PRIME = 0x100000001B3
+MUL2 = 0xC2B2AE3D27D4EB4F
+
+
+@dataclass(frozen=False, slots=True)
+class State:
+    idx: int
+    r8: int
+    r9: int
+    r10: int
+    r13: int
+    r14: int
+    rsi: int
+    eax: int
+    state16: list[int]
+
+    @classmethod
+    def initial(cls, state16: bytes) -> "State":
+        return cls(
+            idx=0,
+            r8=0xB1EB4606F35CF7F9,
+            r9=0x881DB3E005D90DFF,
+            r10=0x42,
+            r13=0x2F,
+            r14=0x08,
+            rsi=0x0E,
+            eax=0x4D,
+            state16=list(state16),
+        )
+
+
+def step(st: State, sbox: list[int], rand: list[int], input_byte: int) -> int:
+    i = st.idx
+
+    ebp = (st.r10 + (st.r9 & MASK32)) & MASK32
+    st.r13 = (st.r13 + i) & MASK32
+    st.r14 = (st.r14 ^ (st.r8 & MASK32)) & MASK32
+
+    stack3 = i & 0xFF
+    r11 = input_byte & 0xFF
+
+    edx = i & MASK32
+    edx = ((edx << 5) & MASK32)
+    edx = (edx - i) & MASK32  # 31*i
+    ebp = (ebp + edx) & MASK32
+
+    shift = ((i & 7) << 3) & 0xFF  # 0,8,...,56
+
+    edx = (i + i * 8) & MASK32  # 9*i
+    stack2 = (r11 + ebp) & 0xFF
+    edx = (i + (edx * 2)) & MASK32  # 19*i
+
+    ecx = ((st.r9 >> 16) & MASK32) ^ (st.r8 & MASK32)
+    edx ^= ecx
+
+    r15 = (CONST_R15 >> (shift & 0x3F)) & MASK64
+    ecx = (i + (st.r9 & MASK32)) & 0xFF
+
+    edx ^= r15 & MASK32
+    dl = (edx & 0xFF) ^ rand[ecx]
+    dl ^= stack2
+    dl = rol8(dl, (st.r13 + st.r14) & 0xFF)
+
+    edx2 = ((st.r8 >> 32) & MASK32) ^ (st.rsi & MASK32)
+    edx2 ^= dl
+    idx_sbox = edx2 & 0xFF
+
+    r13 = sbox[idx_sbox]
+    r13 ^= st.r9 & MASK32
+    r13 ^= (CONST_SHR >> (shift & 0x3F)) & MASK32
+    r13 ^= st.eax & MASK32
+    st.r13 = r13 & MASK32
+
+    out_byte = st.r13 & 0xFF
+
+    # update state16
+    idx0 = i & 0xF
+    tmp = (st.r13 & MASK32) ^ 0xFFFFFFA5
+    tmp = (tmp + st.r10 + r11) & MASK32
+    st.state16[idx0] = tmp & 0xFF
+
+    idx3 = (i + 3) & 0xF
+    dl2 = (r11 + (st.r13 & 0xFF)) & 0xFF
+    dl2 = rol8(dl2, ebp & 0xFF)
+    st.state16[idx3] = (st.state16[idx3] ^ dl2) & 0xFF
+
+    # rsi becomes rand[(r13 + i) & 0xff]
+    st.rsi = rand[(st.r13 + i) & 0xFF]
+
+    # advance (except last round)
+    if i != 0x1F:
+        next_i = i + 1
+
+        r11_mod = (r11 + stack3) & 0xFF
+        eax_adv = (r11 ^ (st.r13 & 0xFF)) & 0xFF
+
+        rsi64 = (st.rsi & MASK64) ^ CONST_RSI_XOR
+        rax64 = ((eax_adv & MASK64) << (shift & 0x3F)) & MASK64
+        rax64 ^= st.r8 & MASK64
+        rax64 = rol64(rax64, 7)
+        st.r8 = (rsi64 + rax64) & MASK64
+
+        y = ((st.r13 + 0x3D) & MASK32) ^ r11_mod
+        y &= 0xFF
+        rax = (y * FNV_PRIME) & MASK64
+        rax = (rax + (st.r9 & MASK64)) & MASK64
+        rax ^= (rax >> 33) & MASK64
+        rax = (rax * MUL2) & MASK64
+        st.r9 = (rax ^ (rax >> 29)) & MASK64
+
+        st.r10 = st.state16[next_i & 0xF]
+        st.r13 = st.state16[(i + 8) & 0xF]
+        st.r14 = st.state16[(i + 12) & 0xF]
+        st.rsi = st.state16[(i + 6) & 0xF]
+        st.eax = st.state16[(i + 14) & 0xF]
+        st.idx = next_i
+
+    return out_byte
+
+
+def main() -> int:
+    bin_path = Path(__file__).with_name("KrackM3.ks")
+    if not bin_path.exists():
+        raise SystemExit(f"Binary not found: {bin_path}")
+
+    # expected table A (32 bytes) via 0x401550 layout: 12 + 10 + 10
+    a0 = read_vaddr(bin_path, 0x4022A0, 12)
+    a1 = read_vaddr(bin_path, 0x402290, 10)
+    a2 = read_vaddr(bin_path, 0x402280, 10)
+    expected = a0 + a1 + a2
+    if len(expected) != 32:
+        raise SystemExit("Failed to build expected table A")
+
+    state16 = read_vaddr(bin_path, 0x4022C0, 16)
+
+    sbox, _inv = build_sboxes()
+    rand = build_rand()
+
+    allowed = [c for c in range(0x20, 0x7F) if c not in (0x0A, 0x0D)]
+    fixed = {0: ord("K"), 1: ord("C"), 2: ord("T"), 3: ord("F"), 4: ord("{"), 31: ord("}")}
+
+    @lru_cache(maxsize=None)
+    def dfs(
+        pos: int,
+        idx: int,
+        r8: int,
+        r9: int,
+        r10: int,
+        r13: int,
+        r14: int,
+        rsi: int,
+        eax: int,
+        state16_bytes: bytes,
+    ) -> bytes | None:
+        if pos == 32:
+            return b""
+
+        candidates = [fixed[pos]] if pos in fixed else allowed
+
+        for b in candidates:
+            st = State(
+                idx=idx,
+                r8=r8,
+                r9=r9,
+                r10=r10,
+                r13=r13,
+                r14=r14,
+                rsi=rsi,
+                eax=eax,
+                state16=list(state16_bytes),
+            )
+            outb = step(st, sbox, rand, b)
+            if outb != expected[pos]:
+                continue
+
+            suffix = dfs(
+                pos + 1,
+                st.idx,
+                st.r8,
+                st.r9,
+                st.r10,
+                st.r13,
+                st.r14,
+                st.rsi,
+                st.eax,
+                bytes(st.state16),
+            )
+            if suffix is not None:
+                return bytes([b]) + suffix
+
+        return None
+
+    init = State.initial(state16)
+    res = dfs(
+        0,
+        init.idx,
+        init.r8,
+        init.r9,
+        init.r10,
+        init.r13,
+        init.r14,
+        init.rsi,
+        init.eax,
+        bytes(init.state16),
+    )
+
+    if res is None:
+        raise SystemExit("No solution found")
+
+    print(res.decode("ascii"))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+Execute:
+
+```bash
+$ python3 solve.py
+KCTF{_R3_iS_FuNR1gHT?_EnjOy_r3_}
+```
+
+#### Verify to binary
+
+```bash
+$ ./KrackM3.ks <<< 'KCTF{_R3_iS_FuNR1gHT?_EnjOy_r3_}'
+Success! Real flag accepted.
+KnightCTF 2026 says: GG!
+```
+
+---
+
+### Flags
+
+`KCTF{_R3_iS_FuNR1gHT?_EnjOy_r3_}`
+
+---
+
+## rem3
+
+### Intro
+
+There are two things that immediately make this challenge "smell of a trap":
+
+1) The ZIP file is small, but it contains **500MB binary**.
+2) `strings` immediately handed me some `KCTF{...}` as if "here, just copy and paste".
+
+Even though yes... this is the reverse. And a good reverse is usually not about "finding the flag in the strings", but about **following the program story** until you find the real path.
+
+In this write-up I tell you the flow from recon, reading the control-flow in `main`, finding the feed paths, to the RE version of the "exploit": **reversing the transformation** so that the real flag comes out.
+
+---
+
+### Recon: "it's big, the contents are small"
+
+Starting from unpacking the ZIP:
+
+```bash
+$ ls -la
+rem3.zip
+
+$ unzip -l rem3.zip
+524288000  ...  rem3.ks
+
+$ unzip -o rem3.zip
+inflating: rem3.ks
+```
+
+Look at the file type:
+
+```bash
+$ file rem3.ks
+ELF 64-bit LSB pie executable, x86-64, dynamically linked, ... stripped
+```
+
+The size is 500MB, but if you open it using radare2, the size of the *binary code* that can be read is only around a dozen KB:
+
+```bash
+$ r2 -q -c 'iI; q' rem3.ks
+...
+binsz    12641
+...
+```
+
+So 500MB is more of a "load" (padding/junk), not logical complexity.
+
+Try running:
+
+```bash
+$ ./rem3.ks
+=== KCTF Reverse Challenge ===
+Enter flag:
+```
+
+Enter random input:
+
+```bash
+$ printf 'test\n' | ./rem3.ks
+=== KCTF Reverse Challenge ===
+Enter flag: Failed!
+```
+
+---
+
+### Recon 2: the strings are loose (and that's on purpose)
+
+If we look at `.rodata`, there are several false flags that were deliberately planted:
+
+```bash
+$ r2 -q -e bin.relocs.apply=true -c 'iz~KCTF; q' rem3.ks
+...
+KCTF{fake_flag_for_reversers}
+KCTF{hash_passes_but_fake!!!}
+KCTF{str1ngs_lie_dont_trust!}
+```
+
+This is a strong signal: the program has several “false success paths” that deliberately make people quit too quickly.
+
+---
+
+### Surgery `main` (0x10c0): 3 decoy lines + 1 real line
+
+I use radare2 for analysis and decompile:
+
+```bash
+$ r2 -q -e scr.color=false -e bin.relocs.apply=true -c 'aaa; pdg @ main; q' rem3.ks
+```
+
+The important part `main` is in `0x10c0`. In story:
+
+1) The program reads input and removes newlines using `strcspn`.
+2) The program *gasps* only if the input length is exactly `0x1d` (29 bytes).
+3) After that, there are several sequential checks:
+   - **Decoy 1 (string compare)** → if the input is exactly the same as the fake string.
+   - **Decoy 2 (hash check)** → if the hashes match, the false flag still appears.
+   - **Real path** → input is transformed, then compared with constant data.
+
+Pseudocode resulting from "conversion" from ASM (summarized, but the address remains):
+
+```c
+// main @ 0x10c0
+read line into buf
+strip newline
+if (len(buf) != 0x1d) fail
+
+fcn_1380(); // noise / obfuscation kecil
+
+// Decoy #1: memcmp langsung ke string flag palsu (0x20f0)
+if (memcmp(buf, "KCTF{str1ngs_lie_dont_trust!}", 0x1d) == 0)
+  print "Congrats..." + "KCTF{str1ngs_lie_dont_trust!}"
+
+// Decoy #2: hash FNV-like (fcn_1470 @ 0x1470)
+else if (fcn_1470(buf) == 0xe76fa3daba5d6f3a)
+  print "Congrats..." + "KCTF{hash_passes_but_fake!!!}"
+
+// Jalur real
+else {
+  tmp = buf (29 bytes)
+  fcn_14c0(tmp)  // transform in-place @ 0x14c0
+
+  // checker @ 0x1400: bandingin tmp ke konstanta di .rodata
+  if (fcn_1400(tmp, 0x2160, 0x2150, 0x2140) == 1)
+    print "Success! Real flag accepted."
+  else if (fcn_1400(tmp, 0x2130, 0x2120, 0x2110) == 1)
+    print "Congrats..." + "KCTF{fake_flag_for_reversers}"
+  else
+    fail
+}
+```
+
+Well, the real path is the key: **transform + compare**.
+
+---
+
+### “Expected bytes” of `.rodata` (important address)
+
+The `fcn_1400` (0x1400) checker instead checks 29 straight bytes, but checks chunks:
+
+- First `qword` (8 bytes)
+- `word` next (2 bytes)
+- `memcmp` 10 bytes at offset `+0x0a`
+- `memcmp` 9 bytes at offset `+0x14`
+
+That's a total of 8+2+10+9 = 29 bytes (fits the input length).
+
+The target for the success path (which makes the program print "Real flag accepted") is:
+
+- `0x2160` (start of first 10 bytes: 8 + 2)
+- `0x2150` (10 bytes)
+- `0x2140` (9 bytes)
+
+Extract with `px`:
+
+```bash
+$ r2 -q -e scr.color=false -e bin.relocs.apply=true -c 'px 32 @ 0x2160; px 16 @ 0x2150; px 16 @ 0x2140; q' rem3.ks
+0x2160  dc6b bb4d fd25 e47e c326 ...
+0x2150  f572 ab96 fc8d 5510 93c1 ...
+0x2140  fd81 465b 7e33 838f 2f00 ...
+```
+
+If you tidy it up it will be 29 bytes expected output after transform:
+
+```text
+dc 6b bb 4d fd 25 e4 7e c3 26
+f5 72 ab 96 fc 8d 55 10 93 c1
+fd 81 46 5b 7e 33 83 8f 2f
+```
+
+---
+
+### Main transform `fcn_14c0` (0x14c0): 29 byte randomizer
+
+This transform loops through `i = 0..0x1c` and changes one byte per iteration, but with the state changing as well:
+
+- constant `k1 = 0x2f910ed35ca71942`
+- constant `k2 = 0x6a124de908b17733`
+- state `edi` (byte-ish) increments `+0x1d` every iteration
+- state `r8d` increments `+0x11` every iteration
+- state `esi` changes based on previous output byte
+
+Readable version pseudocode (staying true to 8-bit operations in AL):
+
+```c
+// fcn_14c0 @ 0x14c0
+u64 k1 = 0x2f910ed35ca71942;
+u64 k2 = 0x6a124de908b17733;
+u32 edi = 0;
+u32 r8d = 0;
+u32 esi = 0xffffffc3; // -61
+
+for (int i = 0; i < 0x1d; i++) {
+  int sh = (i & 7) << 3;
+  u32 eax = (u32)(k1 >> sh);
+  eax += edi;
+  u8 al = (u8)eax;
+
+  al ^= buf[i];
+  edi += 0x1d;
+
+  u8 rot1 = ((k2 >> ((i*8 + 0x10) & 0x38)) & 0xff) & 7;
+  al = rol8(al, rot1);
+  eax = (eax & 0xffffff00) | al;
+
+  u32 ecx = (u32)(k2 >> sh) ^ r8d;
+  r8d += 0x11;
+
+  eax += esi;
+  eax ^= ecx;
+
+  al = ror8((u8)eax, (u8)esi);
+  eax = (eax & 0xffffff00) | al;
+  buf[i] = al;
+
+  u32 tmp = ((u32)(k1 >> ((i*8 + 0x18) & 0x38)) ^ 0xffffffa5) + esi;
+  esi = eax + tmp;
+}
+```
+
+In essence: input 29 bytes → shuffled into another 29 bytes → compared to “expected bytes”.
+
+---
+
+### “Exploit”: reverse the transformation
+
+Because the expected output is fixed (29 constant bytes), we can **invert** the transform per iteration:
+
+- In iteration `i`, state (`edi`, `r8d`, `esi`) can still be simulated because the update is deterministic.
+- The operations that occur in AL are a combination of XOR, add, rol/ror → all reversible in 8-bit.
+
+Python script that I use (immediately outputs the correct input / flags):
+
+```py
+#!/usr/bin/env python3
+
+def rol8(x, r):
+    r &= 7
+    return ((x << r) | (x >> (8 - r))) & 0xff
+
+def ror8(x, r):
+    r &= 7
+    return ((x >> r) | (x << (8 - r))) & 0xff
+
+k1 = 0x2f910ed35ca71942
+k2 = 0x6a124de908b17733
+
+# expected output bytes setelah fcn_14c0 (dari .rodata @ 0x2160/0x2150/0x2140)
+out = bytes([
+    0xdc,0x6b,0xbb,0x4d,0xfd,0x25,0xe4,0x7e,0xc3,0x26,
+    0xf5,0x72,0xab,0x96,0xfc,0x8d,0x55,0x10,0x93,0xc1,
+    0xfd,0x81,0x46,0x5b,0x7e,0x33,0x83,0x8f,0x2f
+])
+
+edi = 0
+r8d = 0
+esi = 0xffffffc3  # -61
+
+inp = []
+for i, y in enumerate(out):
+    sh = (i & 7) << 3
+
+    base = ((k1 >> sh) & 0xffffffff)
+    base = (base + (edi & 0xffffffff)) & 0xffffffff
+    base_low = base & 0xff
+
+    rot1 = ((k2 >> ((i*8 + 0x10) & 0x38)) & 0xff) & 7
+    rot2 = (esi & 0xff) & 7
+
+    ecx = ((k2 >> sh) & 0xffffffff) ^ (r8d & 0xffffffff)
+
+    # invert jalur 8-bit di AL (lihat pseudocode fcn_14c0)
+    al3 = rol8(y, rot2)
+    eax2_low = al3 ^ (ecx & 0xff)
+    al1 = (eax2_low - (esi & 0xff)) & 0xff
+    al0 = ror8(al1, rot1)
+    x = al0 ^ base_low
+    inp.append(x)
+
+    # advance state persis seperti fcn_14c0 (biar iterasi berikutnya valid)
+    edi = (edi + 0x1d) & 0xffffffff
+    r8d = (r8d + 0x11) & 0xffffffff
+    tmp = (((k1 >> ((i*8 + 0x18) & 0x38)) & 0xffffffff) ^ 0xffffffa5)
+    tmp = (tmp + (esi & 0xffffffff)) & 0xffffffff
+    esi = (y + tmp) & 0xffffffff  # solver cukup jaga (esi & 0xff) untuk rot-count
+
+flag = bytes(inp).decode("ascii")
+print(flag)
+```
+
+Run, result:
+
+```bash
+$ python3 solve.py
+KCTF{w3Lc0m3_T0_tHE_r3_w0rLD}
+```
+
+Validation to binary:
+
+```bash
+$ printf 'KCTF{w3Lc0m3_T0_tHE_r3_w0rLD}\n' | ./rem3.ks
+=== KCTF Reverse Challenge ===
+Enter flag: Success! Real flag accepted.
+```
+
+### Flags
+
+`KCTF{w3Lc0m3_T0_tHE_r3_w0rLD}`
+
+
+---
+
+## rem3_again — Write-up (KCTF)
+
+### Intro
+
+The title is "Reverse me again...", the file is actually `rem3_again.ks` **500MB**. It looks like it's intentionally making us think "wow, this must be a monster". But once opened... the only "monster" is the file size, not the logic.
+
+Our target is simple: enter the flag format `KCTF{...}` and get the response **"Success! Real flag accepted."**. The rest is the storyline from recon to the "exploit" (RE-style).
+
+---
+
+### Recon: dissect the packaging first
+
+Unzip first:
+
+```bash
+ls -la
+unzip -l rem3_again.zip
+unzip -o rem3_again.zip
+file rem3_again.ks
+```
+
+Important results:
+
+- ELF 64-bit PIE, dynamically linked
+- **not stripped** → the function symbol is still there, life is better
+
+Fastest clue from `strings`:
+
+```bash
+strings -n 5 rem3_again.ks | rg -n "KCTF\\{|flag|Success|Failed" | head -n 50
+```
+
+The ones that stand out:
+
+- `Enter flag:`
+- `Failed!`
+- `Success! Real flag accepted.`
+- `Success! ...but you won't get points for this flag :P`
+
+That last sentence really "stinks": there might be a **decoy flag**.
+
+---
+
+### Function map: small but intent
+
+Since the symbols are still there, we can see the local functions:
+
+```bash
+nm -C --defined-only rem3_again.ks
+```
+
+The relevant ones (these addresses are **offset** ELF due to PIE):
+
+- `main` in `0x1080`
+- `z` in `0x1380` (“noise” function)
+- `p` in `0x13e0` (create table)
+- `cat3.constprop.0` in `0x1540` (merge 3 data blocks)
+- `t.constprop.0` in `0x1570` (transform)
+- `eq.constprop.0` in `0x16b0` (compare 0x26 bytes)
+- `chk_first.constprop.0` in `0x1740` (check decoy)
+
+Disassembly `main`:
+
+```bash
+objdump -d -Mintel rem3_again.ks --disassemble=main | sed -n '1,220p'
+```
+
+At the beginning, `main` reads input via `fgets`, removes the newline, then there are two gates:
+
+1) Weird “parity check” that just calls `z()` (result not used)
+2) input length must be exactly `0x26` (**38**) bytes
+
+This is what it looks like on the block:
+
+- length taken from `strcspn`
+- `cmp rsi,0x26`
+
+So the flag **must be 38 char** (perfectly fits the long `KCTF{...}` string).
+
+---
+
+### The main story: decoy first, then check for real
+
+If we follow flow `main`, the order is like this:
+
+1) `p()` create table (permutation + inverse permutation).
+2) `chk_first()` is called **three times** with different constants.
+3) If it passes these three checks, the program creates an "expected flag" and compares.
+
+What's funny: the three `chk_first()` are actually "trap" routes.
+
+#### `chk_first`: decoy detector machine
+
+`chk_first` something like this (address: `0x1740`):
+
+```bash
+objdump -d -Mintel rem3_again.ks --disassemble=chk_first.constprop.0 | sed -n '1,120p'
+```
+
+Pseudocode:
+
+```c
+// returns 1 if input == expected_decoy
+int chk_first(char *input, blk *a, blk *b, blk *c, uint8_t inv[256]) {
+  uint8_t tmp[0x26];
+  uint8_t expected[0x26];
+
+  cat3(tmp, a, b, c);      // tmp = concat(3 data blocks) -> 0x26 bytes
+  t(expected, tmp, inv);   // expected = transform(tmp, inv)
+  return eq(input, expected); // eq compares 0x26 bytes
+}
+```
+
+And `main` treats return `1` as “you got decoyed”:
+
+- if one of `chk_first` matches → print:
+  - `Success! ...but you won't get points for this flag :P`
+  - then echo input
+
+So those three constants are **three “false flags”** which if you find via reversing, you will *feel like you won*… but be told to go home.
+
+#### `p`: create a permutation table + inverse
+
+`p` (address: `0x13e0`) fills a 256 byte array, shuffles using PRNG, then creates an inverse map.
+
+```bash
+objdump -d -Mintel rem3_again.ks --disassemble=p | sed -n '1,220p'
+```
+
+Simple pseudocode:
+
+```c
+void p(uint8_t perm[256], uint8_t inv[256]) {
+  // init perm[i] = i (dibikin via SSE)
+  for (int i = 0; i < 256; i++) perm[i] = (uint8_t)i;
+
+  // shuffle perm[] dengan xorshift-ish PRNG
+  // (swap perm[idx] dengan perm[cur])
+
+  // build inverse: inv[perm[i]] = i
+  for (int i = 0; i < 256; i++) inv[perm[i]] = (uint8_t)i;
+}
+```
+
+#### `t`: transform 0x26 bytes (this is what is used for the real flag)
+
+`t` (address: `0x1570`) is the main “blender”: each incoming byte is blended using a small state (16 bytes on the stack) + the 64-bit constant `0x6a124de908b17733`, then indexed into `inv[256]`.
+
+```bash
+objdump -d -Mintel rem3_again.ks --disassemble=t.constprop.0 | sed -n '1,260p'
+```
+
+Pseudocode (simplified for readability):
+
+```c
+void t(uint8_t out[0x26], const uint8_t in[0x26], const uint8_t inv[256]) {
+  uint8_t s[16] = { 0x42, 0x19, 0xa7, 0x5c, 0xd3, 0x0e, 0x91, 0x2f,
+                    0x33, 0x77, 0xb1, 0x08, 0xe9, 0x4d, 0x12, 0x6a };
+  uint32_t add = 0xffffffc7; // -57
+  uint32_t a = 0, b = 0;     // counters (r8d/r9d di ASM)
+  uint64_t K = 0x6a124de908b17733ULL;
+
+  for (int i = 0; i < 0x26; i++) {
+    uint8_t x = in[i];
+
+    // campur-campur: pakai K (di-shift berdasarkan i), state s[], dan rotasi
+    uint8_t m = (uint8_t)((K >> ((i & 7) * 8)) & 0xff);
+    uint8_t n = x ^ (uint8_t)b ^ (uint8_t)add ^ m;
+    n = ror8(n, (uint8_t)(s[(i + 8) & 0xf] + i));
+    n ^= s[(i + 6) & 0xf];
+
+    // indexing ke inverse table
+    uint8_t y = inv[n];
+
+    // output + update state
+    out[i] = (uint8_t)(y - (uint8_t)(s[(i + 9) & 0xf] + s[i & 0xf] + a));
+    s[i & 0xf] = (uint8_t)(s[i & 0xf] + x + (out[i] ^ 0xA5));
+    s[(i + 3) & 0xf] ^= ror8(out[i], (uint8_t)(s[(i + 9) & 0xf] + s[i & 0xf] + a));
+
+    add += 0xffffffc7;
+    a += 0x1f;
+    b += 0x13;
+  }
+}
+```
+
+Bottom line: the real check is `eq(input, t(cat3(x_r0,x_r1,x_r2), inv))`.
+
+---
+
+### “Exploit”: don't fight crypto, get the answer at runtime
+
+We can (and do) reverse `t()` completely… but there is a sharper path:
+
+In `main`, just before the last `eq()`, register:
+
+- `rdi` → our input pointer
+- `rsi` → “expected flag” buffer pointer as a result of the transform
+- length fixed `0x26`
+
+Meaning: just breakpoint, dump 38 bytes from `$rsi`.
+
+#### Nice breakpoint
+
+From disassembly, the last `eq` call is at offset `0x1220` (`main+0x1a0`).
+
+With PIE, the safest way:
+
+```gdb
+b *main+0x1a0
+run < /tmp/inp.txt
+dump binary memory /tmp/expected.bin $rsi $rsi+0x26
+```
+
+I run the batch version so it's repeatable:
+
+```bash
+python3 -c 'print("A"*38)' > /tmp/inp.txt
+
+gdb -q ./rem3_again.ks -batch \
+  -ex 'set pagination off' \
+  -ex 'set disable-randomization on' \
+  -ex 'b *main+0x1a0' \
+  -ex 'run < /tmp/inp.txt' \
+  -ex 'dump binary memory /tmp/expected.bin $rsi $rsi+0x26'
+
+python3 - <<'PY'
+b=open("/tmp/expected.bin","rb").read()
+print(b.decode())
+PY
+```
+
+In my run, `gdb` resolves the runtime address:
+
+- `main+0x1a0` → `0x0000555555555220`
+- base PIE when ASLR is turned off → `0x555555554000` (because `0x...5220 - 0x1220`)
+
+And the dump is straight ASCII, meaning the flags are "cooked" in memory as a plain string.
+
+---
+
+#### Verification
+
+```bash
+echo 'KCTF{aN0Th3r_r3_I_h0PE_y0U_eNj0YED_IT}' | ./rem3_again.ks
+```
+
+Output:
+
+```
+Success! Real flag accepted.
+Now grab your points. :)
+```
+
+### Flags
+
+`KCTF{aN0Th3r_r3_I_h0PE_y0U_eNj0YED_IT}`
+
+---
+
