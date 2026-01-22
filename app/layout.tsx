@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import Script from "next/script";
 import "./globals.css";
 import Providers from "@/components/Providers";
 import Navbar from "@/components/Navbar";
@@ -44,7 +45,24 @@ export default async function RootLayout({
 }>) {
   const lang = await getServerLang();
   return (
-    <html lang={lang} suppressHydrationWarning>
+    <html lang={lang} className="dark" suppressHydrationWarning>
+      <head>
+        <Script id="theme-init" strategy="beforeInteractive">{`
+(() => {
+  try {
+    const storedTheme = localStorage.getItem("theme");
+    const isDark = storedTheme === "light" ? false : true;
+    const root = document.documentElement;
+    root.classList.toggle("dark", isDark);
+    root.classList.toggle("light", !isDark);
+  } catch {
+    const root = document.documentElement;
+    root.classList.add("dark");
+    root.classList.remove("light");
+  }
+})();
+        `}</Script>
+      </head>
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
         <Providers>
           <Navbar />

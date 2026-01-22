@@ -5,13 +5,15 @@ import { useEffect, useState } from "react";
 export type Lang = "id" | "en";
 
 export function useLang() {
-  const [lang, setLang] = useState<Lang>("id");
+  const [lang, setLang] = useState<Lang>("en");
 
   useEffect(() => {
     const cookieMatch = document.cookie.match(/(?:^|; )lang=(id|en)/);
     const cookieLang = (cookieMatch?.[1] as Lang | undefined) || undefined;
-    const stored = (localStorage.getItem("lang") as Lang) || cookieLang || "id";
-    setLang(stored);
+    const rawStored = localStorage.getItem("lang");
+    const storedLang =
+      rawStored === "id" || rawStored === "en" ? (rawStored as Lang) : undefined;
+    setLang(storedLang || cookieLang || "en");
     const onStorage = (e: StorageEvent) => {
       if (e.key === "lang" && (e.newValue === "id" || e.newValue === "en")) {
         setLang(e.newValue as Lang);
