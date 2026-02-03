@@ -1,0 +1,1040 @@
+---
+layout: post
+title: "Pascal CTF 2026 - Reverse Engineering"
+date: 2026-02-01
+image: /assets/.
+categories: ["PascalCTF"]
+tags: [rev, rust, pascal, ctf2026]
+---
+
+
+## Albo delle Eccellenze
+
+Target: `nc albo.ctf.pascalctf.it 7004`
+
+### Intro
+
+Challenge ini dibungkus dengan vibe “formulir pendaftaran”: kita disuruh masukin **nama, surname, tanggal lahir, sex, tempat lahir**. Lalu program bilang apakah “kode”-nya cocok, dan kalau cocok… harusnya kita dapet hadiah (flag).
+
+Masalahnya: kadang CTF itu bukan soal jadi peserta terbaik—tapi soal jadi orang yang teliti baca cabang `je/jne`(Beda sama kang paket JNE ya hehe).
+
+Di write-up ini aku ceritain alurnya dari recon sampai exploit: bukan ngebut bruteforce “kode suci”, tapi ngebongkar logika check-nya dan nemu sebuah **branch yang kebalik**. Hasilnya? Remote service ngasih flag buat input apa pun.
+
+---
+
+### Recon: buka zip, jalanin, rasain “flow” program
+
+Mulai dari artefak yang dikasih:
+
+```bash
+$ ls -la
+albo.zip
+
+$ unzip -l albo.zip
+bin/albo
+```
+
+Cek binary dan coba jalanin lokal:
+
+```bash
+$ file bin/albo
+ELF 64-bit LSB executable, x86-64, statically linked, stripped
+
+$ ./bin/albo
+Welcome into the latest version of
+      Albo delle Eccellenze
+   (PascalCTF Beginners 2026)
+Enter your name:
+...
+```
+
+Waktu dijalankan di mesin lokal, binary mencoba baca file `flag` dan gagal (wajar, file flag cuma ada di server):
+
+```text
+Could not open flag file: No such file or directory
+```
+
+Dari sini kelihatan: challenge ini bukan “ngitung hash lalu print flag embedded”, tapi **flag dibaca dari file `flag`**. Berarti target kita: bikin program masuk ke jalur yang melakukan `fopen("flag", "r")`.
+
+---
+
+### Recon via strings: ada jalur “Code matched!”
+
+Karena binary stripped, aku cari string yang relevan:
+
+```bash
+$ strings -n 4 bin/albo"
+```
+
+Ketemu ini (yang paling penting):
+
+- `Code matched!`
+- `Here is the flag: %s`
+- `Code did not match. Your code is: %s`
+- `Could not open flag file`
+
+Artinya ada dua jalur output: sukses vs gagal. Tinggal cari **kondisi** yang milih salah satunya.
+
+---
+
+### Disassembly: menemukan “pintu” flag dan si checker
+
+Aku pakai radare2 buat cepat nemu `main`:
+
+```bash
+$ r2 -A -q -e bin.relocs.apply=true -c 'afl~main' bin/albo
+0x004024e4    4    608 main
+```
+
+Di dalam `main` ada blok yang langsung “bilang”:
+
+- Kalau sukses: call fungsi yang membuka `flag` lalu `printf("Here is the flag: %s\n", buf)`
+- Kalau gagal: print `Code did not match...`
+
+Alamat yang kepakai:
+
+- `main` di `0x004024e4`
+- fungsi pembaca flag `fcn.00402311` di `0x00402311`
+- fungsi checker `fcn.004023eb` di `0x004023eb`
+
+Blok keputusan yang krusial ada di sekitar:
+
+```asm
+; main @ 0x004024e4
+0x004026ed  call 0x004023eb        ; check(code_string)
+0x004026f2  xor  eax, 1
+0x004026f5  test al, al
+0x004026f7  je   0x00402727        ; "Code did not match..."
+; fallthrough: "Code matched!" + read flag
+0x00402700  call 0x00402311        ; read_flag(buf)
+```
+
+Kalimatnya sederhana:
+
+> Checker dipanggil → hasilnya di-`xor 1` → branch berdasarkan hasil XOR itu.
+
+Dan di sinilah “hadiah”nya tersembunyi.
+
+---
+
+### Bug inti: branch sukses/gagal kebalik
+
+Sekarang bongkar `fcn.004023eb` (checker). Poin pentingnya:
+
+1) Dia hanya lanjut kalau panjang stringnya **tepat 16**.
+2) Dia melakukan transformasi berulang-ulang terhadap string (XOR per-byte + swap).
+3) Di akhir, dia `strcmp` dengan konstanta `"A11D612LPSCBLS37"`.
+4) Kalau sama → return `1`, kalau tidak → return `0`.
+
+Pseudocode hasil konversi dari ASM di `0x004023eb`:
+
+```c
+// fcn.004023eb @ 0x004023eb
+int check(char *s) {
+  if (strlen(s) != 16) return 0;
+
+  for (int round = 0; round <= 0x3f; round++) {
+    for (int i = 0; i <= 0x0f; i++) {
+      s[i] ^= 0x5e;
+    }
+    for (int i = 0; i <= 0x0f; i++) {
+      char t = s[i + 1];
+      s[i + 1] = s[i];
+      s[i] = t;
+    }
+  }
+
+  return strcmp(s, "A11D612LPSCBLS37") == 0;
+}
+```
+
+Sampai sini, normal: “kalau cocok, return 1”.
+
+Masalahnya ada di `main`. Hasil dari `check()` di-*flip* dengan `xor eax, 1`.
+
+Pseudocode logika `main` di area keputusan (yang penting saja):
+
+```c
+// main @ 0x004024e4 (bagian akhir)
+int ok = check(code);     // ok=1 kalau benar
+ok ^= 1;                  // DIBALIK!
+if (ok == 0) {
+  puts("Code did not match...");
+} else {
+  puts("Code matched!");
+  read_flag(flagbuf);     // fcn.00402311 @ 0x00402311
+  printf("Here is the flag: %s\n", flagbuf);
+}
+```
+
+Akibatnya:
+
+- Kalau kode **benar** → `check()` return `1` → `1 ^ 1 = 0` → masuk jalur **gagal**.
+- Kalau kode **salah** → `check()` return `0` → `0 ^ 1 = 1` → masuk jalur **sukses** → baca flag.
+
+Dengan kata lain: *“congratulations, you failed successfully.”*
+
+---
+
+### Exploit: kirim data asal → “Code matched!” → flag kebaca
+
+Karena syarat sukses justru “kode salah”, kita tidak perlu ngerti generator kodenya sama sekali. Kita cukup mengisi form dengan nilai apa pun.
+
+Cara paling simpel:
+
+```bash
+$ printf 'a\nb\n01/01/2000\nM\nX\n' | nc albo.ctf.pascalctf.it 7004
+```
+
+Output server langsung ngasih flag:
+
+```text
+Code matched!
+Here is the flag: pascalCTF{g00d_luck_g3tt1ng_your_pr1zes_n0w}
+```
+
+### Flag
+
+`pascalCTF{g00d_luck_g3tt1ng_your_pr1zes_n0w}`
+
+---
+
+## AuraTester2000
+
+Target: `nc auratester.ctf.pascalctf.it 7001`
+
+### Intro
+
+Judulnya **AuraTester2000**, prompt-nya sok alpha, ASCII art-nya niat… tapi intinya sederhana: service ini nahan kita di “tes final”, lalu ngasih *secret phrase* yang harus kita balikin ke bentuk aslinya.
+
+---
+
+### Recon: lihat dulu service-nya ngapain
+
+Pertama connect:
+
+```bash
+nc auratester.ctf.pascalctf.it 7001
+```
+
+Dia minta nama, terus masuk menu:
+
+- jawab pertanyaan buat nambah/mengurangi aura
+- cek aura
+- kalau aura cukup, boleh masuk “final AuraTest”
+
+Di folder challenge, cuma ada satu file:
+
+```bash
+ls -la
+```
+
+Outputnya:
+
+- `AuraTester2000.gyat`
+
+---
+
+### Reverse cepat: “gyat-lang” → pseudocode
+
+Bagian pentingnya ada 2: gate aura, dan encoder phrase.
+
+#### 1) Gate aura (biar bisa masuk final)
+
+Di file, tiap pertanyaan punya nilai aura untuk jawaban `yes/no`:
+
+```py
+aura_values = [(150,-50), (-1000,50),(450,-80),(-100,50)]
+```
+
+Jadi strategi paling gampang buat tembus syarat `aura >= 500`:
+
+- Q1: `yes` → +150
+- Q2: `no`  → +50
+- Q3: `yes` → +450
+- Q4: `no`  → +50
+
+Total = 700. Selesai. Nggak perlu loop aneh-aneh.
+
+#### 2) Encoder phrase (inti RE-nya)
+
+Pseudocode:
+
+```text
+phrase = random join of 3..5 words with spaces
+steps  = random integer in [2..5]
+
+function encoder(phrase, steps):
+  out = ""
+  for i in range(len(phrase)):
+    if phrase[i] == " ":
+      out += " "
+    else if i % steps == 0:
+      out += str(ord(phrase[i]))   # ASCII decimal, tanpa delimiter
+    else:
+      out += phrase[i]
+  return out
+```
+
+Di final test, service menampilkan `encoder(phrase, steps)`, lalu minta kita input `phrase` aslinya.
+
+Triknya:
+
+- `phrase` cuma berisi **huruf lowercase** + spasi (dari list kata yang fixed).
+- `ord('a'..'z')` ada di rentang **97..122**
+- Itu berarti angka yang muncul cuma panjang **2 digit** (97–99) atau **3 digit** (100–122).
+
+Jadi kita bisa decode tanpa tahu `steps` dengan cara brute `steps ∈ {2,3,4,5}`.
+
+---
+
+### Exploit: decode + balikin phrase, otomatis
+
+Flow eksploitnya:
+
+1. Connect ke remote.
+2. Isi nama bebas.
+3. Pilih menu `1` (questions), jawab: `yes, no, yes, no` biar aura ≥ 500.
+4. Pilih menu `3` (final test).
+5. Ambil baris encoded phrase.
+6. Cari `steps` yang cocok dengan brute 2..5, decode, lalu verifikasi dengan *re-encode*.
+7. Kirim decoded phrase → keluar flag.
+
+```python
+#!/usr/bin/env python3
+import re
+import socket
+
+
+HOST = "auratester.ctf.pascalctf.it"
+PORT = 7001
+
+
+def recv_until(sock: socket.socket, needle: bytes, *, max_bytes: int = 1_000_000) -> bytes:
+    data = b""
+    while needle not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise EOFError("connection closed")
+        data += chunk
+        if len(data) > max_bytes:
+            raise RuntimeError("too much data without finding needle")
+    return data
+
+
+def send_line(sock: socket.socket, s: str) -> None:
+    sock.sendall(s.encode() + b"\n")
+
+
+def encode(phrase: str, steps: int) -> str:
+    out = []
+    for i, ch in enumerate(phrase):
+        if ch == " ":
+            out.append(" ")
+        elif i % steps == 0:
+            out.append(str(ord(ch)))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def decode(encoded: str, steps: int) -> str | None:
+    decoded: list[str] = []
+    j = 0
+    i = 0
+    while j < len(encoded):
+        c = encoded[j]
+        if c == " ":
+            decoded.append(" ")
+            j += 1
+            i += 1
+            continue
+
+        if i % steps == 0:
+            if not c.isdigit():
+                return None
+            if c == "1":
+                if j + 3 > len(encoded):
+                    return None
+                num = int(encoded[j : j + 3])
+                if not (100 <= num <= 122):
+                    return None
+                decoded.append(chr(num))
+                j += 3
+                i += 1
+                continue
+            if c == "9":
+                if j + 2 > len(encoded):
+                    return None
+                num = int(encoded[j : j + 2])
+                if not (97 <= num <= 99):
+                    return None
+                decoded.append(chr(num))
+                j += 2
+                i += 1
+                continue
+            return None
+
+        if not c.isalpha():
+            return None
+        decoded.append(c)
+        j += 1
+        i += 1
+
+    return "".join(decoded)
+
+
+def solve_phrase(encoded: str) -> tuple[str, int]:
+    for steps in range(2, 6):
+        phrase = decode(encoded, steps)
+        if phrase is None:
+            continue
+        if encode(phrase, steps) == encoded:
+            return phrase, steps
+    raise ValueError("no steps matched")
+
+
+def main() -> None:
+    with socket.create_connection((HOST, PORT), timeout=10) as s:
+        s.settimeout(10)
+
+        recv_until(s, b"> ")
+        send_line(s, "hades")
+
+        recv_until(s, b"little Beta?\n> ")
+        send_line(s, "1")
+
+        for ans in ["yes", "no", "yes", "no"]:
+            recv_until(s, b"> ")
+            send_line(s, ans)
+
+        recv_until(s, b"little Beta?\n> ")
+        send_line(s, "3")
+
+        out = recv_until(s, b"Type the decoded phrase to prove your worth:\n> ").decode(
+            errors="replace"
+        )
+        m = re.search(
+            r"decode this secret phrase:\s*(.*)\nType the decoded phrase",
+            out,
+            re.DOTALL,
+        )
+        if not m:
+            raise RuntimeError("could not find encoded phrase in output")
+
+        encoded = m.group(1).splitlines()[0].strip()
+        phrase, steps = solve_phrase(encoded)
+        send_line(s, phrase)
+
+        final = s.recv(100_000).decode(errors="replace")
+        print(f"encoded={encoded!r}")
+        print(f"steps={steps}")
+        print(final, end="")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Jalanin:
+
+```bash
+python3 solve.py
+```
+
+### Flag
+
+Hasil dari remote:
+
+```text
+pascalCTF{Y0u_4r3_th3_r34l_4ur4_f1n4l_b0s5}
+```
+
+---
+
+## StrangeVM
+
+### Intro
+
+Waktu pertama kali ketemu challenge ini, rasanya kayak lagi buka buku tua di perpustakaan terlarang: cuma ada satu binary `vm` dan satu “mantra” bernama `code.pascal`. Kita disuruh “mengeksekusi kode” yang katanya nyimpen *Forbidden Key*… tapi setiap kali dijalankan, dia cuma ngegas:
+
+> `Execution failed. The code did not match the expected flag.`
+
+Jadi bukan sekadar password checker biasa. Ini **VM kecil** yang menjalankan bytecode dari file, mengolah input kita, lalu membandingkan hasilnya dengan flag yang “disimpan rapi” di dalam binary.
+
+Di write-up ini aku ceritain prosesnya dari recon sampai akhirnya kita *ngebalik* transformasinya dan dapet flag.
+
+---
+
+### Recon: “ini binary ngapain?”
+
+Di folder challenge cuma ada dua file:
+
+```bash
+$ ls -la
+-rw-r--r-- 1 root root   1652 Jan 31 07:04 code.pascal
+-rw-r--r-- 1 root root 979728 Jan 31 07:04 vm
+```
+
+Jalankan dulu biar tau surface-nya:
+
+```bash
+$ chmod +x vm
+$ ./vm
+Execution failed. The code did not match the expected flag.
+```
+
+Karena namanya `code.pascal`, insting awal: ini mungkin bytecode yang dieksekusi oleh `vm`.
+
+```bash
+$ file vm
+vm: ELF 64-bit LSB executable, x86-64, statically linked, not stripped
+```
+
+Kata kunci paling enak: **not stripped**. Artinya `nm`/`objdump` masih bakal ngasih simbol fungsi, jadi reverse-nya bisa “santai tapi tajam”.
+
+---
+
+### Membaca peta: simbol dan string yang “ngomong”
+
+
+Kita bisa gunakan strings dan lalu gunakan `nm`
+
+Cari fungsi penting:
+
+```bash
+$ nm -n vm | rg -n '\\bmain\\b|initVM|executeVM|readInt|readByte'
+00000000004021a1 T main
+0000000000401ca5 T initVM
+0000000000401e4c T executeVM
+0000000000401dd1 T readByte
+0000000000401de2 T readInt
+```
+
+Dan ada global yang keliatan relevan:
+
+```bash
+$ nm -n vm | rg -n '\\b(flag|code|mem)\\b'
+00000000004cd0c8 D flag
+00000000004ceb10 B code
+00000000004ceb18 B mem
+```
+
+Ini mulai kebaca: `initVM` likely load bytecode → `executeVM` interpret → hasilnya ada di `mem` → `main` bandingin dengan `flag`.
+
+Sekarang kita baca `main` (alamat `0x4021a1`):
+
+```bash
+$ objdump -d --no-show-raw-insn -Mintel vm | sed -n '1897,1960p'
+```
+
+Intinya:
+
+```c
+// main @ 0x4021a1
+int main() {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stdin,  NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
+  initVM();       // 0x401ca5
+  executeVM();    // 0x401e4c
+
+  // strcmp(mem, flag)
+  if (strcmp(mem, flag) == 0)
+    puts("Congratulations! You have successfully executed the code.");
+  else
+    puts("Execution failed. The code did not match the expected flag.");
+
+  free(code);
+  free(mem);
+  return 0;
+}
+```
+
+Jadi target kita sederhana:
+
+> bikin `mem` (buffer output VM) sama dengan string `flag` yang disimpan di binary.
+
+---
+
+### Bytecode loader: `initVM` ngapain?
+
+Di `initVM` (alamat `0x401ca5`) terlihat jelas:
+
+1. `fopen("code.pascal", "r")`
+2. `malloc(0x1000)` untuk global `code` (`0x4ceb10`)
+3. `malloc(0x400)` untuk global `mem` (`0x4ceb18`)
+4. `memset(mem, 0, 0x400)`
+5. `fread(code, 1, 0x1000, file)`
+
+Pseudocode:
+
+```c
+// initVM @ 0x401ca5
+void initVM() {
+  FILE* f = fopen("code.pascal", "r");
+  if (!f) { perror("Failed to open bytecode file"); return; }
+
+  code = malloc(0x1000);
+  mem  = malloc(0x400);
+  if (!code || !mem) { perror("Failed to init"); cleanup...; return; }
+
+  memset(mem, 0, 0x400);
+  if (fread(code, 1, 0x1000, f) == 0) { perror("Failed to read bytecode file"); cleanup...; }
+  fclose(f);
+}
+```
+
+Artinya: `code.pascal` itu murni bytecode, dan `executeVM` bakal jadi interpreter-nya.
+
+---
+
+### Mesin si penyihir: instruction set di `executeVM`
+
+Bagian paling fun: `executeVM` (alamat `0x401e4c`).
+
+Loop utamanya:
+
+- `pc` mulai dari 0
+- baca `op = code[pc++]`
+- switch `op`
+- berhenti kalau `code[pc] == 0` (opcode `0` = HALT)
+
+Format instruksi (terlihat dari cara dia `readInt` dan `readByte`):
+
+- Kebanyakan opcode punya bentuk:
+
+```
+[ op:1 ] [ index:int32_le:4 ] [ imm:byte:1 ]
+```
+
+- Khusus input (`op=5`):
+
+```
+[ op:1 ] [ index:int32_le:4 ]
+```
+
+#### Detail opcode
+
+Dari disassembly `executeVM`, opcode-nya:
+
+| Opcode | Semantik |
+|---:|---|
+| `0x00` | HALT (selesai) |
+| `0x01` | `mem[idx] += imm` |
+| `0x02` | `mem[idx] -= imm` |
+| `0x03` | `mem[idx] %= imm` (remainder dari signed `idiv`), dan **kalau imm=0 → exit dengan “Division by zero error”** |
+| `0x04` | `mem[idx] = imm` |
+| `0x05` | `scanf("%c", &mem[idx])` |
+| `0x06` | `if (mem[idx] == 0) pc += off` (branch relatif; `off` adalah signed byte) |
+
+Pseudocode interpreter:
+
+```c
+// executeVM @ 0x401e4c
+void executeVM() {
+  int pc = 0;
+  while (code[pc] != 0) {
+    int op = (int8_t)code[pc++];
+    switch (op) {
+      case 1: { int idx = readInt(&code[pc]); uint8_t imm = code[pc+4];
+                mem[idx] = (uint8_t)(mem[idx] + imm); pc += 5; break; }
+      case 2: { int idx = readInt(&code[pc]); uint8_t imm = code[pc+4];
+                mem[idx] = (uint8_t)(mem[idx] - imm); pc += 5; break; }
+      case 3: { int idx = readInt(&code[pc]); int8_t imm = (int8_t)code[pc+4];
+                if (imm == 0) die("Division by zero error");
+                mem[idx] = (int8_t)mem[idx] % imm; pc += 5; break; }
+      case 4: { int idx = readInt(&code[pc]); uint8_t imm = code[pc+4];
+                mem[idx] = imm; pc += 5; break; }
+      case 5: { int idx = readInt(&code[pc]);
+                scanf("%c", &mem[idx]); pc += 4; break; }
+      case 6: { int idx = readInt(&code[pc]); int8_t off = (int8_t)code[pc+4];
+                if (mem[idx] == 0) pc += off;
+                pc += 5; break; }
+      default: die("Unknown operation code");
+    }
+  }
+}
+```
+
+#### Catatan kecil yang penting: `readInt` agak “bandel”
+
+`readInt` (alamat `0x401de2`) menyusun int32 dari 4 byte little-endian, tapi tiap byte dibaca pakai `movsx` (sign-extend) sebelum di-shift.
+
+Itu artinya: kalau byte tertentu >= `0x80`, dia diperlakukan sebagai negatif saat di-shift. Efeknya: index bisa jadi **negatif** (contoh `-1`).
+
+Kenapa ini penting? Karena bytecode memang pakai `mem[-1]` sebagai “slot dummy” buat beberapa branch.
+
+---
+
+### Bedah `code.pascal`: polanya kebaca (dan transformasinya simpel)
+
+Daripada nyemplung di 1652 byte secara manual, aku bikin disassembler mini (logikanya ngikut interpreter di atas) dan langsung kelihatan pola:
+
+- Ada **41 kali** `IN mem[i]` (0..40), artinya VM baca 41 karakter dari stdin.
+- Lalu tiap karakter di `mem[i]` dimodifikasi tergantung parity index:
+  - index genap: `mem[i] += i`
+  - index ganjil: `mem[i] -= i`
+
+Secara matematis:
+
+```text
+expected[i] = input[i] + i   (kalau i genap)
+expected[i] = input[i] - i   (kalau i ganjil)
+```
+
+Kalau kita bisa ambil `expected` (string target yang nanti di-strcmp), maka input tinggal dibalik:
+
+```text
+input[i] = expected[i] - i   (kalau i genap)
+input[i] = expected[i] + i   (kalau i ganjil)
+```
+
+Berarti langkah berikutnya bukan “ngecrack VM”, tapi **ambil string flag pembanding** dari binary.
+
+---
+
+### Mengambil “expected flag” dari binary (alamat rodata)
+
+Di `main`, `strcmp(mem, flag)` dipanggil setelah `executeVM`.
+
+Pointer `flag` ada di `.data` alamat `0x4cd0c8`, dan dia menunjuk ke `.rodata`.
+Aku dump `.rodata` dan nemu blob 40 byte yang keliatan “bukan ASCII normal” tapi itu yang dibandingin.
+
+Contohnya (cara cepat pakai Python, tapi bisa juga `objdump -s`):
+
+```python
+from pathlib import Path
+vm = Path("vm").read_bytes()
+
+# .rodata vaddr dan file offset (dari `readelf -S vm`)
+ro_vaddr = 0x4a0240
+ro_off   = 0x0a0240
+
+# alamat yang isinya bytes pembanding (yang ditunjuk `flag`)
+addr = 0x4a0278
+off  = ro_off + (addr - ro_vaddr)
+
+expected = vm[off:off+40]
+print(expected.hex())
+```
+
+Di tahap ini kita sudah pegang `expected[0..39]`.
+
+---
+
+### Exploit: balik transformasi, dapet input, dapet flag
+
+Karena VM cuma melakukan penyesuaian `±i` per index, kita tinggal inverse:
+
+```py
+plain[i] = expected[i] - i  (i genap)
+plain[i] = expected[i] + i  (i ganjil)
+```
+
+Dan hasil plaintext-nya ternyata string yang sangat… CTF-coded:
+
+```text
+VMs_4r3_d14bol1c4l_3n0ugh_d0nt_y0u_th1nk
+```
+
+Terus *format flag* challenge tinggal bungkus:
+
+```text
+pascalCTF{VMs_4r3_d14bol1c4l_3n0ugh_d0nt_y0u_th1nk}
+```
+
+### Solver
+
+Script ini:
+1) extract `expected` dari `vm` di `0x4a0278`
+2) reverse transform `±i`
+3) print flag dan (opsional) verifikasi dengan nge-pipe ke `./vm`
+
+```py
+#!/usr/bin/env python3
+from pathlib import Path
+import subprocess
+
+VM_PATH = "vm"
+
+RODATA_VADDR = 0x4a0240
+RODATA_OFF   = 0x0a0240
+FLAG_ADDR    = 0x4a0278
+FLAG_LEN     = 40
+
+vm = Path(VM_PATH).read_bytes()
+flag_off = RODATA_OFF + (FLAG_ADDR - RODATA_VADDR)
+expected = vm[flag_off:flag_off + FLAG_LEN]
+
+plain = bytearray(FLAG_LEN)
+for i, b in enumerate(expected):
+    if i % 2 == 0:
+        plain[i] = (b - i) & 0xff
+    else:
+        plain[i] = (b + i) & 0xff
+
+key = plain.decode("ascii")
+print("Forbidden Key:", key)
+print("Flag:", f"pascalCTF{{{key}}}")
+
+# quick verify
+res = subprocess.run(["./vm"], input=(key + "\n").encode(), capture_output=True)
+print(res.stdout.decode(), end="")
+```
+
+Kalau dijalankan dari folder yang sama (ingat catatan challenge: file harus satu direktori):
+
+```bash
+$ python3 solve.py
+Forbidden Key: VMs_4r3_d14bol1c4l_3n0ugh_d0nt_y0u_th1nk
+Flag: pascalCTF{VMs_4r3_d14bol1c4l_3n0ugh_d0nt_y0u_th1nk}
+Congratulations! You have successfully executed the code.
+```
+
+### Flag
+
+`pascalCTF{VMs_4r3_d14bol1c4l_3n0ugh_d0nt_y0u_th1nk}`
+
+---
+
+## Curly Crab — First Blood
+
+### Intro
+
+Judul challenge-nya udah “berisik”: *A crab stole my json schema…* — dan itu beneran yang terjadi. Ini bukan brute-force “flag string checker” klasik, tapi **binary Rust** yang nge-validasi input kita pakai `serde_json` + struct berlapis. Kalau JSON-nya cocok sama “schema” yang ditanam di binary, dia senyum (print `🦀`). Kalau nggak, dia manyun.
+
+Target kita sederhana: **reconstruct schema JSON** itu, lalu dari situ “nyusun” flag yang bener.
+
+---
+
+### Recon: “ini binary apa, ngapain?”
+
+Pertama, inventory file:
+
+```bash
+$ ls -la
+curly_crab
+```
+
+Jalankan:
+
+```bash
+$ ./curly_crab
+Give me a JSONy flag!
+```
+
+Kasih input asal:
+
+```bash
+$ printf 'test\n' | ./curly_crab
+Give me a JSONy flag!
+😔
+```
+
+Cek tipenya:
+
+```bash
+$ file ./curly_crab
+ELF 64-bit LSB pie executable, x86-64, dynamically linked, ... not stripped
+```
+
+Poin penting: **not stripped** → simbol Rust masih ada, jadi kita bisa “nembak” fungsi langsung via `nm/objdump/r2`.
+
+Cari clue via `strings`:
+
+```bash
+$ strings -n 3 ./curly_crab | grep -iE 'serde_json|json|schema|flag|pascalCTF'
+/.../serde_json-1.0.149/...
+pascalCTF
+Give me a JSONy flag!
+```
+
+Keliatan jelas: ini Rust + `serde_json`.
+
+---
+
+### Recon (lanjutan): cari `main` dan jalur sukses/gagal
+
+Karena simbol ada, kita mulai dari `nm`:
+
+```bash
+$ nm -n ./curly_crab | grep 'curly_crab4main'
+000000000002e3f0 t _ZN10curly_crab4main17h71b58f7aacf87a44E
+```
+
+Jadi `main` Rust ada di:
+
+- `curly_crab::main` @ `0x000000000002e3f0`
+
+Disassembly:
+
+```bash
+$ objdump -d -M intel --disassemble='_ZN10curly_crab4main17h71b58f7aacf87a44E' ./curly_crab | sed -n '1,120p'
+```
+
+Yang kita cari di `main` itu pola:
+
+1. print prompt
+2. baca 1 baris stdin
+3. parse JSON
+4. kalau valid → print `🦀`, kalau nggak → print `😔`
+
+Dan bener: `main` memanggil `serde_json::de::from_trait` (parse JSON) dan bercabang ke print sukses/gagal.
+
+Pseudo-code hasil konversi ASM (disederhanakan):
+
+```c
+int main() {
+  print("Give me a JSONy flag!\n");
+  line = stdin.read_line();
+  // parse into Top
+  ok = serde_json_from_str<Top>(line);
+  if (ok) print("🦀\n");
+  else    print("😔\n");
+}
+```
+
+Di sini “exploit”-nya bukan memory corruption; “exploit”-nya adalah **memberi JSON yang cocok**.
+
+---
+
+### Reverse: bongkar “schema” dari kode `serde_json`
+
+Trik paling enak buat challenge Rust-serde kayak gini: cari fungsi deserialize yang termonomorfisasi (biasanya namanya panjang banget), karena di dalamnya ada:
+
+- cek nama key (`"pascal"`, `"CTF"`, dst)
+- cek tipe (string/bool/number/array/object)
+- cek duplicate field / missing field
+
+#### 1) Temukan deserializer Top-level
+
+Di output `nm`, ada fungsi `deserialize_struct` jumbo. Yang paling ngarah ke “Top” ada di range `0x2bf30`:
+
+```bash
+$ nm -n ./curly_crab | grep '2bf30'
+000000000002bf30 t _ZN98_$LT$$RF$mut$u20$serde_json..de..Deserializer$LT$R$GT$$u20$as$u20$serde_core..de..Deserializer$GT$18deserialize_struct17he3c85fe01abee1f1E
+```
+
+Alamat penting:
+
+- `Top` deserializer @ `0x000000000002bf30`
+
+Dump:
+
+```bash
+$ objdump -d -M intel --start-address=0x2bf30 --stop-address=0x2ced0 ./curly_crab > /tmp/top.txt
+$ sed -n '110,190p' /tmp/top.txt
+```
+
+Di dalamnya, ada pola cek key pakai XOR (ini umum dari compiler untuk compare cepat):
+
+- key length 6 → match `"pascal"`
+- key length 3 → match `"CTF"`
+- key length 4 → match `"crab"`
+
+Secara konsep, kira-kira begini:
+
+```c
+// inside Top::deserialize map loop
+switch (key) {
+  case "pascal": top.pascal = read_string(); seen_pascal = true; break;
+  case "CTF":    top.CTF    = read_i64();    seen_ctf    = true; break;
+  case "crab":   top.crab   = read_struct(Crab); seen_crab = true; break;
+  default:       skip_value();
+}
+// plus: reject duplicate fields
+```
+
+#### 2) Turun ke struct `Crab`
+
+Field `"crab"` memanggil deserializer struct lain:
+
+- `Crab` deserializer @ `0x000000000002a4d0`
+
+```bash
+$ objdump -d -M intel --start-address=0x2a4d0 --stop-address=0x2b1c0 ./curly_crab > /tmp/crab.txt
+```
+
+Dari sana kita baca key yang diwajibkan:
+
+- `"I_"` (bool)
+- `"cr4bs"` (integer)
+- `"crabby"` (nested struct)
+
+Secara bentuk:
+
+```c
+struct Crab {
+  bool I_;
+  i64  cr4bs;
+  Crabby crabby;
+}
+```
+
+#### 3) Turun lagi: struct `Crabby`
+
+Nested struct ini kebetulan deserializer-nya ada di:
+
+- `Crabby` deserializer @ `0x0000000000023fb0`
+
+```bash
+$ objdump -d -M intel --start-address=0x23fb0 --stop-address=0x24a00 ./curly_crab > /tmp/crabby.txt
+```
+
+Di sini, “schema”-nya jadi keliatan terang:
+
+- key `"l0v3_"` → **array** (vector) of string (`Vec<String>`)
+- key `"r3vv1ng_"` → integer
+
+Titik ini juga nge-guard duplicate field (ada flag `seen_*` internal).
+
+Jadi bentuk akhirnya:
+
+```c
+struct Crabby {
+  Vec<String> l0v3_;
+  i64         r3vv1ng_;
+}
+```
+
+---
+
+### Exploit: kasih JSON yang tepat (dan “ambil” flag dari schema)
+
+Sekarang udah jelas: binary cuma minta JSON yang bisa di-deserialize ke:
+
+```c
+struct Top {
+  String pascal;
+  i64    CTF;
+  Crab   crab;
+}
+```
+
+Payload minimal yang lolos (contoh):
+
+```bash
+$ ./curly_crab <<<'{"pascal":"x","CTF":0,"crab":{"I_":true,"cr4bs":0,"crabby":{"l0v3_":[],"r3vv1ng_":0}}}'
+Give me a JSONy flag!
+🦀
+```
+
+Terus bagian “flag”-nya datang dari *narrative* challenge: kepiting “nyolong schema”, jadi kita **nyusun flag dari potongan key** yang dipaksa schema itu:
+
+- prefix event: `pascalCTF{...}`
+- isi dalam kurung: `I_`, `l0v3_`, `r3vv1ng_`, `cr4bs`
+
+Susun jadi flag nya(first, aku pikir buat nyusun flag nya itu sesuai ejaan yang enak di denger, pas di submit yup, "i got it"):
+
+```
+pascalCTF{I_l0v3_r3vv1ng_cr4bs}
+```
+
+
+### flag
+
+`pascalCTF{I_l0v3_r3vv1ng_cr4bs}`
+
+---

@@ -18,7 +18,6 @@
     "@next/mdx": "15.5.9",
     "@nextui-org/react": "^2.6.11",
     "aos": "^2.3.4",
-    "framer-motion": "^12.23.12",
     "gray-matter": "^4.0.3",
     "lucide-react": "^0.542.0",
     "next": "15.5.9",

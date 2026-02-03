@@ -1,0 +1,1254 @@
+---
+layout: post
+title: "Arkavidia 10 - Reverse Engineering"
+date: 2026-02-02
+image: /assets/.
+categories: ["Arkavidia"]
+tags: [rev, ctf2026]
+---
+
+
+## Deadliner
+
+### Intro
+
+This challenge felt like a “mobile app semester project that took 2 months but got vibe-coded in 3 days”: the UI is neat, the login/register flow exists, but… the security is “good enough for a demo”. And that’s the entry point.
+
+Our goal is simple: **grab the flag from the APK**. But since this is Flutter (AOT), we won’t get raw Dart source. So the approach is: recon first so we know what kind of app this is, then crack open `libapp.so` until we find the credential-validation path, and finally **invert the hash algorithm** to recover a password that turns out to be… the flag.
+
+---
+
+### Recon: “this is a Flutter APK—where’s the logic?”
+
+Start from a single file:
+
+```bash
+ls -la
+file dist.apk
+unzip -l dist.apk | head -n 40
+```
+
+The important bits:
+
+- There’s `assets/flutter_assets/...` and `lib/*/libflutter.so` + `lib/*/libapp.so`
+- That’s the signature of a **Flutter release (AOT)**: the app logic is in `libapp.so`, not `classes.dex`.
+
+Next: extract the APK so it’s easy to grep.
+
+```bash
+mkdir -p out/apk
+unzip -q -o dist.apk -d out/apk
+```
+
+I usually try a quick flag search first (sometimes the developer “slips” and leaves the raw flag string somewhere):
+
+```bash
+rg -a -n "flag\\{|FLAG\\{|arkav\\{|ctf\\{" out/apk || true
+strings -a out/apk/classes.dex | rg -i 'flag|arkav|ctf' | head
+```
+
+Nothing. Okay—so this isn’t a “strings ez win”.
+
+---
+
+### Quick triage in `libapp.so`: there’s login, there’s admin, and there’s something very long
+
+Flutter AOT is noisy if you only use `strings`, but it’s still useful for finding “anchors”:
+
+```bash
+strings -a out/apk/lib/x86_64/libapp.so | rg -n "Admin Panel|LoginScreen|RegisterScreen|password_db\\.dart|hash_algorithm\\.dart" | head -n 50
+```
+
+One thing that made me pause: there are Dart file paths carried into the binary, for example:
+
+- `package:simple_mobile_app/utils/password_db.dart`
+- `package:simple_mobile_app/utils/hash_algorithm.dart`
+
+Meaning: there’s a “password db” module and a custom “hash algorithm”. This is usually a jackpot for a rev chall, because:
+
+1) the stored hash is usually in one place,
+2) the hash is usually “homebrew crypto” (read: reversible or weak),
+3) you can just invert it to recover the password.
+
+And sure enough: in `libapp.so` there’s a very long hex string that looks like a digest.
+
+---
+
+### Level up: dump Dart AOT symbols with Blutter
+
+Because this is Flutter AOT, the most comfortable way is using **Blutter** to:
+
+- dump object pool (konstanta: string, map, list),
+- generate pseudo-assembly per file `package:...`.
+
+Minimal setup:
+
+```bash
+apt-get install -y -qq cmake ninja-build pkg-config libicu-dev libcapstone-dev python3-pyelftools python3-requests
+```
+
+Clone Blutter and run it on the `arm64-v8a` folder (Blutter focuses on arm64):
+
+```bash
+git clone --depth 1 https://github.com/worawit/blutter.git out/blutter
+python3 out/blutter/blutter.py out/apk/lib/arm64-v8a out/blutter_out
+```
+
+Outputs we use:
+
+- `out/blutter_out/asm/simple_mobile_app/utils/password_db.dart`
+- `out/blutter_out/asm/simple_mobile_app/utils/hash_algorithm.dart`
+- `out/blutter_out/asm/simple_mobile_app/services/analytics_service.dart`
+- `out/blutter_out/pp.txt` (object pool, constants)
+
+---
+
+### Finding 1: the “password database” has only 1 user — `superadmin`
+
+In `out/blutter_out/asm/simple_mobile_app/utils/password_db.dart`, there’s a map initializer that’s literally hardcoded:
+
+- Function: `PasswordDB._passwordHashes()` at **addr `0x3216b4`**
+- Key: **`"superadmin"`**
+- Value: a long hex string (digest)
+
+Relevant bits (from the Blutter dump):
+
+- `"superadmin"`: `out/blutter_out/asm/simple_mobile_app/utils/password_db.dart:75`
+- digest hex: `out/blutter_out/asm/simple_mobile_app/utils/password_db.dart:80`
+
+And it really is just that: a map literal of size 1.
+
+If you want “proof”, the init part looks like this:
+
+```asm
+; PasswordDB._passwordHashes @ 0x3216b4
+0x3216d8: r16 = "superadmin"
+;           [pp+0xcd08] "superadmin"
+0x3216e4: r16 = "ff9841831ca972c5...4c4a65869"
+;           [pp+0xcd50] "<digest hex>"
+```
+
+Conceptually, the pseudocode is:
+
+```text
+// PasswordDB._passwordHashes @ 0x3216b4
+passwordHashes = {
+  "superadmin": "ff9841831ca972c5...4c4a65869"
+}
+```
+
+So this challenge isn’t “find a random username”: the username is implicitly given.
+
+---
+
+### Finding 2: per-user “session params” are used as the hashing key
+
+In `out/blutter_out/asm/simple_mobile_app/services/analytics_service.dart` there’s:
+
+- Function: `AnalyticsService.getSessionParams` at **addr `0x322028`**
+- It looks up a constant map (object pool) whose contents are:
+
+```bash
+rg -n "Map<String, List<int>>\\(1\\)" out/blutter_out/pp.txt | head
+sed -n '12510,12520p' out/blutter_out/pp.txt
+```
+
+Contents:
+
+```text
+Map<String, List<int>>(1) {
+  "superadmin": List<int>(2) [0xd15ea5e, 0x41414141]
+}
+```
+
+And the call to that constant map is clearly visible from the pool reference:
+
+```asm
+; AnalyticsService.getSessionParams @ 0x322028
+0x32204c: ... ; [pp+0xcd78] Map<String, List<int>>(1)
+```
+
+Pseudocode:
+
+```text
+// AnalyticsService.getSessionParams @ 0x322028
+sessionParams = {
+  "superadmin": [0x0d15ea5e, 0x41414141]
+}
+return sessionParams[username] ?? []
+```
+
+This is the interesting part: the hashing is “keyed”, but the key is also hardcoded.
+
+---
+
+### Finding 3 (core): the hash algorithm is reversible
+
+Most important file: `out/blutter_out/asm/simple_mobile_app/utils/hash_algorithm.dart`.
+
+What we care about:
+
+- `HashAlgorithm.verify` @ **`0x321a4c`** (wrapper that calls the hash then compares)
+- `HashAlgorithm.hash` @ **`0x321aa0`**
+- Helper:
+  - `XOR_Username` @ **`0x321e50`**
+  - `rotate_right_6` @ **`0x321ee4`**
+  - `rotate_left_3` @ **`0x321f1c`**
+  - `XOR_0x0D15EA5E` @ **`0x321f58`** (basically XOR using bytes from the key dword)
+
+#### Shape of the algorithm (pseudocode from ASM)
+
+Condensing the flow in `HashAlgorithm.hash`:
+
+```text
+// HashAlgorithm.hash @ 0x321aa0
+// input: passwordBytes, username
+keys = AnalyticsService.getSessionParams(username)
+if keys == null or len(keys) < 2: return ""
+
+k1 = keys[0]  // 0x0d15ea5e
+k2 = keys[1]  // 0x41414141
+
+out = []
+for i, b in enumerate(passwordBytes):
+    b = b ^ byte(k1, i)          // take one byte from k1 (i % 4)
+    b = rol8(b, 3)
+    b = b ^ byte(k2, i)          // take one byte from k2 (i % 4)
+    b = ror8(b, 6)
+    b = b ^ username[i % len(username)]
+    out.append(b)
+
+return hex(out)  // each byte -> 2 hex digits, then join
+```
+
+A small snippet from the helper that makes “the username part of the key”:
+
+```asm
+; HashAlgorithm.XOR_Username @ 0x321e50
+0x321e68: sdiv  x6, x2, x0          ; i / len(username)
+0x321e6c: msub  x5, x6, x0, x2      ; i % len(username)
+...
+0x321eac: eor   x0, x4, x1          ; byte ^ username[i % len]
+```
+
+Key point: all operations are XOR + 8-bit bit rotations → **invertible**.
+
+So if we have:
+
+- username: `superadmin`
+- key: `[0x0d15ea5e, 0x41414141]`
+- digest hex: `ff9841...`
+
+…we can run the inverse to recover the original password.
+
+---
+
+### Exploit: invert digest → get the password → password = flag
+
+Forward:
+
+```text
+passwordByte -> XOR(k1) -> ROL3 -> XOR(k2) -> ROR6 -> XOR(usernameByte) -> digestByte
+```
+
+So the inverse (right-to-left):
+
+```text
+digestByte -> XOR(usernameByte) -> ROL6 -> XOR(k2) -> ROR3 -> XOR(k1) -> passwordByte
+```
+
+Python implementation (this is what I used to recover the flag):
+
+```py
+hash_hex = "ff9841831ca972c540e6c035d2c4c1026ea63c4bd11fc32df02d700deb44a79d192ec129cec4da06799c4e26f92d1a2d26272d15594ee74b4e217d8659b4c306b02d1a6e264726dd3f0e84216e84574b99f4c4a65869"
+username = "superadmin"
+k1 = 0x0d15ea5e
+k2 = 0x41414141
+
+def rotl8(x, n): return ((x << n) | (x >> (8 - n))) & 0xff
+def rotr8(x, n): return ((x >> n) | (x << (8 - n))) & 0xff
+
+k1b = [(k1 >> 24) & 0xff, (k1 >> 16) & 0xff, (k1 >> 8) & 0xff, k1 & 0xff]
+k2b = [(k2 >> 24) & 0xff, (k2 >> 16) & 0xff, (k2 >> 8) & 0xff, k2 & 0xff]
+uname = username.encode()
+
+digest = bytes.fromhex(hash_hex)
+pw = []
+for i, s in enumerate(digest):
+    o = s ^ uname[i % len(uname)]
+    e = rotl8(o, 6)           # inverse dari ROR6
+    c = e ^ k2b[i % 4]
+    b = rotr8(c, 3)           # inverse dari ROL3
+    p = b ^ k1b[i % 4]
+    pw.append(p)
+
+print(bytes(pw).decode())
+```
+
+The output is immediately printable ASCII, and it’s the flag.
+
+### Flag 
+
+`ARKAV{r3ly_t00_much_0n_41_bu1ld1ng_4pp_5ur3ly_1t_w0uldn't_b1t3_m3_1n_th3_futur3_r1ght}`
+
+
+---
+
+## him
+
+### Intro
+
+> “Huh? Even though I’m a guy? Have you finally lost your mind, you cosmetic fanatic?”  
+> “Treat me to Tenya Ramen, three times. Any less than that and it’s not happening.”
+
+This challenge looks simple: a small binary named `him` that asks us to pass `./him <flag>`. But the moment we give the wrong input… it *segfaults*. And that’s where the “story” begins: not brute-force, but dissecting a mini VM + self-modifying bytecode until we can “say” the name *HIM* correctly.
+
+`ARKAV{C4nn07_5p311_h1ur4_m1h473_w17h0u7_H1M}`
+
+---
+
+### Recon: “why does a wrong flag crash?”
+
+First, check the folder contents:
+
+```bash
+$ ls -la
+him.zip
+```
+
+Unzip and run:
+
+```bash
+$ unzip him.zip
+$ chmod +x him
+$ ./him
+Usage: ./him <flag>
+```
+
+If we give a random input:
+
+```bash
+$ ./him test
+# (tidak ada output)
+$ echo $?
+139
+```
+
+Exit code `139` = segfault. This isn’t a “security feature”, it’s a signal that the checker logic intentionally corrupts internal state (or there’s a VM writing to a bogus address) when validation fails.
+
+Because the binary is **not stripped**, we get a lot of freebies right away:
+
+```bash
+$ file him
+him: ELF 64-bit LSB pie executable, x86-64, dynamically linked, not stripped
+```
+
+PIE means runtime addresses are `base + offset`. In this write-up I use **offsets** from `nm/objdump`.
+
+---
+
+### Mapping: fungsi dan data penting
+
+```bash
+$ nm -an him | rg 'rdtsc|encode_input|vm_cpu|main|bytecode|reward|reward_len|sp_cookie|encrypted_sp'
+0000000000002169 T rdtsc
+0000000000002187 T encode_input
+000000000000222f T vm_cpu
+0000000000002ada T main
+0000000000005040 D bytecode
+0000000000005140 D reward
+0000000000005174 D reward_len
+0000000000005178 D sp_cookie
+000000000000517c D encrypted_sp
+```
+
+My initial intuition was:
+
+- `encode_input()` turns the user input into a global buffer `encoded_input` (in `.bss`, offset `0x69a0`).
+- `bytecode` (in `.data` `0x5040`) and `dispatch_table` (in `.data` `0x5180`) form a **VM**.
+- `reward` (`0x5140`) + `reward_len` (`0x5174`) are used to print output after validation passes.
+
+---
+
+### Main: three “evil” steps
+
+The core `main` disassembly (offset `0x2ada`) is basically:
+
+1. Check args (`argc == 2`), otherwise -> `printf("Usage: %s <flag>")`.
+2. Call `encode_input(argv[1])`.
+3. **Decrypt the bytecode in-place**: every byte `bytecode[i] ^= 0x55` for `i = 0..0xe4` (229 bytes).
+4. Call `vm_cpu(strlen(argv[1]))`.
+
+So the original bytecode is *encrypted* and only gets opened at runtime.
+
+---
+
+#### Part 1 — encode_input(): the “flag” isn’t checked directly
+
+`encode_input` (offset `0x2187`) builds an `encoded_input` array that later becomes the VM’s “fuel”.
+
+Pseudocode-nya:
+
+```c
+// encode_input(input: char*)
+// output ditaruh di global encoded_input[0..len-1]
+
+uint8_t state = 0xA7;
+int n = min(strlen(input), 0xFF);
+
+for (int i = 0; i < n; i++) {
+    uint8_t b = (uint8_t)input[i];
+    uint8_t e = (uint8_t)((b ^ state) + (13 * i));   // 13*i mod 256
+    encoded_input[i] = e;
+
+    // state = e ^ (state*7)   (mod 256)
+    state = (uint8_t)(e ^ (uint8_t)(state * 7));
+}
+```
+
+Meaning: the VM **never** compares the plaintext input directly. What’s checked is `encoded_input[i]` (the encoding result).
+
+Important bonus: this function can be **inverted** to recover the original input once we know all `encoded_input[i]`.
+
+---
+
+#### Part 2 — vm_cpu(): VM stack + self-modifying bytecode
+
+`vm_cpu` (offset `0x222f`) is a simple interpreter, with:
+
+- `bytecode` di `.data` (`0x5040`)
+- `dispatch_table` in `.data` (`0x5180`) containing 256 function pointers (most point to `exit(0x8b)`).
+- `stack` global di `.bss` (`0x59a0`) sebagai stack VM (elemen 32-bit)
+- `encoded_input` global in `.bss` (`0x69a0`) as the input “register file”
+
+#### “Encrypted stack pointer” (why it can segfault)
+
+Ada dua global:
+
+- `sp_cookie` (u32) di `0x5178`
+- `encrypted_sp` (u32) di `0x517c`
+
+On every push/pop, SP is computed as:
+
+```
+sp = sp_cookie ^ encrypted_sp
+```
+
+If the checker fails on certain opcodes, it **XORs `sp_cookie` with a magic constant** (e.g. `0xdeadbeef`, `0xcafebabe`). After that, SP becomes garbage → the stack index goes negative/out of range → writes to a random address → segfault (which is what we see with wrong input).
+
+#### Relevant opcodes (and handler addresses)
+
+From `dispatch_table` we can map opcode → handler (offset):
+
+| Opcode | Char | Handler (offset) | Meaning |
+|---:|:---:|---:|---|
+| 0x48 | `H` | 0x2277 | `PUSH_IMM` (push 1-byte immediate from bytecode) |
+| 0x49 | `I` | 0x231b | `PUSH_INP idx` (push `encoded_input[idx]`) |
+| 0x55 | `U` | 0x23e9 | `ADD` |
+| 0x52 | `R` | 0x24ff | `XOR` |
+| 0x41 | `A` | 0x2613 | `ASSERT_EQ imm` (compare pop against the next immediate byte) |
+| 0x6d | `m` | 0x26c1 | `ASSERT_M imm` (check a specific transform) |
+| 0x69 | `i` | 0x278d | `JMP (top ^ imm)` |
+| 0x74 | `t` | 0x2940 | XOR-blok bytecode: `len, key` |
+| 0x68 | `h` | 0x2851 | anti-debug-ish: pick `0xCC`/`0xAD` via `rdtsc`, then XOR 4 bytes of bytecode |
+| 0x61 | `a` | 0x2a1f | NOP (advance ip) |
+| 0x65 | `e` | 0x2a56 | “reward printer” (print output then `exit(0)`) |
+
+Other opcodes → `exit(0x8b)`.
+
+#### Transform `m`: the math is reversible
+
+Handler `m` basically checks:
+
+```c
+// val = pop()
+// imm = next byte in bytecode
+uint8_t t = (uint8_t)(((val + 13) * 3) & 0xFF);
+t ^= 0x55;
+assert(t == imm);
+```
+
+Because `3` has an inverse mod 256 (`171`, since `3*171 ≡ 1 (mod 256)`), this constraint can be inverted:
+
+```text
+imm' = imm ^ 0x55
+val  = (imm' * 171 - 13) mod 256
+```
+
+So `m` ultimately also “locks” a single byte of `encoded_input[idx]`.
+
+---
+
+### Part 3 — the “exploit”: don’t fight the VM, emulate it and steal the constraints
+
+This is the turning point:
+
+- The VM bytecode contains only `ADD`, `XOR`, `ASSERT` operations against immediates.
+- That means many constraints **directly solve** `encoded_input[i]` to a specific value.
+- One annoying part: opcode `i` (`JMP`) needs a runtime value (`encoded_input[idx]`) to decide where `ip` jumps to.
+
+Solution:
+
+1. Emulasikan VM.
+2. Representasikan stack sebagai ekspresi sederhana (`Var(idx)`, `Const`, `Add`, `Xor`).
+3. Saat ketemu `ASSERT_EQ` atau `ASSERT_M`:
+   - If the expression is `Var(i)` / `Var(i) ^ c` / `Var(i) + c`, we can directly assign the value of `encoded_input[i]`.
+4. Saat ketemu `JMP` dan stack top masih `Var(i)`:
+   - Do a small BFS/branch: try 0..255 for `encoded_input[i]`, and continue with the ones that don’t “die”.
+5. Once we reach opcode `e`, we have enough `encoded_input[0..43]`.
+6. Invert `encode_input` to recover the plaintext input: that’s the flag.
+
+### Script solver
+
+This is the script I used.
+
+`solve.py`:
+
+```py
+#!/usr/bin/env python3
+import pathlib
+import collections
+
+BIN = pathlib.Path("him").read_bytes()
+
+DATA_VA  = 0x5020
+DATA_OFF = 0x4020
+
+BYTECODE_VA  = 0x5040
+BYTECODE_LEN = 229
+REWARD_VA    = 0x5140
+REWARD_LEN   = 52
+
+def va_to_off(va: int) -> int:
+    return (va - DATA_VA) + DATA_OFF
+
+bytecode_enc = bytearray(BIN[va_to_off(BYTECODE_VA):va_to_off(BYTECODE_VA)+BYTECODE_LEN])
+reward       = BIN[va_to_off(REWARD_VA):va_to_off(REWARD_VA)+REWARD_LEN]
+
+# main() decrypts bytecode in-place: bytecode[i] ^= 0x55
+bytecode0 = bytearray(b ^ 0x55 for b in bytecode_enc)
+
+# --- tiny symbolic layer (cukup buat ADD/XOR + konstanta) ---
+class Expr: pass
+class Const(Expr):
+    __slots__ = ("v",)
+    def __init__(self, v): self.v = v & 0xFFFFFFFF
+class Var(Expr):
+    __slots__ = ("i",)
+    def __init__(self, i): self.i = int(i)
+class Xor(Expr):
+    __slots__ = ("a","b")
+    def __init__(self, a, b): self.a=a; self.b=b
+class Add(Expr):
+    __slots__ = ("a","b")
+    def __init__(self, a, b): self.a=a; self.b=b
+
+def simplify(e: Expr, env: dict[int,int]) -> Expr:
+    if isinstance(e, Const): return e
+    if isinstance(e, Var):
+        return Const(env[e.i]) if e.i in env else e
+    if isinstance(e, Xor):
+        a = simplify(e.a, env); b = simplify(e.b, env)
+        if isinstance(a, Const) and isinstance(b, Const): return Const(a.v ^ b.v)
+        # keep const on right
+        if isinstance(a, Const) and not isinstance(b, Const): a, b = b, a
+        return Xor(a, b)
+    if isinstance(e, Add):
+        a = simplify(e.a, env); b = simplify(e.b, env)
+        if isinstance(a, Const) and isinstance(b, Const): return Const((a.v + b.v) & 0xFFFFFFFF)
+        if isinstance(a, Const) and not isinstance(b, Const): a, b = b, a
+        return Add(a, b)
+    raise TypeError(e)
+
+def solve_single(e: Expr, target: int, env: dict[int,int]) -> bool:
+    """Try to solve constraints for a single Var under +c / ^c forms."""
+    e = simplify(e, env)
+    target &= 0xFF
+    if isinstance(e, Const): return (e.v & 0xFF) == target
+    if isinstance(e, Var):
+        if e.i in env: return (env[e.i] & 0xFF) == target
+        env[e.i] = target
+        return True
+    if isinstance(e, Xor):
+        a, b = e.a, e.b
+        if isinstance(a, Var) and isinstance(b, Const):
+            val = target ^ (b.v & 0xFF)
+            if a.i in env: return (env[a.i] & 0xFF) == (val & 0xFF)
+            env[a.i] = val & 0xFF
+            return True
+    if isinstance(e, Add):
+        a, b = e.a, e.b
+        if isinstance(a, Var) and isinstance(b, Const):
+            val = (target - (b.v & 0xFF)) & 0xFF
+            if a.i in env: return (env[a.i] & 0xFF) == val
+            env[a.i] = val
+            return True
+    return False
+
+def invert_m(imm: int) -> int:
+    # (((val + 13) * 3) & 0xff) ^ 0x55 == imm
+    inv3 = 171
+    y = (imm ^ 0x55) & 0xFF
+    return ((y * inv3) - 13) & 0xFF
+
+def run_vm(variant_byte: int, preset: dict[int,int]):
+    bc = bytearray(bytecode0)
+    env = {k:(v & 0xFF) for k,v in preset.items()}
+    stack: list[Expr] = []
+    ip = 0
+
+    for _ in range(50000):
+        if not (0 <= ip < len(bc)):
+            return ("dead", None)
+        op = bc[ip]
+
+        if op == 0x61:  # 'a' nop
+            ip += 1
+            continue
+
+        if op == 0x65:  # 'e' end
+            return ("success", env)
+
+        if op == 0x48:  # 'H' push imm
+            ip += 1
+            stack.append(Const(bc[ip]))
+            ip += 1
+            continue
+
+        if op == 0x49:  # 'I' push encoded_input[idx]
+            ip += 1
+            stack.append(Var(bc[ip]))
+            ip += 1
+            continue
+
+        if op == 0x55:  # 'U' add
+            a = stack.pop(); b = stack.pop()
+            stack.append(simplify(Add(a, b), env))
+            ip += 1
+            continue
+
+        if op == 0x52:  # 'R' xor
+            a = stack.pop(); b = stack.pop()
+            stack.append(simplify(Xor(a, b), env))
+            ip += 1
+            continue
+
+        if op == 0x41:  # 'A' assert eq imm
+            ip += 1
+            imm = bc[ip]
+            val = stack.pop()
+            if not solve_single(val, imm, env):
+                return ("dead", None)
+            ip += 1
+            continue
+
+        if op == 0x6D:  # 'm' assert transform
+            ip += 1
+            imm = bc[ip]
+            val = stack.pop()
+            if not solve_single(val, invert_m(imm), env):
+                return ("dead", None)
+            ip += 1
+            continue
+
+        if op == 0x69:  # 'i' jump by (top ^ imm)
+            ip += 1
+            imm = bc[ip]
+            top = simplify(stack.pop(), env)
+            if not isinstance(top, Const):
+                if isinstance(top, Var):
+                    return ("need", (ip, imm, top.i, env))
+                return ("dead", None)
+            ip = ip + (((top.v & 0xFF) ^ imm) & 0xFFFFFFFF)
+            continue
+
+        if op == 0x68:  # 'h' timing xor 4 bytes
+            ip += 1
+            for j in range(4):
+                bc[ip+j] ^= variant_byte
+            continue
+
+        if op == 0x74:  # 't' xor-block
+            ip += 1
+            n = bc[ip]; ip += 1
+            key = bc[ip]; ip += 1
+            for j in range(n):
+                bc[ip+j] ^= key
+            continue
+
+        return ("dead", None)
+
+    return ("dead", None)
+
+def invert_encode_input(encoded: bytes) -> bytes:
+    state = 0xA7
+    out = bytearray()
+    for i, e in enumerate(encoded):
+        b = ((e - (13*i)) & 0xFF) ^ state
+        out.append(b)
+        state = (e ^ ((state * 7) & 0xFF)) & 0xFF
+    return bytes(out)
+
+# BFS: isi byte yang diperlukan saat jump muncul
+q = collections.deque()
+q.append({})
+seen = set()
+
+def solve_with_variant(variant: int) -> str | None:
+    q = collections.deque([{}])
+    seen = set()
+
+    while q:
+        preset = q.popleft()
+        key = tuple(sorted(preset.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        st, payload = run_vm(variant, preset)
+        if st == "success":
+            env = payload
+            # flag length = 44; ini yang dipakai VM untuk modulo dan output
+            if all(i in env for i in range(44)):
+                encoded = bytes(env[i] for i in range(44))
+                return invert_encode_input(encoded).decode("ascii")
+
+        if st == "need":
+            _, imm, idx, env_snapshot = payload
+            # brute 0..255 untuk encoded_input[idx], lanjutkan yang masih hidup
+            for v in range(256):
+                p2 = dict(preset)
+                p2[idx] = v
+                st2, _ = run_vm(variant, p2)
+                if st2 in ("success", "need"):
+                    q.append(p2)
+
+    return None
+
+# opcode 'h' memilih XOR key via rdtsc, kadang 0xCC kadang 0xAD.
+for variant in (0xCC, 0xAD):
+    flag = solve_with_variant(variant)
+    if flag is not None:
+        print(flag)
+        raise SystemExit(0)
+
+raise SystemExit("failed to recover flag")
+```
+
+Then run:
+
+```bash
+$ python3 solve.py
+ARKAV{C4nn07_5p311_h1ur4_m1h473_w17h0u7_H1M}
+```
+
+---
+
+### Validasi
+
+Once the solver prints the flag string, validation is just this:
+
+```bash
+$ ./him 'ARKAV{C4nn07_5p311_h1ur4_m1h473_w17h0u7_H1M}'
+
+FLAG: ARKAV{C4nn07_5p311_h1ur4_m1h473_w17h0u7_H1M}
+```
+
+Exit code `0` is also an indicator that we passed all the “if wrong -> break -> crash” paths.
+
+---
+
+## NeuralChiper
+
+### Intro
+
+There are three files and one big claim: *“neural network cipher”*. And honestly—when a “cipher” claims to be a neural network, it usually ends up being either:
+
+- just a *linear layer*,
+- or obfuscation to make us forget that math still applies.
+
+This challenge falls into the first category. Clean, fast, and… **reversible**.
+
+The goal is simple: from the “encrypted” `output`, recover the original input until we get the flag.
+
+---
+
+### Recon: what’s inside the dist?
+
+Start from the zip:
+
+```bash
+$ ls -la
+dist.zip
+
+$ unzip -l dist.zip
+Archive:  dist.zip
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+      178  2026-01-28 22:38   output
+    10944  2026-01-28 22:38   weights
+     4137  2026-01-28 22:38   chall.pyc
+---------                     -------
+    15259                     3 files
+```
+
+Three artifacts:
+
+- `output` → the “ciphertext” result
+- `weights` → model weights (this looks like a matrix)
+- `chall.pyc` → the “leaked” AI kernel (but made annoying)
+
+---
+
+### Looking at `output`: disguised bytes
+
+`output` turns out to be just a list of numbers, one per line:
+
+```bash
+$ wc -l output
+52 output
+
+$ head -n 8 output
+2
+218
+41
+57
+208
+54
+224
+95
+```
+
+52 numbers, each 0–255. This already smells like a “byte vector”.
+
+---
+
+### Looking at `weights`: NUMPY, shape (52, 52)
+
+The `weights` file looks like a `.npy`:
+
+```bash
+$ hexdump -C weights | head
+00000000  93 4e 55 4d 50 59 01 00  76 00 7b 27 64 65 73 63  |.NUMPY..v.{'desc|
+00000010  72 27 3a 20 27 3c 69 34  27 2c 20 27 66 6f 72 74  |r': '<i4', 'fort|
+00000020  72 61 6e 5f 6f 72 64 65  72 27 3a 20 46 61 6c 73  |ran_order': Fals|
+00000030  65 2c 20 27 73 68 61 70  65 27 3a 20 28 35 32 2c  |e, 'shape': (52,|
+00000040  20 35 32 29 2c 20 7d 20  20 20 20 20 20 20 20 20  | 52), }         |
+```
+
+In the header you can clearly see:
+
+- dtype: `'<i4'` (int32)
+- shape: `(52, 52)`
+
+If this is a “neural network cipher”, it’s most likely just:
+
+> `y = W * x (mod 256)`
+
+where:
+
+- `x` = input (52 bytes)
+- `W` = weight matrix (52×52)
+- `y` = output (the 52 numbers we have)
+
+In other words: one *fully-connected layer* with no activation. And if `W` is invertible modulo 256… game over.
+
+---
+
+### Bonus: `chall.pyc` is a trap (but you don’t need it)
+
+If you try to run it directly:
+
+```bash
+$ python3 chall.pyc
+RuntimeError: Bad magic number in .pyc file
+```
+
+That’s because the `.pyc` header was modified (different magic number). Technically you can still *load* it with `marshal` after skipping the 16-byte header, but in this challenge we don’t even need a full decompile—two data files (`weights` + `output`) are enough to “reverse the network”.
+
+If you want to see the “address” (file offset), here are the first 16 bytes of `chall.pyc`:
+
+```bash
+$ hexdump -C chall.pyc | head -n 2
+00000000  42 0f ad ed 00 00 00 00  76 2d 7a 69 4b 0e 00 00  |B.......v-ziK...|
+00000010  e3 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+```
+
+At offset `0x00000000` you can see the magic number `42 0f ad ed` (different from normal Python magic), which is why the interpreter rejects it.
+
+Example code-object load (if you want to peek):
+
+```python
+import marshal, dis
+with open("chall.pyc","rb") as f:
+    f.read(16)
+    code = marshal.load(f)
+dis.dis(code)
+```
+
+---
+
+### Core exploit: invert the matrix modulo 256
+
+If the encryption is linear:
+
+```
+y = W * x  (mod 256)
+```
+
+then decryption is simply:
+
+```
+x = W^{-1} * y  (mod 256)
+```
+
+There’s only one requirement: `W` must have an inverse modulo 256.
+
+A handy sanity check: look at the matrix rank modulo 2. If it’s full-rank (52), then `det(W)` is odd (a unit in `Z/256Z`) → **W is definitely invertible modulo 256**.
+
+```python
+import numpy as np
+w = np.load("weights")
+print("shape:", w.shape, "dtype:", w.dtype)
+print("mod2 rank:", np.linalg.matrix_rank(w % 2))
+```
+
+```bash
+shape: (52, 52) dtype: int32
+mod2 rank: 52
+```
+
+Full rank. Nice.
+
+---
+
+### Solver: 10 lines that turn the “AI cipher” into plaintext
+
+We use `sympy` for the inverse modulo 256 (`inv_mod(256)`):
+
+```python
+import numpy as np
+import sympy as sp
+
+w = np.load("weights")
+y = [int(line) for line in open("output")]
+
+W = sp.Matrix(w.tolist())
+Y = sp.Matrix(y)
+
+X = (W.inv_mod(256) * Y) % 256
+pt = bytes(int(v) for v in list(X))
+print(pt.decode())
+```
+
+### Flag
+
+`ARKAV{m4tr1x_m0dul0_m4yhem_1nv3rt1bl3_n3ur4l_c1ph3r}`
+
+And that’s it.
+
+---
+
+
+## umapyoi
+
+### Intro
+
+Description: *“Are you... glad to have been my trainer?”*  
+The binary only prints the prompt `Insert flag:` and if you’re wrong, you immediately get labeled:
+
+> `Your trainee lacks guts.`
+
+What makes it interesting: this isn’t “just a string compare”, but a **graph** of 1000 nodes, and the correct flag is a **path** from the start node to the end node with the exact required length.
+
+In this write-up I’ll walk through it from recon to the flag.
+
+---
+
+### Recon: look at the binary first
+
+Unzip, check the file type, then try running it:
+
+```bash
+$ unzip -o umapyoi.zip
+$ file umapyoi
+umapyoi: ELF 64-bit LSB executable, x86-64, statically linked, ... not stripped
+
+$ ./umapyoi
+I'm going to win this for the folks back home. But first, food.
+Insert flag:
+```
+
+If I enter a random string:
+
+```bash
+$ printf '%s\n' test | ./umapyoi
+...
+Your trainee lacks guts.
+```
+
+Since the binary is **not stripped**, I immediately look for the `main` symbol:
+
+```bash
+$ nm -n umapyoi | rg ' main$'
+0000000000405589 T main
+```
+
+---
+
+### Reading `main`: input validation and the “flag printing machine”
+
+Disassemble `main`:
+
+```bash
+$ objdump -d -M intel --disassemble=main umapyoi | sed -n '1,120p'
+```
+
+Key things visible in `main` (address: `0x405589`):
+
+1. Print narrative + prompt.
+2. Read input as a `std::string`.
+3. Call `init(input)` (address: `0x405146`).
+4. If `init` fails **or** `length != 0x22` (34), immediately exit with “lacks guts”.
+5. If it passes, the program builds a `std::function` (a recursive lambda) and starts traversing the graph from the start node.
+
+Two key numbers are also clearly hard-coded in `main`:
+
+- `start = 0x278` (632)
+- `end   = 0x2cb` (715)
+
+---
+
+### `init(input)`: not finding the flag, just “character checking”
+
+Disassemble `init`:
+
+```bash
+$ objdump -d -M intel --disassemble=_Z4initRKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE umapyoi | sed -n '1,120p'
+```
+
+Inside `init` (address: `0x405146`) I found a character whitelist string in `.rodata`:
+
+```bash
+$ strings -t x -n 5 umapyoi | rg '0134579AKRV'
+181040 0134579AKRV_bdmnruv{}
+```
+
+In short, `init` builds an `unordered_set<char>` from that whitelist and then ensures **every** input character is in the set.
+
+Pseudocode converted from ASM → logic:
+
+```c
+bool init(const string& s) {
+  const string allowed = "0134579AKRV_bdmnruv{}";
+  unordered_set<char> set(allowed.begin(), allowed.end());
+
+  for (char c : s) {
+    if (set.find(c) == set.end()) return false;
+  }
+  return true;
+}
+```
+
+So… `init` isn’t a flag comparator. It’s just a “fence” forcing our input to use a specific alphabet.
+
+---
+
+### Recursive lambda in `main`: flag = a path in the graph
+
+The lambda used by `std::function` has a symbol (because it’s not stripped):
+
+```bash
+$ nm umapyoi | rg '_ZZ4main.*_clEiiS4_'
+000000000040533a t _ZZ4mainENKUliiNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEE_clEiiS4_
+```
+
+Disassemble that lambda (address: `0x40533a`):
+
+```bash
+$ objdump -d -M intel --disassemble=_ZZ4mainENKUliiNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEE_clEiiS4_ umapyoi | sed -n '1,220p'
+```
+
+Logical structure:
+
+- Parameter `i` = current node.
+- Parameter `depth` = index of the character being checked (0..len-1).
+- Parameter `out` = the string being accumulated.
+- There’s a `found` flag to stop once it’s found.
+- There are two important globals:
+  - `node_chars` (`0x5f3d20`): map `node -> char`
+  - `graph` (`0x5f3ce0`): map `node -> vector<neighbor>`
+
+The character-verification snippet (the “key” of the puzzle):
+
+1) Take `expected = node_chars[i]`  
+2) Check `input[depth] == expected`  
+3) If it matches, append `expected` to `out`  
+4) If `depth == len-1` and `i == end`, print `FLAG: ` + `out`
+
+In compact pseudocode:
+
+```c
+void dfs(int node, int depth, string out) {
+  if (depth >= input.size()) return;
+  if (input[depth] != node_chars[node]) return;
+
+  out.push_back(node_chars[node]);
+
+  if (depth == input.size() - 1 && node == end) {
+    cout << "FLAG: " << out << endl;
+    found = true;
+    return;
+  }
+
+  for (int nxt : graph[node]) {
+    if (found) return;
+    dfs(nxt, depth + 1, out);
+  }
+}
+```
+
+This explains why the program can *“print the flag”* without ever storing the final flag string literally:  
+**the flag is the traversal result**, and our input is used to “lock” the node choice at each depth.
+
+At this point, the problem is clear:
+
+> Find a length-34 string, all characters from the whitelist, that represents a node path `0x278 -> ... -> 0x2cb` of 33 edges, with the rule `char(depth) = node_chars[node]`.
+
+---
+
+### Avoid tedious RE: extract the graph tables directly from the file
+
+I did peek at the very long global initialization in `__static_initialization_and_destruction_0` (around `0x405cfe`), but that would turn this write-up into a 1000-episode soap opera.
+
+Faster: since this is a static binary and the data is built from constants in `.rodata`, we can **dump the tables directly from the file**.
+
+Two relevant offsets (file offsets, not runtime addresses):
+
+- `node_chars` table: `0x188f00` (1000 entry, format `<int node><int char>` = 8 byte per entry)
+- `graph` adjacency: `0x1811f0` (1000 node, tiap node punya 5 neighbor `int32` = 0x20 byte per node)
+
+I verified one of them with a hexdump:
+
+```bash
+$ hexdump -Cv -s 0x188f00 -n 64 umapyoi
+00188f00  00 00 00 00 4e 00 00 00  01 00 00 00 70 00 00 00  |....N.......p...|
+...
+```
+
+Meaning:
+
+- node 0 → 'N' (0x4e)
+- node 1 → 'p' (0x70)
+- etc.
+
+---
+
+### The “exploit”: find a sensible length-34 path (`ARKAV{...}`)
+
+We know the CTF flag format is `ARKAV{...}`.  
+As it happens, the first shortest path found really does start with `A` from the start node, so I used this prefix to narrow the search.
+
+Strategy:
+
+1) Extract `node_chars[0..999]` and `adj[0..999][0..4]`.
+2) Dynamic programming: `reachable[t]` = set of nodes that can reach `end` in exactly `t` steps.
+3) Force the `ARKAV{` prefix at the start.
+4) Reconstruct the rest to total length 34.
+
+Solver I used:
+
+```py
+import struct
+
+BIN = "umapyoi"
+NODE_CHARS_OFF = 0x188f00
+GRAPH_OFF      = 0x1811f0
+N = 1000
+
+START = 0x278
+END   = 0x2cb
+L     = 34
+EDGES = L - 1
+
+with open(BIN, "rb") as f:
+  f.seek(NODE_CHARS_OFF)
+  node_data = f.read(N * 8)
+
+node_char = ["?"] * N
+for i in range(N):
+  k, v = struct.unpack_from("<iI", node_data, i * 8)
+  assert k == i
+  node_char[i] = chr(v & 0xff)
+
+with open(BIN, "rb") as f:
+  f.seek(GRAPH_OFF)
+  graph_data = f.read(N * 0x20)
+
+adj = [None] * N
+for i in range(N):
+  adj[i] = list(struct.unpack_from("<5i", graph_data, i * 0x20))
+
+# DP: reachable[t] = nodes that can reach END in exactly t edges
+reachable = [set() for _ in range(EDGES + 1)]
+reachable[0].add(END)
+for t in range(1, EDGES + 1):
+  prev = reachable[t - 1]
+  cur = set()
+  for u in range(N):
+    if any(v in prev for v in adj[u]):
+      cur.add(u)
+  reachable[t] = cur
+
+assert START in reachable[EDGES]
+
+prefix = "ARKAV{"
+paths = [(START, [START])]
+for ch in prefix[1:]:
+  nxt = []
+  for u, p in paths:
+    for v in adj[u]:
+      if node_char[v] == ch:
+        nxt.append((v, p + [v]))
+  paths = nxt
+assert paths, "prefix not found"
+
+best = None
+for u, p in paths:
+  remaining = EDGES - (len(prefix) - 1)
+  if u in reachable[remaining]:
+    best = p
+    break
+assert best is not None
+
+cur = best[-1]
+remaining = EDGES - (len(best) - 1)
+while remaining > 0:
+  for v in adj[cur]:
+    if v in reachable[remaining - 1]:
+      best.append(v)
+      cur = v
+      remaining -= 1
+      break
+  else:
+    raise RuntimeError("stuck")
+
+flag = "".join(node_char[n] for n in best)
+print(flag)
+```
+
+Run:
+
+```bash
+$ python3 solve.py
+ARKAV{09ur1_d_b3_7r4v3r51n9_1n_m3}
+```
+
+Verify against the binary:
+
+```bash
+$ printf '%s\n' 'ARKAV{09ur1_d_b3_7r4v3r51n9_1n_m3}' | ./umapyoi
+...
+FLAG: ARKAV{09ur1_d_b3_7r4v3r51n9_1n_m3}
+```
+
