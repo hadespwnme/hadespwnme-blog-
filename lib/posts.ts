@@ -4,6 +4,7 @@ import matter from "gray-matter";
 import readingTime from "reading-time";
 import { compileMDX } from "next-mdx-remote/rsc";
 import CodeBlock from "@/components/CodeBlock";
+import { Highlighter } from "@/components/ui/highlighter";
 import remarkGfm from "remark-gfm";
 import rehypeSlug from "rehype-slug";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
@@ -143,10 +144,32 @@ export async function getPost(slug: string, lang?: Lang) {
   const source = fs.readFileSync(file, "utf8");
   const Pre: React.FC<React.HTMLAttributes<HTMLPreElement>> = (props) =>
     React.createElement(CodeBlock, null, props.children);
+  const Strong: React.FC<{ children?: React.ReactNode }> = ({ children }) =>
+    React.createElement(
+      Highlighter,
+      { action: "highlight", color: "#87CEFA", padding: 4 },
+      React.createElement("span", { style: { fontWeight: "inherit" } }, children),
+    );
+  const Code: React.FC<React.ComponentPropsWithoutRef<"code">> = ({ className, ...props }) => {
+    const children = props.children;
+    const childText =
+      typeof children === "string"
+        ? children
+        : Array.isArray(children) && children.every((c) => typeof c === "string")
+          ? children.join("")
+          : "";
+    const isBlock =
+      (typeof className === "string" && /(?:^|\\s)language-/.test(className)) || childText.includes("\n");
+    const codeEl = React.createElement("code", { className, ...props });
+    if (isBlock) return codeEl;
+    return React.createElement(Highlighter, { action: "underline" }, codeEl);
+  };
   const { content, frontmatter } = await compileMDX<PostFrontmatter>({
     source,
     components: {
       pre: Pre,
+      strong: Strong,
+      code: Code,
     },
     options: {
       parseFrontmatter: true,

@@ -3,10 +3,11 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
-import { Github, Sun, Moon, Menu, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { Github, Menu, X } from "lucide-react";
+import { useMemo, useState } from "react";
 import { useLang } from "@/lib/useLang";
 import { Press_Start_2P } from "next/font/google";
+import { AnimatedThemeToggler } from "@/components/ui/animated-theme-toggler";
 
 const pressStart = Press_Start_2P({ subsets: ["latin"], weight: "400" });
 
@@ -45,30 +46,9 @@ export default function Navbar() {
   const pathname = usePathname();
   const router = useRouter();
   const [open, setOpen] = useState(false);
-  const [dark, setDark] = useState(false);
   const { lang, toggle: toggleLang } = useLang();
 
-  useEffect(() => {
-    const root = document.documentElement;
-    const storedTheme = localStorage.getItem("theme");
-    const isDark = storedTheme === "light" ? false : true;
-    root.classList.toggle("dark", isDark);
-    root.classList.toggle("light", !isDark);
-    setDark(isDark);
-  }, []);
-
   const t = useMemo(() => labels[lang], [lang]);
-
-  const toggleTheme = () => {
-    setDark((prev) => {
-      const next = !prev;
-      const root = document.documentElement;
-      root.classList.toggle("dark", next);
-      root.classList.toggle("light", !next);
-      localStorage.setItem("theme", next ? "dark" : "light");
-      return next;
-    });
-  };
 
   const navItems = [
     { href: "/posts", label: t.posts },
@@ -159,13 +139,7 @@ export default function Navbar() {
             </button>
           </div>
 
-          <button
-            className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
-            aria-label={t.toggleTheme}
-            onClick={toggleTheme}
-          >
-            {dark ? <Sun size={16} /> : <Moon size={16} />}
-          </button>
+          <AnimatedThemeToggler aria-label={t.toggleTheme} />
         </div>
       </nav>
 
@@ -208,13 +182,7 @@ export default function Navbar() {
                 {lang.toUpperCase()}
               </button>
 
-              <button
-                className="p-2 rounded-md hover:bg-black/5 dark:hover:bg-white/10"
-                aria-label={t.toggleTheme}
-                onClick={toggleTheme}
-              >
-                {dark ? <Sun size={16} /> : <Moon size={16} />}
-              </button>
+              <AnimatedThemeToggler aria-label={t.toggleTheme} />
             </div>
           </div>
         </div>

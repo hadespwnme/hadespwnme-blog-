@@ -25,6 +25,7 @@
     "next-sitemap": "^4.2.3",
     "react": "19.1.0",
     "react-dom": "19.1.0",
+    "react-rough-notation": "^1.0.8",
     "reading-time": "^1.5.0",
     "rehype-autolink-headings": "^7.1.0",
     "rehype-slug": "^6.0.0",
