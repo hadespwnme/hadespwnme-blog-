@@ -8,7 +8,7 @@ export default async function TCP1PLeaderboardCard() {
   const rows = await getTCP1PLeaderboard({ limit: 10, offset: 0 });
 
   return (
-    <section className="border border-black/20 dark:border-white/20 rounded-lg p-4 shadow-sm dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]">
+    <section className="border border-black/20 dark:border-white rounded-lg p-4 shadow-sm dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]">
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="font-semibold leading-tight">TCP1P Member Scoring</div>
@@ -65,4 +65,3 @@ export default async function TCP1PLeaderboardCard() {
     </section>
   );
 }
-

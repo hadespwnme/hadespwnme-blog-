@@ -13,7 +13,7 @@ export default async function CategoriesPage() {
         {data.map((c, i) => (
           <li
             key={c.name}
-            className="rounded-md p-3 flex items-center justify-between border border-black/20 dark:border-white/20 shadow-sm hover:shadow-md transition dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]"
+            className="rounded-md p-3 flex items-center justify-between border border-black/20 dark:border-white shadow-sm hover:shadow-md transition dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]"
             data-aos="fade-up"
             data-aos-delay={i * 50}
           >

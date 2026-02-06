@@ -2,7 +2,7 @@ import Image from "next/image";
 
 export default function AuthorCard() {
   return (
-    <div className="flex items-center gap-4 border border-black/20 dark:border-white/20 rounded-lg p-4 shadow-sm hover:shadow-md transition dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]" data-aos="fade-up">
+    <div className="flex items-center gap-4 border border-black/20 dark:border-white rounded-lg p-4 shadow-sm hover:shadow-md transition dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]" data-aos="fade-up">
       <Image
         src="/assets/avatar.jpg"
         alt="Author avatar"

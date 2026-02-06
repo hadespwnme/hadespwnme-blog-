@@ -94,7 +94,7 @@ export default async function Home() {
           {posts.map((p, i) => (
             <article
               key={p.slug}
-              className="relative rounded-lg p-4 border border-black/20 dark:border-white/20 shadow-sm hover:-translate-y-0.5 hover:shadow-md transition dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]"
+              className="relative rounded-lg p-4 border border-black/20 dark:border-white shadow-sm hover:-translate-y-0.5 hover:shadow-md transition dark:ring-1 dark:ring-white/15 dark:shadow-[0_8px_24px_rgba(0,0,0,0.6)]"
               data-aos="fade-up"
               data-aos-delay={i * 50}
             >
