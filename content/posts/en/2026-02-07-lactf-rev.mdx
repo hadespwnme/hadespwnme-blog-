@@ -1,0 +1,2535 @@
+---
+layout: post
+title: "laCTF 2026 - Reverse Engineering"
+date: 2026-02-07
+image: /assets/.
+categories: ["laCTF"]
+tags: [rev, dos, lfsr, ctf2026]
+---
+
+## Flag Finder
+
+### Intro
+
+Sometimes reverse is not about "reading assembly until your eyes water (want to cry)", but about *seeing patterns* that are hidden in unexpected places.
+
+In this challenge, the title is casual: **Flag Finder**. The UI is also “friendly”: checkered grid(**ascii art**), **Find flag** button. But when we peeked at the JavaScript file... it turned out that the "flag" validation was done using **giant regex**.
+
+And the twist: the regex doesn't create ordinary strings.
+It's actually a **Nonogram (Picross)** disguised as a regex.
+
+Our final target: create `#` and `.` patterns that **pass the regex**, then read the text that is formed into a flag.
+
+---
+
+### Recon: what services are unlocked?
+
+The given host (because usually rev uses *nc* and doesn't give a port so scanning the port is the right choice):
+
+```bash
+flag-finder.chall.lac.tf
+```
+
+Start by scanning the relevant ports:
+
+```bash
+$ nmap -Pn -p 22,80,443,1337,31337 flag-finder.chall.lac.tf
+Starting Nmap 7.98 ( https://nmap.org )
+Nmap scan report for flag-finder.chall.lac.tf (34.11.215.13)
+Host is up (0.18s latency).
+Not shown: 3 filtered tcp ports (no-response)
+PORT    STATE SERVICE
+80/tcp  open  http
+443/tcp open  https
+```
+
+So this is the web.
+
+Check the landing page:
+
+```bash
+$ curl -fsSL -D - http://flag-finder.chall.lac.tf/ | head
+HTTP/1.1 200 OK
+Content-Type: text/html
+Server: nginx/1.29.5
+
+<!DOCTYPE html>
+<html lang="en">
+```
+
+The HTML includes `script.js`:
+
+```html
+<script src="script.js"></script>
+```
+
+Take the script:
+
+```bash
+$ curl -fsSL http://flag-finder.chall.lac.tf/script.js -o /tmp/ff_script.js
+$ head -n 25 /tmp/ff_script.js
+```
+
+---
+
+### Surgery `script.js`: The “flag” is not a normal string
+
+The basic source snippet:
+
+```js
+const len = 1919;
+const theFlag = /^ ... $/;
+
+function match() {
+  const boxes = document.querySelectorAll('.grid-box');
+  let input = "";
+  boxes.forEach(box => {
+    input += box.checked ? "#" : ".";
+  });
+
+  if (theFlag.test(input)) {
+    result.textContent = "✅ Flag found!";
+  } else {
+    result.textContent = "❌ Flag not found.";
+  }
+}
+```
+
+The insight:
+
+- There is a **1919 checkbox** → meaning the input is a string of length 1919.
+- Each checkbox becomes a character:
+  - checked → `#`
+  - unchecked → `.`
+- So what we are looking for is **pattern** `#` / `.` 1919 characters long.
+
+If we factor 1919:
+
+- `1919 = 19 * 101`
+
+This really stinks: grid **19 rows x 101 columns**.
+
+---
+
+### The essence of the exploit: the regex is actually a “Nonogram rule”
+
+#### 1) What is nonogram in short?
+
+Nonograms are picture puzzles made of black/white grids.
+You are given a **clue** for:
+
+- each row → long list of sequential “black blocks” (`#`).
+- each column → long list of sequential “black blocks” (`#`).
+
+Example clue line `[3,1]` means:
+
+- there are 3 `#` in sequence,
+- minimum 1 `.`,
+- then 1 `#`.
+
+Well... this challenge encodes the clue into regex.
+
+#### 2) How does regex encode lines?
+
+At the end of the regex there is a pattern like:
+
+```
+(?<=.{101})(?<!.{102})(\.*#{2}\.+#\.+#{2} ... )
+```
+
+This means:
+
+- `(?<=.{101})(?<!.{102})` → *anchor* so that we are right at the line boundary.
+- group `\.*#{2}\.+#...` → this literally describes “run” `#`:
+  - `#{2}` → two consecutive `#`
+  - `\.+` → at least one `.` as a separator between blocks
+
+So, if we parse regular `#{k}` and `#`, we get the clue line.
+
+#### 3) How does regex encode columns?
+
+At the beginning of the regex, there are many `(?=...)` lookaheads that are repetitive:
+
+- `(?:.{c}\..{100-c})` → “in the `c` column it must be `.` for a particular row”
+- `(?:.{c}#.{100-c})` → “in the `c` column it must be `#` for a particular row”
+
+When this section is combined with the repetition of `(...){n}` and `(...)+`, it exactly forces the pattern `#`/`.` vertical → clue column.
+
+Conclusion: the giant regex is not a “string validator”.
+He is **the reverse Nonogram solver**: he validates the correct grid.
+
+---
+
+### Solver: parse regex → become clue → solve using Z3
+
+I made a solver that does 4 steps:
+
+1. Take regex `theFlag` from `/tmp/ff_script.js`
+2. Extract **row clues** and **column clues** from the regex structure
+3. Solve Nonogram using **Z3** (SMT solver)
+4. Decode the resulting image (3x5 font) into a flag string
+
+#### Setup
+
+```bash
+$ cd /home/hadespwnme/ctf/lactf/rev/flag-finder
+$ python3 -m venv .venv
+$ . .venv/bin/activate
+$ pip install z3-solver==4.13.0.0
+
+# simpan JS target (biar solver bisa parse regex-nya)
+$ curl -fsSL http://flag-finder.chall.lac.tf/script.js -o /tmp/ff_script.js
+
+$ python solve.py | tail -n 4
+--- decoded flag
+lactf{Wh47_d0_y0u_637_wh3n_y0u_cr055_4_r363x_4nd_4_n0n06r4m?_4_r363x06r4m!}
+```
+
+### Solver code
+
+```py
+"""LA CTF - Flag Finder
+
+The challenge serves a web page with 1919 checkboxes (a 19x101 grid).
+The client-side JS checks the checkbox pattern against a giant regex.
+
+That giant regex is (effectively) a Nonogram constraint:
+- a lookahead per *column* encodes the column clue runs
+- a sequence of groups encodes the *row* clue runs
+
+This solver:
+1) parses the regex out of the hosted script.js
+2) extracts row/column Nonogram clues
+3) solves the Nonogram with Z3
+4) decodes the resulting 3x5 font into the flag string
+"""
+
+import re
+import sys
+from pathlib import Path
+
+
+def find_matching_paren(text: str, start_idx: int) -> int:
+    """Find the matching ')' for '(' at start_idx, respecting escapes."""
+    if text[start_idx] != '(':
+        raise ValueError('expected ( at start_idx')
+    depth = 0
+    i = start_idx
+    while i < len(text):
+        c = text[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise ValueError('no matching ) found')
+
+
+def prefix_str(n: int) -> str:
+    """Regex fragment for skipping n chars."""
+    if n == 0:
+        return ''
+    if n == 1:
+        return '.'
+    return f'.{{{n}}}'
+
+
+def suffix_str(n: int) -> str:
+    """Regex fragment for skipping n chars."""
+    if n == 0:
+        return ''
+    if n == 1:
+        return '.'
+    return f'.{{{n}}}'
+
+
+def token(col: int, ch: str) -> str:
+    """Column-constraint token used by the challenge regex."""
+    rest = 100 - col
+    pref = prefix_str(col)
+    suff = suffix_str(rest)
+    if ch == '.':
+        return f'(?:{pref}\\.{suff})'
+    if ch == '#':
+        return f'(?:{pref}#{suff})'
+    raise ValueError('ch must be . or #')
+
+
+def get_col_from_expr(expr: str) -> int:
+    """Infer which column a lookahead refers to from its first token."""
+    i = expr.find('(?:')
+    if i == -1:
+        raise ValueError('no (?: in expr')
+    j = i + 3
+
+    if expr.startswith('\\.', j) or expr.startswith('#', j):
+        return 0
+    if expr.startswith('.', j):
+        if expr.startswith('\\.', j + 1) or expr.startswith('#', j + 1):
+            return 1
+        if expr.startswith('{', j + 1):
+            k = expr.find('}', j + 2)
+            return int(expr[j + 2 : k])
+    if expr.startswith('.{', j):
+        k = expr.find('}', j + 2)
+        return int(expr[j + 2 : k])
+
+    raise ValueError(f'cannot infer column from expr prefix: {expr[:80]!r}')
+
+
+def simplify_expr(expr: str, col: int) -> str:
+    """Replace the verbose per-column tokens with just '.' or '#'."""
+    return expr.replace(token(col, '.'), '.').replace(token(col, '#'), '#')
+
+
+def runs_from_expr(expr: str) -> list[int]:
+    """Parse a row/col clue from a run-encoded regex fragment."""
+    runs: list[int] = []
+    i = 0
+    while i < len(expr):
+        if expr[i] == '#':
+            if i + 1 < len(expr) and expr[i + 1] == '{':
+                j = expr.find('}', i + 2)
+                runs.append(int(expr[i + 2 : j]))
+                i = j + 1
+            else:
+                runs.append(1)
+                i += 1
+        else:
+            i += 1
+    return runs
+
+
+def extract_regex_from_script(script_text: str) -> str:
+    """Grab the huge /^(... )$/ regex body from script.js."""
+    m = re.search(r'theFlag\\s*=\\s*/\\^(.+?)\\$\\/;\\s*\\n', script_text, flags=re.S)
+    if not m:
+        raise ValueError('could not locate theFlag regex in script')
+    return m.group(1)
+
+
+def extract_column_clues(pre: str) -> list[list[int]]:
+    """Parse the 101 column lookaheads into Nonogram run lists."""
+    outer_end = find_matching_paren(pre, 0)
+    inner = pre[3:outer_end]
+
+    lookaheads: list[str] = []
+    i = 0
+    while i < len(inner):
+        if inner.startswith('(?=', i):
+            end = find_matching_paren(inner, i)
+            lookaheads.append(inner[i + 3 : end])
+            i = end + 1
+        else:
+            i += 1
+
+    if len(lookaheads) != 101:
+        raise ValueError(f'expected 101 column lookaheads, got {len(lookaheads)}')
+
+    col_expr: dict[int, str] = {}
+    for expr in lookaheads:
+        col = get_col_from_expr(expr)
+        if col in col_expr:
+            raise ValueError(f'duplicate column {col}')
+        col_expr[col] = expr
+
+    missing = set(range(101)) - set(col_expr)
+    if missing:
+        raise ValueError(f'missing columns: {sorted(missing)}')
+
+    clues: list[list[int]] = []
+    for col in range(101):
+        simp = simplify_expr(col_expr[col], col)
+        clues.append(runs_from_expr(simp))
+    return clues
+
+
+def extract_row_clues(post: str) -> list[list[int]]:
+    """Parse the 19 row groups into Nonogram run lists."""
+    groups: list[str] = []
+
+    if not post.startswith('('):
+        raise ValueError('expected first row group at start of post')
+    end = find_matching_paren(post, 0)
+    groups.append(post[1:end])
+    i = end + 1
+
+    boundary_re = re.compile(r'\\(\\?<=\\.\\{(\\d+)\\}\\)\\(\\?<\\!\\.\\{(\\d+)\\}\\)')
+    while True:
+        m = boundary_re.search(post, i)
+        if not m:
+            break
+        i = m.end()
+        if i < len(post) and post[i] == '(':
+            end = find_matching_paren(post, i)
+            groups.append(post[i + 1 : end])
+            i = end + 1
+        else:
+            break
+
+    if len(groups) != 19:
+        raise ValueError(f'expected 19 row groups, got {len(groups)}')
+
+    return [runs_from_expr(g) for g in groups]
+
+
+def solve_nonogram(row_clues: list[list[int]], col_clues: list[list[int]]):
+    """Solve the Nonogram as constraints over booleans using Z3."""
+    import z3
+
+    H = len(row_clues)
+    W = len(col_clues)
+
+    # x[r][c] == True means a filled cell ('#')
+    x = [[z3.Bool(f'x_{r}_{c}') for c in range(W)] for r in range(H)]
+    s = z3.Solver()
+
+    def add_line_constraints(cells, runs, name_prefix: str):
+        """Enforce run-length constraints on one line (row/col)."""
+        L = len(cells)
+        k = len(runs)
+
+        if k == 0:
+            for p in range(L):
+                s.add(cells[p] == z3.BoolVal(False))
+            return
+
+        # start indices for each run
+        starts = [z3.Int(f'{name_prefix}_s{i}') for i in range(k)]
+
+        # bounds + ordering (+ at least 1 gap between runs)
+        for i_run, run_len in enumerate(runs):
+            s.add(starts[i_run] >= 0)
+            s.add(starts[i_run] + run_len <= L)
+            if i_run > 0:
+                prev_len = runs[i_run - 1]
+                s.add(starts[i_run] >= starts[i_run - 1] + prev_len + 1)
+
+        # each position is filled iff it belongs to any run interval
+        for p in range(L):
+            in_any = z3.Or(
+                [z3.And(starts[i_run] <= p, p < starts[i_run] + runs[i_run]) for i_run in range(k)]
+            )
+            s.add(cells[p] == in_any)
+
+    for r in range(H):
+        add_line_constraints(x[r], row_clues[r], f'row{r}')
+
+    for c in range(W):
+        add_line_constraints([x[r][c] for r in range(H)], col_clues[c], f'col{c}')
+
+    if s.check() != z3.sat:
+        raise RuntimeError('unsat')
+
+    m = s.model()
+    grid = [[bool(m.evaluate(x[r][c], model_completion=True)) for c in range(W)] for r in range(H)]
+    return grid
+
+
+def render(grid: list[list[bool]]) -> str:
+    """Pretty print for humans."""
+    lines = []
+    for row in grid:
+        lines.append(''.join('█' if v else ' ' for v in row))
+    return '\n'.join(lines)
+
+
+def decode_flag_from_grid(grid: list[list[bool]]) -> str:
+    """Decode the 3x5 glyph text drawn by the solved grid."""
+    H = len(grid)
+    W = len(grid[0]) if H else 0
+    if (H, W) != (19, 101):
+        raise ValueError(f'unexpected grid size {(H, W)}, expected (19, 101)')
+
+    def pat_for(line_start: int, glyph_idx: int) -> tuple[str, ...]:
+        cols = [4 * glyph_idx + 1, 4 * glyph_idx + 2, 4 * glyph_idx + 3]
+        rows = range(line_start + 1, line_start + 6)  # 5-row font
+        return tuple(''.join('#' if grid[r][c] else '.' for c in cols) for r in rows)
+
+    font: dict[tuple[str, ...], str] = {
+        ("##.", ".#.", ".#.", ".#.", "###"): "l",
+        ("...", "##.", ".##", "#.#", "###"): "a",
+        ("...", ".##", "#..", "#..", ".##"): "c",
+        (".#.", "###", ".#.", ".#.", ".##"): "t",
+        (".##", ".#.", "###", ".#.", ".#."): "f",
+        (".##", "##.", "#..", "##.", ".##"): "{",
+        ("#.#", "#.#", "###", "###", "#.#"): "W",
+        ("#.#", "#.#", "###", "..#", "..#"): "4",
+        ("###", "..#", "..#", "..#", "..#"): "7",
+        ("..#", ".##", "#.#", "#.#", ".##"): "d",
+        ("...", "...", "...", "...", "###"): "_",
+        (".##", "#.#", "#.#", "#.#", "###"): "0",
+        ("...", "#.#", "#.#", "#.#", ".##"): "u",
+        (".##", "#..", "###", "#.#", "###"): "6",
+        ("#..", "##.", "#.#", "#.#", "#.#"): "h",
+        ("###", "..#", "###", "..#", "###"): "3",
+        ("...", "###", "#.#", "#..", "#.."): "r",
+        ("###", "#..", "###", "..#", "##."): "5",
+        ("...", "##.", "#.#", "#.#", "#.#"): "n",
+        ("...", "#.#", "#.#", "###", "..#"): "y",
+        ("...", "###", "###", "###", "#.#"): "m",
+        ("...", "#.#", ".#.", ".#.", "#.#"): "x",
+        ("...", "#.#", "###", "###", "###"): "w",
+        ("###", "..#", ".#.", "...", ".#."): "?",
+        ("##.", ".##", "..#", ".##", "##."): "}",
+        (".#.", ".#.", ".#.", "...", ".#."): "!",
+    }
+
+    decoded = []
+    for line_start in (0, 6, 12):
+        for glyph_idx in range(25):
+            pat = pat_for(line_start, glyph_idx)
+            if pat not in font:
+                raise ValueError('unknown glyph pattern')
+            decoded.append(font[pat])
+
+    return ''.join(decoded)
+
+
+def main() -> int:
+    script_path = Path('/tmp/ff_script.js')
+    if not script_path.exists():
+        print('missing /tmp/ff_script.js; fetch script.js first', file=sys.stderr)
+        return 2
+
+    script_text = script_path.read_text(encoding='utf-8')
+    theflag = extract_regex_from_script(script_text)
+
+    marker = '(?=^.{1919}$)'
+    if marker not in theflag:
+        raise ValueError('marker not found')
+    pre, post = theflag.split(marker, 1)
+
+    row_clues = extract_row_clues(post)
+    col_clues = extract_column_clues(pre)
+
+    grid = solve_nonogram(row_clues, col_clues)
+
+    # print the solved bitmap
+    print(render(grid))
+
+    # print the exact dot/hash string too
+    print('\n---')
+    for row in grid:
+        print(''.join('#' if v else '.' for v in row))
+
+    # decode and print the final flag
+    flag = decode_flag_from_grid(grid)
+    print('\n--- decoded flag')
+    print(flag)
+
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+```
+
+
+### Flags 
+
+`lactf{Wh47_d0_y0u_637_wh3n_y0u_cr055_4_r363x_4nd_4_n0n06r4m?_4_r363x06r4m!}`
+
+### References
+
+- [Nonograms / Picross - Wikipedia](https://en.wikipedia.org/wiki/Nonogram)
+- [Regular expression lookahead / lookbehind (MDN)](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions/Assertions)
+- [Satisfiability Modulo Theories (Wikipedia)](https://en.wikipedia.org/wiki/Satisfiability_modulo_theories)
+
+
+## Helmet Hell
+
+### Intro
+
+At first it looks like “just a regular Helm chart”: render template → exit YAML → done.  
+But there is one symptom that makes you suspicious: **Whatever input is given, the result is always `false`**.
+
+And since it's challenge rev, that means the "false" isn't a bug... it's the *front door* in disguise.
+
+Our target: make Helm render `true`—and from there, the flag will open by itself.
+
+---
+
+### Recon: what's in dist?
+
+Starting from zip:
+
+```bash
+$ ls -la
+total 15904
+drwxr-xr-x 4 root root       4096 Feb  7 19:40 .
+drwxr-xr-x 7 root root       4096 Feb  7 19:16 ..
+drwxr-xr-x 3 root root       4096 Feb  7 19:40 helm-hell
+-rw-r--r-- 1 root root     105995 Feb  4 12:30 helm-hell.zip
+-rw-r--r-- 1 root root   16162235 Feb  7 19:18 helm.tgz
+drwxr-xr-x 2 ctf  docker     4096 Apr 11  2024 linux-amd64
+```
+
+The contents of the zip are very concise:
+
+```bash
+$ unzip -l helm-hell.zip
+Archive:  helm-hell.zip
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+       49  2026-02-04 11:52   helm-hell/Chart.yaml
+       10  2026-02-04 11:52   helm-hell/values.yaml
+   652276  2026-02-04 11:52   helm-hell/templates/_helpers.tpl
+      118  2026-02-04 11:52   helm-hell/templates/output.yaml
+---------                     -------
+   652453                     4 files
+```
+
+Four files, but one "makes us suspicious": `templates/_helpers.tpl` size is 652KB.  
+Usually it's just a helper... but here it looks like a *program* disguised as a helper.
+
+---
+
+### Glancing at the entrypoint: “result” is taken from the helper
+
+The output file is just like this:
+
+```yaml
+# helm-hell/templates/output.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: output
+data:
+  result: {{- include "replicaHandler7951" . | quote }}
+```
+
+This means **value `result` = output of `include "replicaHandler7951"`**.  
+If the helper prints the string `"true"`, we win.
+
+Now check the default values:
+
+```yaml
+# helm-hell/values.yaml
+input: ""
+```
+
+Let's try rendering:
+
+```bash
+$ ./linux-amd64/helm version --short
+v3.14.4+g81c902a
+
+$ ./linux-amd64/helm template t ./helm-hell --set-string input='' | sed -n '1,40p'
+---
+# Source: helm-program/templates/output.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: output
+data:
+  result:"false"
+```
+
+OK, baseline: **blank = false**. And (spoiler) random input is also false.
+
+---
+
+### Glancing at `_helpers.tpl`: it's not a helper, it's a VM
+
+We look for a function called output.yaml:
+
+```bash
+$ rg -n 'define \"replicaHandler7951\"' helm-hell/templates/_helpers.tpl
+12842:{{- define "replicaHandler7951" -}}
+```
+
+And fill in the function (our “entrypoint” address is here):
+
+```gotmpl
+{{- define "replicaHandler7951" -}}                      {{/* templates/_helpers.tpl:12842 */}}
+{{- $mooringBay7952 := dict                              {{/* state object */}}
+      "sea" (dict)                                       {{/* tape/memory */}}
+      "helm" 0                                           {{/* pointer */}}
+      "cargo" ""                                         {{/* output string */}}
+      "provisions" (default "" .Values.input)            {{/* user input */}}
+      "logbook" 0                                        {{/* input index */}}
+  -}}
+{{- include "volumeWorker7940" $mooringBay7952 -}}        {{/* run the “program” */}}
+{{- $mooringBay7952.cargo -}}                             {{/* return output */}}
+{{- end -}}
+```
+
+The variable names are (“sea/helm/cargo/logbook”), but the pattern is clear:
+
+- `sea` = memory (use `dict` and `set`)
+- `helm` = pointer/index (used as key string: `printf "%d" $helm`)
+- `provisions` = input string
+- `logbook` = input read position
+- `cargo` = output (finally becomes `"true"` or `"false"`)
+
+And the part that makes this feel “VM”: many of the functions are in the form of recursive loops:
+
+```gotmpl
+{{- define "tideInlet200" -}}                             {{/* templates/_helpers.tpl:1 */}}
+{{- $controllerStack6830 := printf "%d" $helm -}}
+{{- $secretPool6829 := default 0 (index $sea $controllerStack6830) -}}
+{{- if ne $secretPool6829 0 -}}                           {{/* while sea[helm] != 0 */}}
+  {{- $helm = add $helm 1 -}}
+  {{- include "nauticalCurrent198" (dict "sea" $sea "helm" $helm "cargo" $cargo "provisions" $provisions "logbook" $logbook) -}}
+  {{- $helm = sub $helm 1 -}}
+  {{- include "leagueCurrent199"  (dict "sea" $sea "helm" $helm "cargo" $cargo "provisions" $provisions "logbook" $logbook) -}}
+  {{- include "tideInlet200"      (dict "sea" $sea "helm" $helm "cargo" $cargo "provisions" $provisions "logbook" $logbook) -}}
+{{- end -}}
+{{- end -}}
+```
+
+If you've ever seen a compiler that “turns `while` into recursion”, this is exactly that.
+
+Next important part: **in many places, programs read input byte-by-byte**:
+
+```gotmpl
+{{- if lt $logbook (len $provisions) -}}
+  {{- $ch := index $provisions $logbook -}}               {{/* ambil 1 char */}}
+  {{- $val := int (printf "%d" $ch) -}}                   {{/* ke int 0..255 */}}
+  {{- $_ := set $sea (printf "%d" $helm) $val -}}         {{/* simpan ke memory */}}
+  {{- $logbook = add $logbook 1 -}}                       {{/* next */}}
+{{- end -}}
+```
+
+This is the strongest signal: **our input is processed as bytes, and there must be a compare in the VM**.
+
+---
+
+### Core exploit: “debug print” to block expected input
+
+In rev, we have two options:
+
+1) de-obfuscate the entire VM (tired), or  
+2) take advantage of the fact that Helm *must execute templates* → we can create a YAML version of “printf”.
+
+The key: `include` on the Helmet is side-effect friendly. We can:
+
+- add a new template (`debug.yaml`) that calls the same VM,
+- but the output is not `true/false`—but the “expected input” string that the VM prepared when comparing.
+
+Practical tricks to use in this challenge:
+
+- every time the VM wants to read a character from input, it turns out that it also "sets" a certain cell (cell `0`) to the **byte that it should be**,
+- If we take the cell `0` value every time the input is read, we can assemble the expected string.
+
+#### Automatic patch (in the debug folder, so that the original dist is saved)
+
+This script:
+
+- copy chart to `helm-hell-debug/`
+- search all blocks `index $provisions $logbook` (there are 41 times)
+- after each block is complete (`{{- end -}}`), insert the code that *appends* `sea["0"]` to `.expected_str`
+- create `templates/debug.yaml` to print `.expected_str`
+
+```python
+#!/usr/bin/env python3
+"""
+extract_expected.py — patch Helm chart untuk “debug print” expected flag.
+
+Kenapa begini?
+- Helm template dieksekusi, jadi kita bisa “mengintip” state VM lewat output YAML.
+"""
+
+import shutil
+from pathlib import Path
+
+src = Path("helm-hell")
+dst = Path("helm-hell-debug")
+
+# 1) Duplikasi chart supaya dist asli gak kotor
+shutil.rmtree(dst, ignore_errors=True)
+shutil.copytree(src, dst)
+
+helpers = dst / "templates" / "_helpers.tpl"
+lines = helpers.read_text().splitlines(True)
+
+needle = "index $provisions $logbook"
+
+# 2) Ini “sniffer”-nya: ambil byte di cell 0, append ke expected_str
+snippet = (
+    '{{- $_ := set . "expected_str" '
+    '(printf "%s%c" (default "" .expected_str) (default 0 (index $sea "0"))) -}}\n'
+)
+
+out = []
+i = 0
+patched = 0
+
+while i < len(lines):
+    out.append(lines[i])
+    if needle in lines[i]:
+        # 3) Loncat sampai end dari blok input-read, lalu sisipkan snippet
+        j = i
+        while j < len(lines) and lines[j].strip() != "{{- end -}}":
+            j += 1
+        if j >= len(lines):
+            raise SystemExit("end block not found")
+
+        i += 1
+        while i <= j:
+            out.append(lines[i])
+            i += 1
+
+        out.append(snippet)
+        patched += 1
+        continue
+    i += 1
+
+helpers.write_text("".join(out))
+
+# 4) Template debug buat nge-print expected_str
+(dst / "templates" / "debug.yaml").write_text(
+    "apiVersion: v1\n"
+    "kind: ConfigMap\n"
+    "metadata:\n"
+    "  name: debug\n"
+    "data:\n"
+    '  expected_str: {{- $st := dict "sea" (dict) "helm" 0 "cargo" "" '
+    '"provisions" (default "" .Values.input) "logbook" 0 -}}'
+    '{{- include "volumeWorker7940" $st -}}'
+    '{{- (default "" $st.expected_str) | quote }}\n'
+)
+
+print(f"patched input-read blocks: {patched}")
+print("debug chart:", dst)
+```
+
+Run:
+
+```bash
+$ python3 extract_expected.py
+patched input-read blocks: 41
+debug chart: helm-hell-debug
+
+$ ./linux-amd64/helm template t ./helm-hell-debug --set-string input='' | sed -n '1,80p'
+---
+# Source: helm-program/templates/debug.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: debug
+data:
+  expected_str:"lactf{t4k1ng_7h3_h3lm_0f_h31m_73mp14t3s}\x00"
+---
+# Source: helm-program/templates/output.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: output
+data:
+  result:"false"
+```
+
+Got it!! . But there's `\x00` at the end—that's a “null terminator” / padding because we peek at 1 “excess” step.  
+So the correct expected string just needs to be taken until before `\x00`.
+
+---
+
+### Exploit: give VM requested input → `true`
+
+Now just supply that input to the original chart:
+
+```bash
+$ FLAG='lactf{t4k1ng_7h3_h3lm_0f_h31m_73mp14t3s}'
+$ ./linux-amd64/helm template t ./helm-hell --set-string input=\"$FLAG\" | sed -n '1,40p'
+---
+# Source: helm-program/templates/output.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: output
+data:
+  result:"true"
+```
+
+And that's where the flag is:
+
+> `lactf{t4k1ng_7h3_h3lm_0f_h31m_73mp14t3s}`
+
+---
+
+### Flags
+
+`lactf{t4k1ng_7h3_h3lm_0f_h31m_73mp14t3s}`
+
+
+### Further learning reference
+
+- [Helm Chart Template Guide](https://helm.sh/docs/chart_template_guide/)
+- [Go `text/template` (the basic templating that Helm uses)](https://pkg.go.dev/text/template)
+- [Brainfuck (so you can imagine the similar concept of tape+pointer)](https://esolangs.org/wiki/Brainfuck)
+
+
+## lactf-1986
+
+### Intro
+
+There's something satisfying about old school challenges: they're small, the message is to-the-point, and the "key" is usually just one idea that's executed neatly.
+
+Here we get a floppy image (`CHALL.IMG`) containing the DOS program `CHALL.EXE` which claims to be a *flag checker*. Our goal is simple:
+
+> Find the flag that makes the program say: **"Indeed, that's the flag!"**
+
+And yes—we will “break” the checker in an elegant way: not shooting the flag, but reversing the algorithm.
+
+---
+
+### Recon: unload the contents of the floppy
+
+Starting from the contents of the folder:
+
+```bash
+$ ls -1
+CHALL.EXE
+```
+
+Check the file type:
+
+```bash
+$ file CHALL.IMG CHALL.EXE
+CHALL.IMG: DOS/MBR boot sector, code offset 0x3c+2, OEM-ID "IPRT 6.2", root entries 224, sectors 2880 (volumes <=32 MB), sectors/FAT 9, sectors/track 18, serial number 0x46ba57e0, label: "           ", FAT (12 bit), followed by FAT
+CHALL.EXE: MS-DOS executable, MZ for MS-DOS
+```
+
+We get `CHALL.EXE`, from the FAT12 mount image:
+
+```bash
+# Buat mount point
+$ mkdir -p mnt
+
+# Mount read-only sebagai vfat
+$ mount -o loop,ro -t vfat CHALL.IMG mnt
+
+# Lihat isinya
+$ ls -la mnt
+total 21
+drwxr-xr-x 2 root root 7168 Jan  1  1970 .
+drwxr-xr-x 3 root root 4096 Feb  7 13:33 ..
+-r-xr-xr-x 1 root root 9990 Feb  2  1986 CHALL.EXE
+
+# Copy keluar (opsional)
+$ cp mnt/CHALL.EXE .
+
+# Unmount
+$ umount mnt
+```
+
+---
+
+### Glancing at binary: strings already gives "map"
+
+Even without an emulator, `strings` immediately provides the program flow:
+
+```bash
+$ strings -n 4 CHALL.EXE
+...
+79:UCLA NetSec presents: LACTF '86 Flag Checker
+80:Check your Flag:
+81:Sorry, the flag must begin with "lactf{..."
+82:Sorry, that's not the flag.
+83:Indeed, that's the flag!
+...
+```
+
+This means this checker:
+
+1. Print banners
+2. Request input
+3. Validate prefix `lactf{`
+4. If wrong: "not the flag"
+5. If correct: "Indeed..."
+
+What's interesting: the EXE size is only ~10KB. Usually this is a sign that the algorithm is concise and we can reverse it until we find the hidden "target".
+
+---
+
+### Bonus: vaddr vs file offset (MZ header)
+
+This is the little part that often makes people "slip": in `radare2`, we often talk about "virtual address" / in-memory offset. But to get raw bytes from a file, we need a **file offset**.
+
+In the DOS MZ format, the header size is stored in the `e_cparhdr` field (number of 16-byte *paragraphs*). Create this binary:
+
+```python
+import struct
+exe = open("CHALL.EXE","rb").read()
+(e_cparhdr,) = struct.unpack_from("<H", exe, 0x08)
+print("e_cparhdr =", hex(e_cparhdr), "paragraphs")
+print("header_size =", hex(e_cparhdr * 16), "bytes")
+```
+
+```bash
+e_cparhdr = 0x3 paragraphs
+header_size = 0x30 bytes
+```
+
+That's why the ciphertext in vaddr `0x24D6` can be taken from the file offset `0x24D6 + 0x30 = 0x2506`.
+
+---
+
+### Algorithm dissection: the two most important blocks
+
+We use `radare2` to see 16-bit disassembly.
+
+#### 1) Ciphertext embedded (address that must be recorded)
+
+There is an “unreadable” blob of bytes (not a string) in:
+
+- **Virtual address (r2):** `0x24D6`
+- **Length:** `0x49` bytes
+- **File offset:** `0x24D6 + 0x30 = 0x2506` (MZ header is 0x30 bytes)
+
+Dump the ciphertext:
+
+```bash
+$ r2 -2 -q -A -c 'e scr.color=false; px 0x49 @ 0x24d6' CHALL.EXE
+- offset - D6D7 D8D9 DADB DCDD DEDF E0E1 E2E3 E4E5  6789ABCDEF012345
+0000:24d6  b68c 958f 9b85 4c5e ecb6 b8c0 9793 0b58  ......L^.......X
+0000:24e6  7750 b02c 7e28 7af1 b604 efbe 5c44 78e8  wP.,~(z.....\Dx.
+0000:24f6  9981 048f 0340 a73f fab7 0801 6352 e3ad  .....@.?....cR..
+0000:2506  d185 9f94 21d5 2a5c 20d4 3112 ceaa 16c7  ....!.*\ .1.....
+0000:2516  addf 295d 72fc 2490 2c                   ..)]r.$.,
+```
+
+If it's a classic checker, 99% of the patterns are:
+
+> input → processed → the result is compared with this embedded ciphertext
+
+So our target: reverse the “input → ciphertext” process to “ciphertext → input”.
+
+---
+
+#### 2) 20-bit Hash: “seed” created from plaintext (function @ `0x0010`)
+
+This part is key: the program creates a 2z0-bit value from the input (seed), then the seed is used to generate the keystream.
+
+The most informative snippet of ASM is around `0x0039`:
+
+```bash
+$ r2 -2 -q -A -c 'e scr.color=false; pd 28 @ 0x0039' CHALL.EXE
+│       ╎   ; DATA XREFS from fcn.00000ca4 @ 0xcc8(r), 0xd12(r)
+│       ╎   0000:0039     8b5efc         mov bx, word [var_4h]
+│       ╎   0000:003c     89f7           mov di, si
+│       ╎   ; DATA XREF from fcn.00002054 @ 0x205c(r)
+│       ╎   ; DATA XREF from fcn.000022e9 @ +0x18(r)
+│       ╎   0000:003e     b90600         mov cx, 6
+│       ╎   ; CODE XREF from fcn.00000010 @ 0x45(x)
+│       ╎   ; DATA XREF from fcn.00001a14 @ 0x1a29(x)
+│      ┌──> 0000:0041     d1e3           shl bx, 1
+│      ╎╎   ; DATA XREF from fcn.00001078 @ 0x112d(r)
+│      ╎╎   0000:0043     d1d7           rcl di, 1
+│      │╎   ; DATA XREF from fcn.00001078 @ 0x1129(r)
+│      └──< 0000:0045     e2fa           loop 0x41
+│       ╎   ; DATA XREF from fcn.00001078 @ 0x147c(r)
+│       ╎   0000:0047     8b46fc         mov ax, word [var_4h]
+│       ╎   ; DATA XREF from fcn.000000b0 @ 0xed(r)
+│       ╎   ; DATA XREF from entry0 @ 0x3c4(r)
+│       ╎   ; DATA XREF from fcn.00002328 @ 0x2359(r)
+│       ╎   0000:004a     89f2           mov dx, si
+│       ╎   ; DATA XREF from fcn.000004e1 @ 0x520(r)
+│       ╎   ; DATA XREF from fcn.00000ca4 @ 0xd53(r)
+│       ╎   0000:004c     d1e0           shl ax, 1
+│       ╎   ; DATA XREF from fcn.00000ca4 @ 0xdc3(r)
+│       ╎   0000:004e     d1d2           rcl dx, 1
+│       ╎   ; DATA XREFS from fcn.000000b0 @ 0xe0(r), 0xe3(w)
+│       ╎   ; DATA XREF from fcn.00001078 @ 0x1125(r)
+│       ╎   ; DATA XREF from fcn.00002150 @ 0x2168(r)
+│       ╎   0000:0050     01d8           add ax, bx
+│       ╎   0000:0052     11d7           adc di, dx
+│       ╎   0000:0054     8b56fc         mov dx, word [var_4h]
+│       ╎   ; DATA XREF from fcn.00000ca4 @ 0xdbf(r)
+│       ╎   0000:0057     01c2           add dx, ax
+│       ╎   0000:0059     11f7           adc di, si
+│       ╎   0000:005b     8a46fe         mov al, byte [var_2h]
+│       ╎   0000:005e     30e4           xor ah, ah
+│       ╎   0000:0060     31f6           xor si, si
+│       ╎   ; DATA XREFS from fcn.00001078 @ 0x10a5(r), 0x146e(r)
+│       ╎   0000:0062     01c2           add dx, ax
+│       ╎   ; DATA XREFS from fcn.00001078 @ 0x10dc(r), 0x1121(r)
+│       ╎   0000:0064     8956fc         mov word [var_4h], dx
+│       ╎   ; DATA XREF from fcn.00001078 @ 0x1417(r)
+│       ╎   0000:0067     11fe           adc si, di
+│       ╎   ; DATA XREFS from fcn.00001078 @ 0x1179(r), 0x1413(r)
+│       ╎   0000:0069     83e60f         and si, 0xf
+```
+
+The point is:
+
+- The 20-bit state is stored as:
+  - low 16-bit in `[var_4h]`
+  - high 4-bit in register `si` (reduced to `& 0xF`)
+- Loop `shl`+`rcl` 6 times = **shift-left 6** (aka `x << 6`)
+- Then there's shift-left 1 (aka `x << 1`)
+- Then add up and set `& 0xF` to keep 20-bits
+- Last plus input byte (`add dx, ax` after `ax = input_byte`)
+
+You could call it a hash:
+
+```text
+hash = (hash * 67 + byte) mod 2^20
+```
+
+Why 67? Because it's easy to calculate using shifts:
+
+- `67 = 64 + 2 + 1`
+- `hash*67 = (hash<<6) + (hash<<1) + hash`
+
+---
+
+#### 3) 20-bit LFSR: keystream generator (function @ `0x007B`)
+
+The following is the output of `radare2` which shows the keystream "machine" (pay attention to `xor`+`and 1`, then shift/rotate right, then inject bits into the nibble above `dx`):
+
+```bash
+$ r2 -2 -q -A -c 'e scr.color=false; pd 24 @ 0x0087' CHALL.EXE | head -n 22
+│       ╎   0000:0087     89c3           mov bx, ax
+│       ╎   0000:0089     89d6           mov si, dx
+│       ╎   0000:008b     b90300         mov cx, 3
+│       ╎   ; CODE XREF from fcn.0000007b @ 0x92(x)
+│      ┌──> 0000:008e     d1ea           shr dx, 1
+│      ╎╎   ; DATA XREF from segment.seg_001 @ +0x18c(r)
+│      ╎╎   0000:0090     d1d8           rcr ax, 1
+│      └──< 0000:0092     e2fa           loop 0x8e
+│       ╎   0000:0094     89c7           mov di, ax
+│       ╎   0000:0096     31df           xor di, bx
+│       ╎   0000:0098     83e701         and di, 1
+│       ╎   0000:009b     89d8           mov ax, bx
+│       ╎   0000:009d     89f2           mov dx, si
+│       ╎   ; DATA XREF from fcn.000021e7 @ +0x3d(r)
+│       ╎   0000:009f     d1ea           shr dx, 1
+│       ╎   0000:00a1     d1d8           rcr ax, 1
+│       ╎   0000:00a3     b103           mov cl, 3
+│       ╎   0000:00a5     89fe           mov si, di
+│       ╎   0000:00a7     d3e6           shl si, cl
+│       ╎   0000:00a9     09f2           or dx, si
+│       ╎   0000:00ab     83e20f         and dx, 0xf
+└       └─< 0000:00ae     ebc6           jmp 0x76                      ; fcn.00000010+0x66
+```
+
+How to read it (so you don't just "believe it"):
+
+- `shr dx,1` + `rcr ax,1` looped 3x ⇒ `state` shifted right 3 bits (`state >> 3`).
+- `mov di, ax; xor di, bx; and di, 1` ⇒ take LSB from `(state >> 3) XOR state` ⇒ **bit0 XOR bit3**.
+- `shr dx,1; rcr ax,1` again ⇒ `state >> 1`.
+- `shl si, 3; or dx, si` ⇒ inject `feedback` into the nibble above `dx` (which represents bit19), then `and dx, 0xf` keeps the state 20-bit.
+
+Bottom line: it's **20-bit LFSR** with taps **bit 0** and **bit 3**.
+
+---
+
+### The essence of the exploit: “ciphertext → plaintext” + self-consistency check
+
+Now we have an overview of the algorithm:
+
+```text
+cipher = bytes_at(0x24D6, len=0x49)
+
+seed = hash67(flag)                  # 20-bit
+state = seed
+for i in range(len(flag)):
+    state = lfsr_step(state)         # feedback bit0^bit3, shift, inject to bit19
+    cipher[i] == flag[i] XOR (state & 0xff)
+```
+
+Because the embedded ciphertext and seed are only 20-bit:
+
+- space seed = `2^20 = 1,048,576`
+- it's **bruteforce-able** in seconds
+
+Tricks to make it fast:
+
+1. Bruteforce seeds
+2. Decrypt the ciphertext with the seed
+3. Early filter: plaintext must start with `lactf{`
+4. Final validation: `hash67(plaintext) == seed` (this is what makes it “consistent”)
+
+Once you find something consistent, that plaintext is the flag.
+
+---
+
+### Solver: “neat and reasonable” 2^20 brute force
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+from pathlib import Path
+
+# Kita kerja dengan state 20-bit (mask 0xFFFFF)
+MASK_20 = (1 << 20) - 1
+
+# File CHALL.EXE ini MZ (DOS). Data yang kita lihat di radare2 pakai "virtual address"
+# dan untuk mapping ke file offset, kita perlu tambah ukuran header MZ (0x30).
+HEADER_SIZE = 0x30
+
+# Ciphertext embedded ada di vaddr 0x24D6, panjang 0x49 bytes.
+VADDR_CIPHERTEXT = 0x24D6
+CIPHERTEXT_LEN = 0x49
+
+# Kita punya known prefix dari output program: "flag harus begin dengan lactf{"
+PREFIX = b"lactf{"
+
+
+def lfsr_step(state: int) -> int:
+    """
+    LFSR 20-bit dari ASM:
+      feedback = (bit0 XOR bit3)
+      state = (state >> 1) | (feedback << 19)
+    """
+    feedback = (state ^ (state >> 3)) & 1
+    return ((state >> 1) | (feedback << 19)) & MASK_20
+
+
+def hash67(data: bytes) -> int:
+    """
+    Hash 20-bit dari ASM @ 0x0010:
+      h = (h * 67 + b) mod 2^20
+    """
+    h = 0
+    for b in data:
+        h = (h * 67 + b) & MASK_20
+    return h
+
+
+def decrypt(cipher: bytes, seed: int) -> bytes:
+    """
+    Decrypt ciphertext dengan seed:
+      state = seed
+      for each byte:
+        state = lfsr_step(state)
+        plaintext_byte = cipher_byte XOR (state & 0xFF)
+    """
+    state = seed
+    out = bytearray(len(cipher))
+    for i, cb in enumerate(cipher):
+        state = lfsr_step(state)
+        out[i] = cb ^ (state & 0xFF)
+    return bytes(out)
+
+
+def main() -> None:
+    exe = Path("CHALL.EXE").read_bytes()
+
+    # Ambil ciphertext langsung dari file (vaddr -> file offset)
+    start = VADDR_CIPHERTEXT + HEADER_SIZE
+    cipher = exe[start : start + CIPHERTEXT_LEN]
+    if len(cipher) != CIPHERTEXT_LEN:
+        raise SystemExit("failed to extract ciphertext")
+
+    # Bruteforce semua seed 20-bit
+    for seed in range(1 << 20):
+        # Early prune: cek prefix dulu biar cepat
+        if decrypt(cipher[: len(PREFIX)], seed) != PREFIX:
+            continue
+
+        pt = decrypt(cipher, seed)
+
+        # Sanity checks: jangan ada NUL, dan mayoritas printable
+        if 0 in pt:
+            continue
+        if any(c < 0x20 or c > 0x7E for c in pt):
+            continue
+
+        # Self-consistency check: seed harus sama dengan hash67(plaintext)
+        if hash67(pt) != seed:
+            continue
+
+        print(pt.decode())
+        return
+
+    raise SystemExit("no solution found")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run solver:
+
+```bash
+$ python3 solve.py
+lactf{3asy_3nough_7o_8rute_f0rce_bu7_n0t_ea5y_en0ugh_jus7_t0_brut3_forc3}
+```
+
+### Further learning reference
+
+- [Linear-feedback shift register (LFSR) — Wikipedia](https://en.wikipedia.org/wiki/Linear-feedback_shift_register)
+- [MS-DOS MZ executable format (overview)](https://en.wikipedia.org/wiki/DOS_MZ_executable)
+
+
+## Starless C
+
+### Intro
+
+"The son of the fortune-teller stands before three doors. A bee. A key. A flag."
+
+The opening sentence of this challenge feels poetic… but the binary is the opposite: neat, sharp, and *very* ELF-nerdy **gimmick**. The program says "there is a flag in the binary", but if it runs normally, we are only given the narrative "Not yet." and done.
+
+The twist: it's not about *bruteforce input* or long decompiles. This is about **seeing ELF as a puzzle box**, especially the part that is often overlooked: **program header (PT\_LOAD)**.
+
+Our final target is simple:
+
+- discover how the “three doors” work,
+- open the path to the execution of "flag printer",
+- send the correct input sequence to the remote, and take the flag.
+
+---
+
+### Recon: what's in dist?
+
+Starting from artifacts:
+
+```bash
+$ ls -la
+starless_c
+```
+
+Look at the format:
+
+```bash
+$ file starless_c
+starless_c: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, no section header
+```
+
+**No section header** is immediately a clue: tools that usually rely on sections (`.text`, `.rodata`, symbols, etc.) will be "blind". But the Linux loader *doesn't care about section* — what the runtime uses is **program header**.
+
+If executed:
+
+```bash
+$ ./starless_c </dev/null
+There is a flag in the binary.
+  (The flag is a metaphor but also still a flag.)
+  (The binary could rightly be considered a gimmick.)
+And so the son of the fortune-teller does not find his way to the Starless C. Not yet.
+```
+
+OK. So "the road has not been found", meaning there is a gate/maze mechanism.
+
+---
+
+### Glancing at ELF header: “unnatural” entrypoint
+
+Now we check the ELF header:
+
+```bash
+$ readelf -h starless_c | sed -n '1,30p'
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 03 00 00 00 00 00 00 00 00
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            UNIX - GNU
+  ABI Version:                       0
+  Type:                              EXEC (Executable file)
+  Machine:                           Advanced Micro Devices X86-64
+  Version:                           0x1
+  Entry point address:               0x13370000
+  Start of program headers:          64 (bytes into file)
+  Start of section headers:          0 (bytes into file)
+  Flags:                             0x0
+  Size of this header:               64 (bytes)
+  Size of program headers:           56 (bytes)
+  Number of program headers:         58
+  Size of section headers:           0 (bytes)
+  Number of section headers:         0
+  Section header string table index: 0
+```
+
+The `0x13370000` entry point is *not* normal for ordinary binary—it can already be read as "a program deliberately mapped to absurd addresses".
+
+---
+
+### Glancing at the header program: the header program becomes a "chessboard"
+
+Since the header section is missing, a convenient step is: take all executable `PT_LOAD` segments from the program header, then look at the *virtual address* and *file offset*.
+
+Here's a small script that I use:
+
+```python
+#!/usr/bin/env python3
+# Extract executable PT_LOAD segments (page-sized) from ELF program headers.
+
+import struct
+from pathlib import Path
+
+data = Path("starless_c").read_bytes()
+
+# ELF64 little-endian: e_phoff @ 0x20, e_phentsize @ 0x36, e_phnum @ 0x38
+e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+e_phentsz = struct.unpack_from("<H", data, 0x36)[0]
+e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+
+print("phoff", hex(e_phoff), "phentsz", e_phentsz, "phnum", e_phnum)
+
+PT_LOAD = 1
+for i in range(e_phnum):
+    ph = e_phoff + i * e_phentsz
+    p_type, p_flags = struct.unpack_from("<II", data, ph)
+    p_offset, p_vaddr, _, p_filesz, _, p_align = struct.unpack_from("<QQQQQQ", data, ph + 8)
+
+    # Only keep executable, page-sized PT_LOAD segments.
+    if p_type == PT_LOAD and p_filesz == 0x1000 and (p_flags & 0x1):
+        head = data[p_offset : p_offset + 8].hex()
+        print(
+            f"vaddr={p_vaddr:#x} off={p_offset:#x} flags={p_flags:#x} "
+            f"align={p_align:#x} head={head}"
+        )
+```
+
+The relevant output:
+
+```text
+phoff 0x40 phentsz 56 phnum 58
+vaddr=0x13370000 off=0x9000 flags=0x5 align=0x1f756dd2c8ac64a7 head=48b86d69636b2e29
+vaddr=0x42069000 off=0x6000 flags=0x5 align=0xa0cc45069a13e2e7 head=48b86520666c6167
+vaddr=0x67679000 off=0x10000 flags=0x7 align=0x3f7164456744f0b0 head=31c0880031c08800
+vaddr=0x6767a000 off=0x18000 flags=0x7 align=0xd56a9cc98308210a head=31c08800e9f77f00
+...
+vaddr=0x6768a000 off=0x3000 flags=0x7 align=0xe73dd8a09b15d827 head=90909090e9f76f00
+...
+vaddr=0x67692000 off=0x1000 flags=0x7 align=0xa9eed768556fc6b9 head=31c08800e9f76f9d
+```
+
+There are two things that immediately "connect":
+
+1. There's an executable segment in `0x42069000` — it looks like *another payload*.
+2. Many executable segments in the range `0x6767xxxx` — this looks like a **grid/maze per page** (0x1000 each).
+
+And the `head` pattern is interesting:
+
+- `31 c0 88 00` = `xor eax,eax; mov [rax],al` → *write to NULL* → intentionally segfault.
+- `90 90 90 90 e9 ...` = **NOP sled + JMP** → this is the “open door”.
+
+We check which “door opens” from the beginning (first byte = `0x90`):
+
+```python
+import struct
+from pathlib import Path
+data = Path("starless_c").read_bytes()
+
+e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+e_phentsz = struct.unpack_from("<H", data, 0x36)[0]
+e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+
+PT_LOAD = 1
+pages = []
+for i in range(e_phnum):
+    ph = e_phoff + i * e_phentsz
+    p_type, p_flags = struct.unpack_from("<II", data, ph)
+    p_offset, p_vaddr, _, p_filesz, _, _ = struct.unpack_from("<QQQQQQ", data, ph + 8)
+    if p_type == PT_LOAD and p_filesz == 0x1000 and (p_flags & 0x1) and (0x67600000 <= p_vaddr < 0x67700000):
+        pages.append((p_vaddr, p_offset))
+
+pages.sort()
+nops = [hex(v) for v, off in pages if data[off] == 0x90]
+print("maze pages:", len(pages))
+print("NOP-start pages:", len(nops))
+print("\\n".join(nops))
+
+#output:
+
+maze pages: 23
+NOP-start pages: 5
+0x67689000
+0x6768a000
+0x6768c000
+0x6768d000
+0x67694000
+```
+
+So initially only 5 pages were "safe" (open doors). The other thing... if executed from the beginning of the page, it will segfault.
+
+---
+
+### Bonus: two worlds of execution (handler vs maze)
+
+#### 1) Entry point: install the SIGSEGV handler, then jump into the maze
+
+If we disassemble the `0x13370000` entry (using `ndisasm` because `objdump` is also finicky in this ELF), we see the “syscall-only” pattern:
+
+```bash
+$ dd if=starless_c bs=1 skip=$((0x9000)) count=$((0x120)) status=none | ndisasm -b64 -o0x13370000 - | sed -n '45,65p'
+133700BB  B801000000        mov eax,0x1
+133700C0  BF01000000        mov edi,0x1
+133700C5  4889E6            mov rsi,rsp
+133700C8  BA87000000        mov edx,0x87
+133700CD  0F05              syscall
+133700CF  4883EC20          sub rsp,0x20
+133700D3  48C7C003013713    mov rax,0x13370103
+133700DA  48890424          mov [rsp],rax
+133700DE  C644240B04        mov byte [rsp+0xb],0x4
+```
+
+The important part:
+
+- he **print** intro (syscall `write`),
+- then **set SIGSEGV handler** to address `0x13370103`,
+- then jump to the second world: maze in `0x6767900c`.
+
+That's why if we go wrong and segfault: instead of a normal crash, the program actually "closes the book" with the narrative "Not yet." (that's the handler).
+
+#### 2) Maze page: read 1 byte input, w/a/s/d for move, f for “final”
+
+One maze page (example: `0x67679000`) is consistent in shape. Here are the most important pieces:
+
+```bash
+$ dd if=starless_c bs=1 skip=$((0x10000)) count=$((0x100)) status=none | ndisasm -b64 -o0x67679000 - | sed -n '9,55p'
+6767900C  31C0              xor eax,eax
+6767900E  31FF              xor edi,edi
+67679010  4889E6            mov rsi,rsp
+67679013  BA01000000        mov edx,0x1
+67679018  0F05              syscall
+6767901A  8A06              mov al,[rsi]
+6767901C  3C0A              cmp al,0xa
+6767901E  74EC              jz 0x6767900c
+67679020  3C77              cmp al,0x77
+67679022  7418              jz 0x6767903c
+...
+67679030  3C66              cmp al,0x66
+67679032  0F8480000000      jz 0x676790b8
+```
+
+Here's a “read 1 byte” loop, then compare:
+
+- `'w'` → movement block W
+- `'s'` → block movement S
+- `'a'` → movement block A
+- `'d'` → movement block D
+- `'f'` → special jump (final)
+- else → *crash* (write to NULL again)
+
+Well, the movement blocks are what make this challenge unique. Example for `'s'`:
+
+```text
+6767905B  mov eax, [0x67681000]         ; baca 4 byte dari halaman target
+67679061  cmp al, 0x90                  ; byte pertama == NOP?
+67679065  mov dword [0x67681000], 0x88c031  ; kalau iya: matiin pintu (jadi crash stub)
+6767906F  mov [0x67689000], eax         ; pindahin “NOP token” ke lokasi lain
+67679075  jmp 0x6768100c                ; masuk halaman target via +0x0c (aman)
+```
+
+And for `'f'`:
+
+```text
+676790B8  jmp 0x6767a000
+```
+
+Key insight here:
+
+- The program **doesn't** enter the target page via the base address (`0x67681000`), but via `+0x0c` (`0x6768100c`).
+  - That means, even though the beginning of the page contains a segfault instruction, we can still "walk" because the maze entry always passes through a safe offset.
+- But `'f'` **jump to base** `0x6767a000` (without `+0x0c`).
+  - So `'f'` is kind of like “try running a series of doors from the start of the page”.
+
+In other words: we are free to go around the maze, but to "get out", we need certain pages to have the initial byte `0x90` (NOP), so that the base can be executed without a segfault.
+
+---
+
+### Door mechanism: “NOP token” that is moved around
+
+If we simplify the per-move logic:
+
+- `eax = *(uint32_t*)target`
+- if `target[0] == 0x90`:
+  - `*(uint32_t*)target = 0x0088c031` (change to crash stub)
+  - `*(uint32_t*)store = eax` (copy the old dword—usually `0x90909090`—to another place)
+- then `jmp target + 0x0c`
+
+This means that we have one "token" in the form of `0x90909090` which can be **moved** from one page to another via the `store` field.
+
+So this is no ordinary maze; This is a *stateful* maze: we have to arrange the state "which page now starts with NOP".
+
+---
+
+### Bonus: forms a “base jump chain” up to the printer flag
+
+There is one other executable segment: `0x42069000`. If we peek, he prints the narrative + `open("flag.txt")` + `sendfile`-like syscall:
+
+```bash
+$ dd if=starless_c bs=1 skip=$((0x6000)) count=$((0x100)) status=none | ndisasm -b64 -o0x42069000 - | head -n 25
+42069000  mov rax,0xa2e67616c662065
+4206900A  push rax
+...
+42069148  push qword 0x0
+4206914A  mov rax,0x7478742e67616c66   ; \"flag.txt\"
+42069154  push rax
+42069155  mov eax,0x2                  ; sys_open
+...
+```
+
+The string `flag.txt` also does exist:
+
+```bash
+$ strings -n 4 starless_c | rg -n "flag\\.txt" | head
+40:flag.txtP
+```
+
+And the most “blatant”: page `0x67692000` has a direct base jump to `0x42069000`:
+
+```bash
+$ dd if=starless_c bs=1 skip=$((0x1000)) count=$((0x20)) status=none | ndisasm -b64 -o0x67692000 -
+67692000  xor eax,eax
+67692002  mov [rax],al
+67692004  jmp 0x42069000
+```
+
+**The problem**: `0x67692000` defaults to starting with a crash stub, so base jump can only be used if we succeed in making the start of the page NOP.
+
+After analysis, the base-jump chain we need is:
+
+```text
+0x6767a000 -> 0x67682000 -> 0x6768a000 -> 0x67691000 -> 0x67692000 -> 0x42069000
+```
+
+So the goal state is:
+
+- the pages above must have the starting byte `0x90` (NOP),
+- then press `'f'` → the program "glides" via the jump chain → enters the printer flag.
+
+---
+
+### The essence of the exploit: find the only input sequence that makes the state "true"
+
+We could do it manually, but this is a state-space problem:
+
+- our position = one of the 23 nodes,
+- state token NOP = subset of nodes whose “start of page is NOP”.
+
+So I modeled it as BFS in state `(pos, nop_bitset)`:
+
+- **pos** changes with each input (w/a/s/d),
+- **nop_bitset** changes if the target we enter is NOP (the token is moved to address `store`).
+
+Goal: after several steps, `nop_bitset` includes:
+
+- `0x6767a000`
+- `0x67682000`
+- `0x6768a000`
+- `0x67691000`
+- `0x67692000`
+
+Solver:
+
+1) parse program headers,
+2) build move graph from RIP-relative operands,
+3) BFS to goal state,
+4) print input sequence + `'f'`,
+5) (optional) connect to remote and take flag.
+
+```python
+#!/usr/bin/env python3
+# Solve LA CTF rev/starless-c:
+# - Parse ELF PT_LOAD executable pages (maze)
+# - Decode movement edges (w/a/s/d) from RIP-relative addressing
+# - Model the “NOP token transfer” as state transitions
+# - BFS until the required base pages become NOP, then send 'f'
+
+from __future__ import annotations
+
+import socket
+import struct
+from collections import deque
+from pathlib import Path
+
+
+def parse_maze_pages(path: str) -> list[tuple[int, int, bytes]]:
+    """Return list of (vaddr, file_offset, page_bytes) for maze pages."""
+    data = Path(path).read_bytes()
+
+    e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    e_phentsz = struct.unpack_from("<H", data, 0x36)[0]
+    e_phnum = struct.unpack_from("<H", data, 0x38)[0]
+
+    PT_LOAD = 1
+    pages: list[tuple[int, int, bytes]] = []
+
+    for i in range(e_phnum):
+        ph = e_phoff + i * e_phentsz
+        p_type, p_flags = struct.unpack_from("<II", data, ph)
+        p_offset, p_vaddr, _, p_filesz, _, _ = struct.unpack_from("<QQQQQQ", data, ph + 8)
+
+        # Maze lives in 0x6760_0000..0x6770_0000 and is page-sized + executable.
+        if (
+            p_type == PT_LOAD
+            and p_filesz == 0x1000
+            and (p_flags & 0x1)
+            and (0x67600000 <= p_vaddr < 0x67700000)
+        ):
+            page = data[p_offset : p_offset + 0x1000]
+            pages.append((p_vaddr, p_offset, page))
+
+    pages.sort(key=lambda t: t[0])
+    return pages
+
+
+def rip_target(base: int, page: bytes, insn_off: int) -> int:
+    """
+    Decode RIP-relative target for:
+      8B 05 <disp32>  == mov eax, [rip+disp32]
+      89 05 <disp32>  == mov [rip+disp32], eax
+
+    Both are 6 bytes long, so next RIP = base + insn_off + 6.
+    """
+    disp = struct.unpack_from("<i", page, insn_off + 2)[0]
+    return base + insn_off + 6 + disp
+
+
+def build_moves(pages: list[tuple[int, int, bytes]]) -> tuple[list[int], dict[int, dict[str, tuple[int, int | None]]], int]:
+    """
+    Build move table:
+      moves[pos_i][ch] = (tgt_i, store_i_or_None)
+    and return (addr_list, moves, init_nops_bitset).
+    """
+    addr = [v for v, _, _ in pages]
+    index = {v: i for i, v in enumerate(addr)}
+    mem = [page for _, _, page in pages]
+
+    # Per-node block layout (same across pages):
+    #   target read at these offsets
+    #   store write at these offsets
+    BLOCKS = {
+        "w": (0x3C, 0x50),
+        "s": (0x5B, 0x6F),
+        "a": (0x7A, 0x8E),
+        "d": (0x99, 0xAD),
+    }
+
+    moves: dict[int, dict[str, tuple[int, int | None]]] = {}
+    for pos_i, base in enumerate(addr):
+        page = mem[pos_i]
+        moves[pos_i] = {}
+        for ch, (read_off, store_off) in BLOCKS.items():
+            tgt = rip_target(base, page, read_off)
+            store = rip_target(base, page, store_off)
+            if tgt not in index:
+                continue  # not a valid maze node
+            moves[pos_i][ch] = (index[tgt], index.get(store))
+
+    init_nops = 0
+    for i, page in enumerate(mem):
+        if page[0] == 0x90:
+            init_nops |= 1 << i
+
+    return addr, moves, init_nops
+
+
+def solve_sequence(addr: list[int], moves: dict[int, dict[str, tuple[int, int | None]]], init_nops: int) -> str:
+    """
+    BFS over state (pos_i, nop_bitset).
+
+    Transition rule:
+      - You always move to tgt.
+      - If tgt is currently NOP-start:
+          transfer NOP token from tgt -> store (tgt loses NOP, store gains NOP)
+        (and if store is None, that move would crash in real binary, so we skip it)
+    """
+
+    start_pos = addr.index(0x67679000)
+    start = (start_pos, init_nops)
+
+    required = [
+        0x6767A000,
+        0x67682000,
+        0x6768A000,
+        0x67691000,
+        0x67692000,
+    ]
+    req_mask = 0
+    for a in required:
+        req_mask |= 1 << addr.index(a)
+
+    def is_nop(bitset: int, i: int) -> bool:
+        return ((bitset >> i) & 1) == 1
+
+    q = deque([start])
+    prev: dict[tuple[int, int], tuple[tuple[int, int], str] | None] = {start: None}
+
+    goal: tuple[int, int] | None = None
+    while q:
+        pos, nops = q.popleft()
+        if (nops & req_mask) == req_mask:
+            goal = (pos, nops)
+            break
+
+        for ch, (tgt, store) in moves[pos].items():
+            n2 = nops
+
+            # Entering a NOP-start page triggers token transfer.
+            if is_nop(n2, tgt):
+                if store is None:
+                    continue
+                n2 &= ~(1 << tgt)
+                n2 |= 1 << store
+
+            st = (tgt, n2)
+            if st not in prev:
+                prev[st] = ((pos, nops), ch)
+                q.append(st)
+
+    if goal is None:
+        raise RuntimeError("No solution found")
+
+    # Reconstruct sequence.
+    path: list[str] = []
+    cur = goal
+    while prev[cur] is not None:
+        prev_state, ch = prev[cur]
+        path.append(ch)
+        cur = prev_state
+    return "".join(reversed(path))
+
+
+def main() -> None:
+    pages = parse_maze_pages("starless_c")
+    addr, moves, init_nops = build_moves(pages)
+
+    seq = solve_sequence(addr, moves, init_nops)
+    payload = (seq + "f\n").encode()
+
+    print("[+] sequence length:", len(seq))
+    print("[+] sequence:", seq)
+    print("[+] send:", (seq + "f"))
+
+    # Optional: grab remote flag
+    host, port = "chall.lac.tf", 32223
+    with socket.create_connection((host, port), timeout=5) as s:
+        s.sendall(payload)
+        s.settimeout(2)
+        out = b""
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                out += chunk
+                if b"lactf{" in out:
+                    break
+        except Exception:
+            pass
+        print(out.decode(errors="replace"))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Or we can just use “input” for `nc`, the final sequence found is:
+
+```text
+sddddswaasdwaaasdssawwdwddsawasassdddwsddwasaaaawwdwdddsawaasassdddwwdwasssaaawwdwwassdddssddwasaaawwddwdsaaawdsassddwsddwawaawasdddssawdwaaddwaa
+```
+
+Then add `f` at the end.
+
+---
+
+### Execute to remote: take flag
+
+The simplest way: `nc`, paste sequence + `f`.
+
+```bash
+$ nc chall.lac.tf 32223
+There is a flag in the binary.
+  (The flag is a metaphor but also still a flag.)
+  (The binary could rightly be considered a gimmick.)
+A person this far into a challenge has their path to follow. ...
+lactf{starless_c_more_like_starless_0xcc}
+```
+
+
+### Flags
+
+`lactf{starless_c_more_like_starless_0xcc}`
+
+
+
+## The Three SAT Problem
+
+### Intro
+
+One binary, one quasi-philosophical question:
+
+> “Have you solved the Three-Sat Problem?”
+
+Like *three body problem theory* right?, what's important is not being "academically correct", but **making the program believe** we're right. In this challenge, "Three-Sat" is not made into a CNF input that we can give to an external solver, but is hidden as a **giant boolean circuit** in the assembly.
+
+Our target: find the 1279-bit input (string `'0'/'1'`) that makes the program go through validation, then the program itself prints the flag.
+
+
+---
+
+### Recon: what's in dist?
+
+In this challenge folder:
+
+```bash
+$ ls -la
+total 104
+drwxr-xr-x 3 root root  4096 Feb  7 14:00 .
+drwxr-xr-x 4 root root  4096 Feb  7 13:48 ..
+-rwxr-xr-x 1 root root 84144 Feb  2 06:12 three_sat_problem
+```
+
+
+---
+
+### Glimpse binary: ELF, stripped, PIE
+
+```bash
+$ file three_sat_problem
+three_sat_problem: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=2105e69189dfbce45f029e9b3e147b68f0475869, for GNU/Linux 3.2.0, stripped
+```
+
+Important note for new readers:
+- **PIE** means runtime address = `base_address + offset`. But `objdump` gives us the offset/virtual address in ELF (eg. `0x1090`, `0x1289`), and that's enough for static analysis.
+- **stripped** means minimal symbols; we rely on strings, code patterns, and flows.
+
+---
+
+### Glancing at the runtime: what is the input?
+
+If you run it without the correct input, it will immediately crash:
+
+```bash
+$ printf '\n' | ./three_sat_problem
+Have you solved the Three-Sat Problem?
+Please be serious...
+```
+
+So there is strict input validation.
+
+---
+
+### Bonus: the success string is there, the path is hidden
+
+`strings` gives a fairly clear spoiler:
+
+```bash
+$ strings -a three_sat_problem | rg -n 'Have you solved|Please be serious|Incredible|I see you'
+317:Have you solved the Three-Sat Problem?
+318:Please be serious...
+319:I see you haven't.
+320:Incredible! Let me get the flag for you...
+```
+
+This means that the program **must have** a successful branch (print flag), we just have to find a way to enter it.
+
+---
+
+### The essence of the exploit: The "SAT" is a boolean circuit in ASM
+
+If we open `main`, the input format + two winning conditions are clearly visible:
+
+1) input must be long **0x4ff = 1279** characters  
+2) each character must be `'0'` or `'1'`  
+3) big check function in `0x1289` should return `AL != 0`  
+4) plus one extra constraint: the byte in `0x15352` must be LSB bit = 1 (meaning the character `'1'`)
+
+The crucial part of `objdump` output is like this:
+
+```bash
+$ objdump -d -Mintel --start-address=0x1099 --stop-address=0x1135 three_sat_problem
+
+three_sat_problem:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000000001099 <.text+0x9>:
+    1099:	48 8d 1d c0 3f 01 00 	lea    rbx,[rip+0x13fc0]        # 15060 <stdin@GLIBC_2.2.5+0x10>
+    10a0:	48 83 ec 38          	sub    rsp,0x38
+    10a4:	e8 87 ff ff ff       	call   1030 <puts@plt>
+    10a9:	48 8b 3d 90 3f 01 00 	mov    rdi,QWORD PTR [rip+0x13f90]        # 15040 <stdout@GLIBC_2.2.5>
+    10b0:	e8 bb ff ff ff       	call   1070 <fflush@plt>
+    10b5:	48 8b 15 94 3f 01 00 	mov    rdx,QWORD PTR [rip+0x13f94]        # 15050 <stdin@GLIBC_2.2.5>
+    10bc:	be 00 05 00 00       	mov    esi,0x500
+    10c1:	48 89 df             	mov    rdi,rbx
+    10c4:	e8 97 ff ff ff       	call   1060 <fgets@plt>
+    10c9:	48 89 df             	mov    rdi,rbx
+    10cc:	48 8d 35 58 1f 01 00 	lea    rsi,[rip+0x11f58]        # 1302b <__cxa_finalize@plt+0x11fab>
+    10d3:	e8 78 ff ff ff       	call   1050 <strcspn@plt>
+    10d8:	48 89 df             	mov    rdi,rbx
+    10db:	c6 04 03 00          	mov    BYTE PTR [rbx+rax*1],0x0
+    10df:	e8 5c ff ff ff       	call   1040 <strlen@plt>
+    10e4:	48 3d ff 04 00 00    	cmp    rax,0x4ff
+    10ea:	74 09                	je     10f5 <__cxa_finalize@plt+0x75>
+    10ec:	48 8d 3d 3a 1f 01 00 	lea    rdi,[rip+0x11f3a]        # 1302d <__cxa_finalize@plt+0x11fad>
+    10f3:	eb 36                	jmp    112b <__cxa_finalize@plt+0xab>
+    10f5:	48 8d 93 ff 04 00 00 	lea    rdx,[rbx+0x4ff]
+    10fc:	48 89 dd             	mov    rbp,rbx
+    10ff:	8a 03                	mov    al,BYTE PTR [rbx]
+    1101:	83 e8 30             	sub    eax,0x30
+    1104:	3c 01                	cmp    al,0x1
+    1106:	77 e4                	ja     10ec <__cxa_finalize@plt+0x6c>
+    1108:	48 ff c3             	inc    rbx
+    110b:	48 39 da             	cmp    rdx,rbx
+    110e:	75 ef                	jne    10ff <__cxa_finalize@plt+0x7f>
+    1110:	31 c0                	xor    eax,eax
+    1112:	e8 72 01 00 00       	call   1289 <__cxa_finalize@plt+0x209>
+    1117:	84 c0                	test   al,al
+    1119:	74 09                	je     1124 <__cxa_finalize@plt+0xa4>
+    111b:	f6 05 30 42 01 00 01 	test   BYTE PTR [rip+0x14230],0x1        # 15352 <stdin@GLIBC_2.2.5+0x302>
+    1122:	75 11                	jne    1135 <__cxa_finalize@plt+0xb5>
+    1124:	48 8d 3d 17 1f 01 00 	lea    rdi,[rip+0x11f17]        # 13042 <__cxa_finalize@plt+0x11fc2>
+    112b:	e8 00 ff ff ff       	call   1030 <puts@plt>
+    1130:	6a 01                	push   0x1
+    1132:	58                   	pop    rax
+    1133:	eb 5e                	jmp    1193 <__cxa_finalize@plt+0x113>
+```
+
+If the check passes, `main` packs 320 bits into a 40 byte string, using the index table in `0x13080`:
+
+```bash
+$ objdump -d -Mintel --start-address=0x1135 --stop-address=0x119a three_sat_problem
+
+three_sat_problem:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000000001135 <.text+0xa5>:
+    1135:	48 8d 3d 19 1f 01 00 	lea    rdi,[rip+0x11f19]        # 13055 <__cxa_finalize@plt+0x11fd5>
+    113c:	e8 ef fe ff ff       	call   1030 <puts@plt>
+    1141:	0f 57 c0             	xorps  xmm0,xmm0
+    1144:	48 8d 7c 24 17       	lea    rdi,[rsp+0x17]
+    1149:	31 c0                	xor    eax,eax
+    114b:	0f 11 44 24 07       	movups XMMWORD PTR [rsp+0x7],xmm0
+    1150:	6a 19                	push   0x19
+    1152:	59                   	pop    rcx
+    1153:	f3 aa                	rep stos BYTE PTR [rdi],al
+    1155:	31 c0                	xor    eax,eax
+    1157:	48 8d 3d 22 1f 01 00 	lea    rdi,[rip+0x11f22]        # 13080 <__cxa_finalize@plt+0x12000>
+    115e:	48 63 14 87          	movsxd rdx,DWORD PTR [rdi+rax*4]
+    1162:	89 c6                	mov    esi,eax
+    1164:	89 c1                	mov    ecx,eax
+    1166:	48 ff c0             	inc    rax
+    1169:	c1 fe 03             	sar    esi,0x3
+    116c:	83 e1 07             	and    ecx,0x7
+    116f:	8a 54 15 00          	mov    dl,BYTE PTR [rbp+rdx*1+0x0]
+    1173:	48 63 f6             	movsxd rsi,esi
+    1176:	83 e2 01             	and    edx,0x1
+    1179:	d3 e2                	shl    edx,cl
+    117b:	08 54 34 07          	or     BYTE PTR [rsp+rsi*1+0x7],dl
+    117f:	48 3d 40 01 00 00    	cmp    rax,0x140
+    1185:	75 d7                	jne    115e <__cxa_finalize@plt+0xde>
+    1187:	48 8d 7c 24 07       	lea    rdi,[rsp+0x7]
+    118c:	e8 9f fe ff ff       	call   1030 <puts@plt>
+    1191:	31 c0                	xor    eax,eax
+    1193:	48 83 c4 38          	add    rsp,0x38
+    1197:	5b                   	pop    rbx
+    1198:	5d                   	pop    rbp
+    1199:	c3                   	ret
+```
+
+There are two “golden clues” to this piece:
+
+- Input buffer is at **`0x15060`** (`lea rbx, [rip+...] # 15060`)
+- Large check function called at **`call 1289`**
+- Extra constraint: `test BYTE PTR [rip+...],0x1 # 15352`
+
+Since base input = `0x15060`, the address `0x15352` is the same as:
+
+```
+0x15352 - 0x15060 = 0x2f2
+```
+
+So the program literally asks: `input[0x2f2]` must be `'1'` (because `'0' & 1 = 0`, `'1' & 1 = 1`).
+
+---
+
+### Bonus: check the function is branchless
+
+If we take a peek at the beginning of the check function (`0x1289`), the pattern is repetitive:
+- read input bytes from RIP-relative (addresses in the range `0x15060..0x1555e`)
+- `not` (negation)
+- sometimes `and eax, 1` (take LSB bit)
+- save to temp stack (`[rsp+...]`)
+
+```bash
+$ objdump -d -Mintel --start-address=0x1289 --stop-address=0x1320 three_sat_problem
+
+three_sat_problem:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000000001289 <.text+0x1f9>:
+    1289:	41 57                	push   r15
+    128b:	41 56                	push   r14
+    128d:	41 55                	push   r13
+    128f:	41 54                	push   r12
+    1291:	55                   	push   rbp
+    1292:	53                   	push   rbx
+    1293:	48 81 ec c0 03 00 00 	sub    rsp,0x3c0
+    129a:	8a 05 c0 3d 01 00    	mov    al,BYTE PTR [rip+0x13dc0]        # 15060 <stdin@GLIBC_2.2.5+0x10>
+    12a0:	f7 d0                	not    eax
+    12a2:	83 e0 01             	and    eax,0x1
+    12a5:	88 44 24 91          	mov    BYTE PTR [rsp-0x6f],al
+    12a9:	8a 05 ac 42 01 00    	mov    al,BYTE PTR [rip+0x142ac]        # 1555b <stdin@GLIBC_2.2.5+0x50b>
+    12af:	f7 d0                	not    eax
+    12b1:	83 e0 01             	and    eax,0x1
+    12b4:	88 44 24 b6          	mov    BYTE PTR [rsp-0x4a],al
+    12b8:	8a 05 e8 3d 01 00    	mov    al,BYTE PTR [rip+0x13de8]        # 150a6 <stdin@GLIBC_2.2.5+0x56>
+    12be:	f7 d0                	not    eax
+    12c0:	88 44 24 fa          	mov    BYTE PTR [rsp-0x6],al
+    12c4:	8a 05 a8 3e 01 00    	mov    al,BYTE PTR [rip+0x13ea8]        # 15172 <stdin@GLIBC_2.2.5+0x122>
+    12ca:	f7 d0                	not    eax
+    12cc:	83 e0 01             	and    eax,0x1
+    12cf:	88 84 24 5d 02 00 00 	mov    BYTE PTR [rsp+0x25d],al
+    12d6:	8a 05 45 40 01 00    	mov    al,BYTE PTR [rip+0x14045]        # 15321 <stdin@GLIBC_2.2.5+0x2d1>
+    12dc:	f7 d0                	not    eax
+    12de:	88 44 24 fb          	mov    BYTE PTR [rsp-0x5],al
+    12e2:	8a 05 15 41 01 00    	mov    al,BYTE PTR [rip+0x14115]        # 153fd <stdin@GLIBC_2.2.5+0x3ad>
+    12e8:	f7 d0                	not    eax
+    12ea:	83 e0 01             	and    eax,0x1
+    12ed:	88 44 24 b7          	mov    BYTE PTR [rsp-0x49],al
+    12f1:	8a 05 6c 3d 01 00    	mov    al,BYTE PTR [rip+0x13d6c]        # 15063 <stdin@GLIBC_2.2.5+0x13>
+    12f7:	f7 d0                	not    eax
+    12f9:	88 44 24 fc          	mov    BYTE PTR [rsp-0x4],al
+    12fd:	8a 05 f5 40 01 00    	mov    al,BYTE PTR [rip+0x140f5]        # 153f8 <stdin@GLIBC_2.2.5+0x3a8>
+    1303:	f7 d0                	not    eax
+    1305:	83 e0 01             	and    eax,0x1
+    1308:	88 44 24 b8          	mov    BYTE PTR [rsp-0x48],al
+    130c:	8a 05 80 3e 01 00    	mov    al,BYTE PTR [rip+0x13e80]        # 15192 <stdin@GLIBC_2.2.5+0x142>
+    1312:	f7 d0                	not    eax
+    1314:	88 44 24 fd          	mov    BYTE PTR [rsp-0x3],al
+    1318:	8a 05 14 41 01 00    	mov    al,BYTE PTR [rip+0x14114]        # 15432 <stdin@GLIBC_2.2.5+0x3e2>
+    131e:	f7 d0                	not    eax
+```
+
+What makes this "good" for dissolving:
+- check function almost pure **combinational logic**: `mov/and/or/not` without branching.
+- meaning we can *symbolically evaluate* directly into a boolean/bitvector expression.
+
+At the end of the function, it becomes a long chain of bitwise operations. The tail (so you can imagine) is like this:
+
+```bash
+$ objdump -d -Mintel --start-address=0x1288f --stop-address=0x12910 three_sat_problem
+
+three_sat_problem:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+000000000001288f <.text+0x117ff>:
+   1288f:	21 c2                	and    edx,eax
+   12891:	8a 05 e6 28 00 00    	mov    al,BYTE PTR [rip+0x28e6]        # 1517d <stdin@GLIBC_2.2.5+0x12d>
+   12897:	22 05 be 2c 00 00    	and    al,BYTE PTR [rip+0x2cbe]        # 1555b <stdin@GLIBC_2.2.5+0x50b>
+   1289d:	f7 d0                	not    eax
+   1289f:	83 e0 01             	and    eax,0x1
+   128a2:	0a 05 fe 27 00 00    	or     al,BYTE PTR [rip+0x27fe]        # 150a6 <stdin@GLIBC_2.2.5+0x56>
+   128a8:	21 ce                	and    esi,ecx
+   128aa:	f7 d6                	not    esi
+   128ac:	21 c6                	and    esi,eax
+   128ae:	8a 44 24 fa          	mov    al,BYTE PTR [rsp-0x6]
+   128b2:	0a 05 a3 2c 00 00    	or     al,BYTE PTR [rip+0x2ca3]        # 1555b <stdin@GLIBC_2.2.5+0x50b>
+   128b8:	21 f0                	and    eax,esi
+   128ba:	40 8a 74 24 fb       	mov    sil,BYTE PTR [rsp-0x5]
+   128bf:	40 0a 35 e0 27 00 00 	or     sil,BYTE PTR [rip+0x27e0]        # 150a6 <stdin@GLIBC_2.2.5+0x56>
+   128c6:	21 c6                	and    esi,eax
+   128c8:	8a 44 24 fb          	mov    al,BYTE PTR [rsp-0x5]
+   128cc:	0a 05 a0 28 00 00    	or     al,BYTE PTR [rip+0x28a0]        # 15172 <stdin@GLIBC_2.2.5+0x122>
+   128d2:	21 f0                	and    eax,esi
+   128d4:	40 8a 74 24 fc       	mov    sil,BYTE PTR [rsp-0x4]
+   128d9:	40 0a 35 41 2a 00 00 	or     sil,BYTE PTR [rip+0x2a41]        # 15321 <stdin@GLIBC_2.2.5+0x2d1>
+   128e0:	21 f0                	and    eax,esi
+   128e2:	40 8a 74 24 fc       	mov    sil,BYTE PTR [rsp-0x4]
+   128e7:	40 0a 35 0f 2b 00 00 	or     sil,BYTE PTR [rip+0x2b0f]        # 153fd <stdin@GLIBC_2.2.5+0x3ad>
+   128ee:	21 c6                	and    esi,eax
+   128f0:	8a 44 24 fd          	mov    al,BYTE PTR [rsp-0x3]
+   128f4:	0a 05 69 27 00 00    	or     al,BYTE PTR [rip+0x2769]        # 15063 <stdin@GLIBC_2.2.5+0x13>
+   128fa:	21 f0                	and    eax,esi
+   128fc:	40 8a 74 24 fd       	mov    sil,BYTE PTR [rsp-0x3]
+   12901:	0b 35 f1 2a 00 00    	or     esi,DWORD PTR [rip+0x2af1]        # 153f8 <stdin@GLIBC_2.2.5+0x3a8>
+   12907:	21 f0                	and    eax,esi
+   12909:	40 8a 35 6c 27 00 00 	mov    sil,BYTE PTR [rip+0x276c]        # 1507c <stdin@GLIBC_2.2.5+0x2c>
+```
+
+If you read it straight, this is "torturous". So we shift strategy:
+
+> Instead of humanizing the 70KB boolean circuit, we just have Z3.
+
+---
+
+### Solver: symbolic execution mini + Z3
+
+The concept is simple:
+
+- **SAT**: look for a boolean assignment that makes the formula evaluate to true.
+- Here, the formula is not a CNF file, but *the result of assembly computing*.
+- **SMT solver (Z3)** can handle bitvector expressions like `AND/OR/NOT` with additional constraints.
+
+The trick:
+1) Parse instruction bytes from `0x1289..0x12981`
+2) Emulate the instructions that appear (`mov`, `and`, `or`, `xor`, `not`) but not with concrete numbers—but with **symbol Z3**
+3) Model input as 1279 bits (`b0..b1278`), then lift to ASCII bytes `'0'`/`'1'`
+4) Add constraints `b[0x2f2] == 1` and `AL != 0`
+5) Ask Z3 to give the model (assignment), feed it to binary, take the flag
+
+Setup dependencies (in this environment I use venv):
+
+```bash
+$ python3 -m venv .venv
+$ . .venv/bin/activate
+$ python -m pip install z3-solver capstone pyelftools
+```
+
+Run solver:
+
+```bash
+$ . .venv/bin/activate && python solve.py
+lactf{is_the_three_body_problem_np_hard}
+```
+
+Solver code:
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+"""
+LACTF rev: the-three-sat-problem
+
+High-level idea:
+- The binary reads a 1279-char string of '0'/'1' into a global buffer at 0x15060.
+- It calls a huge, branchless function (0x1289..0x12981) that computes a boolean-ish
+  expression using only byte-level NOT/AND/OR/XOR.
+- If that function returns non-zero in AL and input[0x2f2] == '1', the program
+  "decrypts" a 320-bit message by selecting bits from the input and prints the flag.
+
+Instead of decompiling the entire boolean circuit by hand, we:
+1) Disassemble the check function bytes from the ELF .text section.
+2) Symbolically emulate only the instructions we actually see (mov/and/or/xor/not).
+3) Model each input char as a 1-bit variable (0 or 1), then lift it to 0x30/0x31.
+4) Ask Z3 for any satisfying assignment that makes AL != 0.
+"""
+
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import z3
+from capstone import CS_ARCH_X86, CS_MODE_64, Cs
+from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG, X86_REG_RIP, X86_REG_RSP
+from elftools.elf.elffile import ELFFile
+
+BASE_INPUT = 0x15060
+INPUT_LEN = 0x4FF  # 1279 bytes of '0'/'1'
+BIT_MUST_BE_ONE = 0x2F2  # main() additionally checks (input[0x2f2] & 1) == 1
+
+FUNC_START = 0x1289
+FUNC_END = 0x12982
+
+
+def _canon_low8(reg_name: str) -> str:
+    # Capstone may report e.g. eax/rax; we only track the low 8-bit view.
+    reg_name = reg_name.lower()
+    mapping = {
+        "al": "al",
+        "eax": "al",
+        "rax": "al",
+        "bl": "bl",
+        "ebx": "bl",
+        "rbx": "bl",
+        "cl": "cl",
+        "ecx": "cl",
+        "rcx": "cl",
+        "dl": "dl",
+        "edx": "dl",
+        "rdx": "dl",
+        "sil": "sil",
+        "esi": "sil",
+        "rsi": "sil",
+        "dil": "dil",
+        "edi": "dil",
+        "rdi": "dil",
+        "bpl": "bpl",
+        "ebp": "bpl",
+        "rbp": "bpl",
+        "spl": "spl",
+        "esp": "spl",
+        "rsp": "spl",
+    }
+    if reg_name in mapping:
+        return mapping[reg_name]
+    for i in range(8, 16):
+        if reg_name in {f"r{i}b", f"r{i}d", f"r{i}"}:
+            return f"r{i}b"
+    return reg_name
+
+
+@dataclass
+class MemRef:
+    kind: str  # "input" | "stack"
+    key: int  # input abs addr for kind=input; stack displacement for kind=stack
+
+
+def _read_text_bytes(path: Path, vaddr: int, size: int) -> bytes:
+    # Read raw instruction bytes from ELF .text at a given virtual address.
+    with path.open("rb") as f:
+        elf = ELFFile(f)
+        text = elf.get_section_by_name(".text")
+        if text is None:
+            raise RuntimeError("missing .text section")
+        text_addr = text["sh_addr"]
+        text_off = text["sh_offset"]
+        if not (text_addr <= vaddr < text_addr + text["sh_size"]):
+            raise RuntimeError("address not in .text")
+        start_off = text_off + (vaddr - text_addr)
+        f.seek(start_off)
+        return f.read(size)
+
+
+def _memref(insn_addr: int, insn_size: int, mem) -> MemRef:
+    # Convert a Capstone memory operand into either:
+    # - a RIP-relative reference into the input buffer at 0x15060, or
+    # - an RSP-relative stack slot.
+    base = mem.base
+    if base == X86_REG_RIP:
+        abs_addr = insn_addr + insn_size + mem.disp
+        if not (BASE_INPUT <= abs_addr < BASE_INPUT + INPUT_LEN):
+            raise RuntimeError(f"unexpected RIP-relative address: {hex(abs_addr)}")
+        return MemRef("input", abs_addr)
+    if base == X86_REG_RSP:
+        return MemRef("stack", mem.disp)
+    raise RuntimeError(f"unexpected mem base reg: {base}")
+
+
+def _imm8(v: int) -> z3.BitVecRef:
+    return z3.BitVecVal(v & 0xFF, 8)
+
+
+def _bv8_from_bit(bit1: z3.BitVecRef) -> z3.BitVecRef:
+    # Input characters are ASCII '0' or '1'.
+    # We encode them as 0x30 + bit, so bit=0 -> '0', bit=1 -> '1'.
+    return z3.BitVecVal(0x30, 8) + z3.ZeroExt(7, bit1)
+
+
+def build_return_al(path: Path) -> Tuple[z3.BitVecRef, List[z3.BitVecRef]]:
+    # Symbolically execute the check function and return:
+    # - the final AL value (8-bit bitvector)
+    # - the list of 1-bit input variables
+    code = _read_text_bytes(path, FUNC_START, FUNC_END - FUNC_START)
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = True
+
+    # One Boolean variable per input position (1279 total).
+    bits = [z3.BitVec(f"b{i}", 1) for i in range(INPUT_LEN)]
+
+    # We track only 8-bit slices for regs used in the function.
+    regs: Dict[str, z3.BitVecRef] = {}
+    # Stack slots are 1-byte temporaries at [rsp+disp].
+    stack: Dict[int, z3.BitVecRef] = {}
+    stack_written = set()
+
+    def reg8(reg_id: int) -> str:
+        name = md.reg_name(reg_id)
+        c = _canon_low8(name)
+        if c == "rip":
+            raise RuntimeError("rip used as value reg")
+        return c
+
+    def get_reg(name: str) -> z3.BitVecRef:
+        return regs.get(name, z3.BitVecVal(0, 8))
+
+    def set_reg(name: str, value: z3.BitVecRef) -> None:
+        regs[name] = z3.simplify(value)
+
+    def load_mem(mr: MemRef) -> z3.BitVecRef:
+        if mr.kind == "input":
+            # Read input byte: either 0x30 or 0x31, based on the input bit variable.
+            idx = mr.key - BASE_INPUT
+            return _bv8_from_bit(bits[idx])
+        if mr.kind == "stack":
+            if mr.key not in stack_written:
+                raise RuntimeError(f"uninitialized stack read at disp {mr.key:+#x}")
+            return stack[mr.key]
+        raise AssertionError(mr)
+
+    def store_mem(mr: MemRef, v: z3.BitVecRef) -> None:
+        if mr.kind != "stack":
+            raise RuntimeError("unexpected store to non-stack memory")
+        stack[mr.key] = z3.simplify(v)
+        stack_written.add(mr.key)
+
+    def op_val(op) -> z3.BitVecRef:
+        if op.type == X86_OP_IMM:
+            return _imm8(op.imm)
+        if op.type == X86_OP_REG:
+            return get_reg(reg8(op.reg))
+        if op.type == X86_OP_MEM:
+            return load_mem(_memref(insn.address, insn.size, op.mem))
+        raise RuntimeError(f"unsupported operand type: {op.type}")
+
+    for insn in md.disasm(code, FUNC_START):
+        mnem = insn.mnemonic
+        ops = insn.operands
+
+        # Prologue/epilogue noise (we don't model RSP movement).
+        if mnem in {"push", "pop", "sub", "add", "ret"}:
+            continue
+
+        if mnem == "mov":
+            if len(ops) != 2:
+                raise RuntimeError("unexpected mov operands")
+            dst, src = ops
+            v = op_val(src)
+            if dst.type == X86_OP_REG:
+                set_reg(reg8(dst.reg), v)
+            elif dst.type == X86_OP_MEM:
+                store_mem(_memref(insn.address, insn.size, dst.mem), v)
+            else:
+                raise RuntimeError("unsupported mov destination")
+            continue
+
+        if mnem in {"and", "or", "xor"}:
+            if len(ops) != 2 or ops[0].type != X86_OP_REG:
+                raise RuntimeError(f"unsupported {mnem} form")
+            dst_name = reg8(ops[0].reg)
+            a = get_reg(dst_name)
+            b = op_val(ops[1])
+            # Bitvector-level boolean ops (8-bit wide).
+            if mnem == "and":
+                out = a & b
+            elif mnem == "or":
+                out = a | b
+            else:
+                out = a ^ b
+            set_reg(dst_name, out)
+            continue
+
+        if mnem == "not":
+            if len(ops) != 1 or ops[0].type != X86_OP_REG:
+                raise RuntimeError("unsupported not form")
+            dst_name = reg8(ops[0].reg)
+            set_reg(dst_name, ~get_reg(dst_name))
+            continue
+
+        raise RuntimeError(f"unsupported mnemonic: {mnem} @ {hex(insn.address)}")
+
+    return get_reg("al"), bits
+
+
+def solve_assignment(path: Path) -> str:
+    # Constrain the model so the program takes the success path:
+    # - input[0x2f2] must be '1'
+    # - the check function must return AL != 0
+    al, bits = build_return_al(path)
+    s = z3.Solver()
+    s.add(bits[BIT_MUST_BE_ONE] == z3.BitVecVal(1, 1))
+    s.add(al != z3.BitVecVal(0, 8))
+
+    if s.check() != z3.sat:
+        raise RuntimeError("unsat (unexpected)")
+    m = s.model()
+
+    out = []
+    for b in bits:
+        out.append("1" if m.eval(b, model_completion=True).as_long() & 1 else "0")
+    return "".join(out)
+
+
+def run_and_get_flag(path: Path, assignment: str) -> str:
+    # Feed the satisfying assignment to the binary and scrape the printed flag.
+    p = subprocess.run(
+        [str(path)],
+        input=(assignment + "\n").encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=10,
+    )
+    lines = p.stdout.decode(errors="replace").splitlines()
+    # Expected:
+    # 0: prompt
+    # 1: Incredible!...
+    # 2: flag
+    for line in lines:
+        if "lactf{" in line:
+            return line.strip()
+    return "\n".join(lines[-3:]).strip()
+
+
+def main() -> None:
+    bin_path = Path(__file__).with_name("three_sat_problem")
+    assignment = solve_assignment(bin_path)
+    flag = run_and_get_flag(bin_path, assignment)
+    print(flag)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### Pseudocode “Three-Sat”
+
+#### `main` (approx. `0x1090`)
+
+```text
+print("Have you solved the Three-Sat Problem?")
+s = fgets(buf=0x15060, size=0x500, stdin)
+strip_newline(s)
+
+if strlen(s) != 0x4ff:
+    puts("Please be serious...")
+    exit(1)
+
+for i in range(0x4ff):
+    if s[i] not in {'0','1'}:
+        puts("Please be serious...")
+        exit(1)
+
+ok = sat_check()          # call 0x1289, result in AL
+if ok == 0:
+    puts("I see you haven't.")
+    exit(1)
+
+# extra constraint:
+if (s[0x2f2] & 1) == 0:   # address 0x15060+0x2f2 = 0x15352
+    puts("I see you haven't.")
+    exit(1)
+
+puts("Incredible! Let me get the flag for you...")
+
+# build 40-byte string from 320 selected input bits, table at 0x13080
+out = bytearray(41)  # zeroed, includes null terminator
+for bitpos in range(0x140):         # 320 bits
+    idx = table_0x13080[bitpos]     # dword index into input
+    b = (s[idx] & 1)
+    out[bitpos >> 3] |= b << (bitpos & 7)
+
+puts(out)  # prints flag
+```
+
+#### `sat_check` (giant function in `0x1289..0x12981`)
+
+```text
+# boolean circuit, no branches
+# xi = (input[i] & 1)  for i in 0..1278
+# function computes a long expression F(x0..x1278) using NOT/AND/OR (byte-wide)
+# return (F != 0) in AL
+```
+
+If you want to be “more literal”, the beginning of the function could be read as:
+
+```text
+t0 = (~input[0x000]) & 1
+t1 = (~input[0x4fb]) & 1
+t2 = (~input[0x046])     # dst disimpan sebagai byte, lalu dipakai via AND/OR berikutnya
+...
+```
+
+This is where Z3 shines: we don't need to write the Fs one by one—just **model the instruction stream** into symbolic expressions.
+
+
+### References
+
+- [SAT vs SMT (basic concepts)](https://en.wikipedia.org/wiki/Satisfiability_modulo_theories)

